@@ -171,11 +171,208 @@ def _make_temp_dce_project(db_name: str) -> Path:
     return tmp
 
 
+# ── <think>-tag stripper ──────────────────────────────────────────────────────
+#
+# Thinking models (GLM-4.7-Flash, DeepSeek R1, Qwen3 with thinking enabled, etc.)
+# emit verbose <think>...</think> monologue before each tool call. The model still
+# benefits from this on the *current* turn (chain-of-thought is preserved during
+# generation), but if we let the raw assistant message flow back into the chat
+# history, every subsequent turn re-reads the full prior monologue. Across a
+# 16-step agent loop that's thousands of wasted input tokens.
+#
+# This monkey-patch wraps databao.agent.executors.llm.chat so the *last* message
+# in the returned list (the new AIMessage) has its <think> blocks stripped before
+# being stored back into LangGraph state. Per-turn quality is unaffected (the
+# model still thinks during generation); only the cumulative history shrinks.
+#
+# Equivalent server-side option: launch vLLM with --reasoning-parser glm45 (the
+# vLLM 0.18.1 GLM-4.5 family parser, which uses the DeepSeek V3 thinking-parser
+# implementation). When that's enabled vLLM splits reasoning_content from
+# content automatically, and this client-side patch becomes a no-op.
+
+# GLM-4.7-Flash chat template prepends <think> as part of the assistant prefill,
+# so the model only emits "reasoning</think>response" in `content` — no opening
+# tag in the message string. We split on the LAST </think> to separate reasoning
+# from narrative. If there's substantive narrative after </think>, we keep it.
+# If there's no narrative (common: GLM often emits only tool_calls after </think>),
+# we replace the reasoning with a brief LLM-generated summary so the model has a
+# decision anchor when re-reading its history. The summary call is capped at
+# max_tokens=120 and hard-truncated to 500 chars so a runaway summary can't
+# balloon history anyway.
+
+_SUMMARY_MAX_CHARS = 500
+_SUMMARY_MAX_TOKENS = 120
+_SUMMARY_MIN_REASONING_CHARS = 80  # below this, don't bother summarizing
+
+_SUMMARY_SYSTEM_PROMPT = (
+    "You compress an AI agent's internal reasoning into a terse note the agent "
+    "can use as a memory anchor. Output at most 2 short sentences. Focus on: "
+    "(1) the decision the agent made, (2) WHY. Do not echo the reasoning; "
+    "extract the conclusion. Do not include <think> tags. Be direct."
+)
+
+_summary_client = None  # OpenAI client pointed at vLLM, configured via _configure_summarizer
+_summary_model_name = None
+
+
+def _configure_summarizer(vllm_base_url: str | None, model_name: str) -> None:
+    """Initialize the summarizer client once we know the vLLM endpoint."""
+    global _summary_client, _summary_model_name
+    if _summary_client is not None or not vllm_base_url:
+        return
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return
+    _summary_client = OpenAI(base_url=f"{vllm_base_url.rstrip('/')}/v1", api_key="EMPTY", timeout=60)
+    _summary_model_name = model_name
+
+
+def _get_summary_client():
+    return _summary_client, _summary_model_name
+
+
+def _summarize_reasoning(reasoning: str) -> str:
+    """Ask the LLM to compress a block of reasoning into ≤2 sentences.
+
+    Falls back to the tail of the reasoning (last ~400 chars, trimmed to sentence
+    boundary) if the summary call fails or the endpoint is not configured.
+    """
+    reasoning = reasoning.strip()
+    if len(reasoning) < _SUMMARY_MIN_REASONING_CHARS:
+        return reasoning[:_SUMMARY_MAX_CHARS]
+
+    client, model_name = _get_summary_client()
+    if client is not None:
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Reasoning:\n{reasoning}\n\nCompressed note:"},
+                ],
+                temperature=0.0,
+                max_tokens=_SUMMARY_MAX_TOKENS,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            summary = (resp.choices[0].message.content or "").strip()
+            # Strip any stray think tags the summarizer might have produced
+            summary = re.sub(r"<think>.*?</think>\s*", "", summary, flags=re.DOTALL)
+            summary = re.sub(r"</?think>", "", summary).strip()
+            if summary:
+                return summary[:_SUMMARY_MAX_CHARS]
+        except Exception as e:
+            print(f"  [think-stripper] summary call failed: {e}; falling back to tail heuristic")
+
+    # Fallback: last ~400 chars trimmed to a sentence boundary.
+    tail = reasoning[-400:]
+    # Find first sentence start in the tail so we don't land mid-sentence.
+    m = re.search(r"(?<=[.!?])\s+", tail)
+    if m:
+        tail = tail[m.end():]
+    return tail.strip()[:_SUMMARY_MAX_CHARS]
+
+
+def _strip_think_from_text(text: str) -> str:
+    # Unclosed <think> with no closer: truncated generation. Strip everything
+    # from the opener onward and summarize what was cut.
+    if "<think>" in text and "</think>" not in text:
+        pre, _, rest = text.partition("<think>")
+        summary = _summarize_reasoning(rest)
+        return ((pre.strip() + "\n" + summary).strip() if pre.strip() else summary)
+
+    if "</think>" not in text:
+        return text  # no reasoning at all
+
+    # Split on LAST </think> so any intermediate reasoning is fully captured as
+    # "reasoning" and whatever the model wrote after its final </think> is
+    # treated as narrative output.
+    idx = text.rfind("</think>")
+    reasoning = text[:idx]
+    narrative = text[idx + len("</think>"):]
+    # Clean any embedded think tags inside the reasoning block itself.
+    reasoning = re.sub(r"</?think>", "", reasoning)
+
+    if narrative.strip():
+        # The model emitted real narrative after </think> — keep that verbatim,
+        # drop the reasoning entirely. Narrative is already a natural anchor.
+        return narrative.lstrip()
+
+    # No post-</think> narrative → summarize the reasoning so the model has
+    # SOMETHING to re-read when parsing its own history on the next turn.
+    return _summarize_reasoning(reasoning)
+
+
+def _strip_think_from_message_content(content):
+    """Strip <think>...</think> blocks from a langchain message content field.
+
+    langchain messages allow content as either str or list[dict]. We handle both.
+    """
+    if isinstance(content, str):
+        return _strip_think_from_text(content)
+    if isinstance(content, list):
+        out = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                stripped = _strip_think_from_text(block["text"])
+                if stripped:
+                    out.append({**block, "text": stripped})
+            else:
+                out.append(block)
+        return out
+    return content
+
+
+_THINK_PATCH_INSTALLED = False
+
+
+def _install_think_stripper_once() -> None:
+    """Monkey-patch databao.agent.executors.llm.chat to strip <think> from responses."""
+    global _THINK_PATCH_INSTALLED
+    if _THINK_PATCH_INSTALLED:
+        return
+    from databao.agent.executors import llm as _databao_llm
+
+    _orig_chat = _databao_llm.chat
+
+    def _chat_strip_think(messages, config, model=None):
+        result = _orig_chat(messages, config, model)
+        if not result:
+            return result
+        last = result[-1]
+        # Only strip if last message has a `content` attribute (AIMessage does).
+        if hasattr(last, "content") and last.content:
+            new_content = _strip_think_from_message_content(last.content)
+            if new_content != last.content:
+                # langchain messages are pydantic; use model_copy to update in-place semantics.
+                if hasattr(last, "model_copy"):
+                    new_last = last.model_copy(update={"content": new_content})
+                else:
+                    last.content = new_content
+                    new_last = last
+                result = [*result[:-1], new_last]
+        return result
+
+    _databao_llm.chat = _chat_strip_think
+    # graph.py imported `chat` directly into its module namespace, so patch that too.
+    try:
+        from databao.agent.executors.lighthouse import graph as _lh_graph
+        if hasattr(_lh_graph, "chat"):
+            _lh_graph.chat = _chat_strip_think
+    except Exception:
+        pass
+    _THINK_PATCH_INSTALLED = True
+    print("  [think-stripper] installed: <think>...</think> blocks will be stripped from AIMessage content before history reuse")
+
+
 def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, external_knowledge_doc: str | None = None):
     """Create a databao agent with DCE retrieval enabled for a single database."""
     import databao.agent as bao
     from databao.agent.configs.agent import AgentConfig
     from databao.agent.configs.llm import LLMConfig
+
+    _install_think_stripper_once()
+    _configure_summarizer(vllm_base_url, model_name)
 
     is_qwen3 = "Qwen3" in model_name or "qwen3" in model_name.lower()
 
@@ -184,11 +381,12 @@ def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, exter
             name=model_name,
             api_base_url=f"{vllm_base_url}/v1",
             temperature=0.0,
-            # 1024 output tokens: GLM context is 28000. Reducing from 2048 saves 1024 tokens
-            # of reserved output space, fixing context overflow on local003/local009-style
-            # questions where external_knowledge docs + schema approach the 28K limit.
-            # SQL is compact; complex queries rarely exceed 500 tokens.
-            max_tokens=1024,
+            # 4096 output tokens: on A100 80GB at max_model_len=60000 we no longer need
+            # to starve max_tokens. Lifted from 1024 (the A6000 setting) because GLM's
+            # verbose pre-tool-call reasoning was being truncated mid-thought, causing
+            # the final assistant turn to land with empty tool_calls and the agent to
+            # terminate without emitting SQL (observed on local022, local025).
+            max_tokens=4096,
             timeout=180,
             use_responses_api=False,
             # Qwen3 only: disable thinking mode via chat_template_kwargs per-request.
@@ -205,7 +403,7 @@ def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, exter
             use_responses_api=False,
         )
 
-    agent_config = AgentConfig(recursion_limit=12, min_retrievals=1)
+    agent_config = AgentConfig(recursion_limit=30, min_retrievals=1)
 
     # Build a temp DCE project with only this DB's YAML — enables search_context tool
     # without loading all 28 databases into DuckDB simultaneously.
@@ -238,13 +436,21 @@ def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, exter
     # Default is 250K chars which doesn't help on a 40K-token context model.
     executor._max_schema_summary_length = 60_000
     # Override _graph_recursion_limit (default 50 in base.py) so LangGraph actually
-    # respects our recursion_limit=12. base.py uses max(self._graph_recursion_limit,
+    # respects our recursion_limit. base.py uses max(self._graph_recursion_limit,
     # agent_config.recursion_limit), so we must set both to cap loop depth.
-    # 12 agent steps × 2 LangGraph nodes/step = 24 LangGraph nodes.
-    executor._graph_recursion_limit = 24
+    # 30 agent steps × 2 LangGraph nodes/step = 60 LangGraph nodes.
+    # Bumped from 24/48 after local002 was 2 steps away from a correct answer at step 24.
+    # Doom-loop prompt rules (3-consecutive-error cutoff) are the primary guard against
+    # runaway loops; the step limit is a hard backstop only.
+    executor._graph_recursion_limit = 60
 
+    # auto_output_modality=False: skip the post-submit Vega visualizer agent. Spider 2.0
+    # scoring only needs SQL + dataframe; the visualizer fires extra LLM calls after
+    # submit_result that can hit the 180s read timeout and bubble up an httpx.ReadTimeout
+    # — which the benchmark loop then mis-marks as a full question failure even though
+    # submit_result already succeeded (observed on local054 in the 15-winner A100 run).
     agent = bao.agent(domain=domain, llm_config=llm_config, agent_config=agent_config,
-                      data_executor=executor, stream_ask=False)
+                      data_executor=executor, stream_ask=False, auto_output_modality=False)
     return agent, tmp_dce
 
 

@@ -41,6 +41,13 @@ HF_HOME="/data/user_data/sandeep3/.cache/huggingface"
 # multi-turn retrieval + reasoning loops without VLLMValidationError on input length.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-60000}"
 
+# Tensor parallel size. Default is single-GPU. Set TP_SIZE=2 (and submit with
+# --gres=gpu:A6000:2 etc) to shard the model across two GPUs on the same node,
+# e.g. as a fallback when 80GB-class GPUs are queue-bound. With 2x A6000 you get
+# ~96 GiB total, ~74 GiB usable for KV cache after sharded weights and overhead,
+# enough to keep MAX_MODEL_LEN=60000.
+TP_SIZE="${TP_SIZE:-1}"
+
 # Tool call parser depends on model family.
 # GLM: glm47  |  Qwen3: hermes
 if [[ "$MODEL" == *"GLM"* ]] || [[ "$MODEL" == *"glm"* ]]; then
@@ -59,6 +66,7 @@ echo "Model:  $MODEL"
 echo "Parser: $TOOL_CALL_PARSER"
 echo "Port:   $VLLM_PORT"
 echo "MaxLen: $MAX_MODEL_LEN"
+echo "TP:     $TP_SIZE"
 echo "Time:   $(date)"
 echo "========================================"
 
@@ -107,7 +115,7 @@ HF_HOME="$HF_HOME" "$VENV_PYTHON" -m vllm.entrypoints.openai.api_server \
     --host 0.0.0.0 \
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization 0.92 \
-    --tensor-parallel-size 1 \
+    --tensor-parallel-size "$TP_SIZE" \
     --dtype float16 \
     --quantization awq \
     --trust-remote-code \
