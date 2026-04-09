@@ -125,9 +125,10 @@ echo "Clearing datasource hashes to force full re-index..."
 "$VENV_PYTHON" - <<'PYEOF'
 import duckdb
 db = duckdb.connect('/ocean/projects/cis260009p/dpalagan/nl2sql-databao/spider2-dce/output/dce.duckdb')
-db.execute("DELETE FROM datasource_context_hash")
+# Delete in FK-safe order: child tables first, then parent
 db.execute("DELETE FROM chunk")
 db.execute("DELETE FROM embedding_model_registry")
+db.execute("DELETE FROM datasource_context_hash")
 db.close()
 print("Hash table cleared — pass 2 will re-index all datasources")
 PYEOF
