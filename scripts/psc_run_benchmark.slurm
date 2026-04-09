@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
-#SBATCH --output=/jet/home/dpalagan/nl2sql-databao/logs/bench_%j.log
-#SBATCH --error=/jet/home/dpalagan/nl2sql-databao/logs/bench_%j.err
+#SBATCH --output=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/bench_%j.log
+#SBATCH --error=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/bench_%j.err
 
 # Run full Spider 2.0 local SQLite benchmark on PSC Bridges-2 (CPU-only job).
 #
@@ -35,7 +35,7 @@
 
 set -e
 
-WORK_DIR="/jet/home/dpalagan/nl2sql-databao"
+WORK_DIR="/ocean/projects/cis260009p/dpalagan/nl2sql-databao"
 VENV_PYTHON="$WORK_DIR/databao-agent/.venv/bin/python"
 TS=$(date +%Y%m%d_%H%M%S)
 
@@ -85,8 +85,9 @@ echo "Baseline: 15/124 (12.1%) — Run 4, Qwen3-32B-AWQ, no fixes"
 echo "Target:   beat 12.1% with all fixes applied"
 echo ""
 
-# Tell the benchmark where Spider2 data lives on PSC
+# Tell the benchmark where Spider2 data and DCE project live on PSC
 export SPIDER2_DIR="$WORK_DIR/Spider2/spider2-lite"
+export DCE_PROJECT_DIR="$WORK_DIR/spider2-dce"
 
 "$VENV_PYTHON" scripts/spider2_benchmark.py \
     --output "results/spider2_full135_${TS}.csv" \

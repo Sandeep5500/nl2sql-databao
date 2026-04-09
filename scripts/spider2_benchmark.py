@@ -53,7 +53,8 @@ GOLD_EXEC_DIR = EVAL_SUITE_DIR / "gold/exec_result"
 EVAL_JSONL = EVAL_SUITE_DIR / "gold/spider2lite_eval.jsonl"
 DOCS_DIR = SPIDER2_DIR / "resource/documents"
 QUESTIONS_FILE = SPIDER2_DIR / "spider2-lite.jsonl"
-DCE_PROJECT_DIR = Path("/data/user_data/sandeep3/personal/capstone/spider2-dce")
+_DEFAULT_DCE_PROJECT_DIR = "/data/user_data/sandeep3/personal/capstone/spider2-dce"
+DCE_PROJECT_DIR = Path(os.environ.get("DCE_PROJECT_DIR", _DEFAULT_DCE_PROJECT_DIR))
 RESULTS_DIR = CAPSTONE_DIR / "results"
 ENDPOINT_FILE = CAPSTONE_DIR / "logs/vllm_endpoint.txt"
 

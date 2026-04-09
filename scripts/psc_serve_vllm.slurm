@@ -6,52 +6,47 @@
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=08:00:00
-#SBATCH --output=/jet/home/dpalagan/nl2sql-databao/logs/vllm_%j.out
-#SBATCH --error=/jet/home/dpalagan/nl2sql-databao/logs/vllm_%j.err
+#SBATCH --output=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/vllm_%j.out
+#SBATCH --error=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/vllm_%j.err
 
-# Serve GLM-4.7-Flash-AWQ via vLLM on PSC Bridges-2 for databao-agent benchmark.
+# Serve XiYanSQL-QwenCoder-32B-2504 via vLLM on PSC Bridges-2 for databao-agent benchmark.
 #
 # GPU: H100-80 (80 GB HBM3)
 #   VRAM budget:
 #     Total:          80 GB
-#     gpu_mem_util:   × 0.90  →  72 GB usable
-#     GLM-4.7-Flash-AWQ weights (INT4 AWQ):  ~17 GB
-#     KV cache headroom:                     ~55 GB  →  comfortably fits 60K context
+#     gpu_mem_util:   × 0.92  →  73.6 GB usable
+#     XiYanSQL-QwenCoder-32B (BF16, dense 32B):  ~64 GB weights
+#     KV cache headroom:                          ~9.6 GB  →  ~32K context
 #
-#   Why NOT L40S-48:
-#     L40S has 48 GB — same as A6000. After weights, only ~26 GB for KV cache,
-#     which caps usable context at ~28K tokens. The complex_oracle / log / f1
-#     schemas exceed 38K tokens and would still hit HTTP 400 (context overflow).
-#     H100-80 is the minimum GPU that eliminates all 14 A2 overflow failures.
+#   Context window note:
+#     32K covers the majority of Spider2 schemas. A few very large schemas
+#     (complex_oracle, log, f1) may still exceed 32K and trigger HTTP 400.
+#     If overflows persist, switch to 2× H100-80 with TP_SIZE=2 for 60K+.
 #
-#   Why NOT V100-32:
-#     After weights only ~12 GB for KV cache — limits context to ~15–20K tokens.
-#     Worse than our A6000 baseline.
+#   Fallback — 2× H100-80 (full context, no overflows):
+#     Change: --gres=gpu:h100-80:2  --mem=160G
+#     And set: TP_SIZE=2 below
 #
-# Model: QuantTrio/GLM-4.7-Flash-AWQ
-#   MoE 30B-A3B, INT4 AWQ, ~17 GB VRAM
-#   Best tool-call reliability for LangGraph agent loops
-#   Scored 8/15 (53%) on 15-question re-run with all fixes applied
+# Model: XGenerationLab/XiYanSQL-QwenCoder-32B-2504
+#   SQL-specialist fine-tune of Qwen2.5-Coder-32B (BF16 dense)
+#   Strong schema understanding and structured SQL generation
+#   Tool calling via hermes parser (native vLLM support, no special hacks needed)
 #
-# First run: model will be downloaded to HF cache (~17 GB, ~5–10 min on PSC)
-# Subsequent runs: loads from cache instantly
+# First run: model downloaded to HF cache (~64 GB, ~15–20 min on PSC)
+# Subsequent runs: loads from cache in ~2–3 min
 #
 # Usage:
 #   sbatch scripts/psc_serve_vllm.slurm
 #   # Then submit benchmark once endpoint is ready:
 #   sbatch scripts/psc_run_benchmark.slurm
-#
-# To use H100 fallback if queue is long — alternative: 2× L40S (TP=2):
-#   Change to: --gres=gpu:l40s-48:2  --mem=96G
-#   And set:   TP_SIZE=2 below
 
 set -e
 
-WORK_DIR="/jet/home/dpalagan/nl2sql-databao"
+WORK_DIR="/ocean/projects/cis260009p/dpalagan/nl2sql-databao"
 HF_HOME="/ocean/projects/cis260009p/dpalagan/huggingface_cache"
 VLLM_PORT="${VLLM_PORT:-8765}"
-MODEL="${MODEL:-QuantTrio/GLM-4.7-Flash-AWQ}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-60000}"
+MODEL="${MODEL:-XGenerationLab/XiYanSQL-QwenCoder-32B-2504}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32000}"
 TP_SIZE="${TP_SIZE:-1}"
 
 mkdir -p "$WORK_DIR/logs"
@@ -83,34 +78,22 @@ if ! "$VENV_PYTHON" -c "import vllm" 2>/dev/null; then
     "$VENV_PYTHON" -m pip install vllm --quiet
 fi
 
-# GLM-4.7-Flash requires transformers from git main (glm4_moe_lite architecture)
-echo "Installing transformers from git main (required for GLM-4.7-Flash)..."
-"$VENV_PYTHON" -m pip install --quiet \
-    "git+https://github.com/huggingface/transformers.git" --upgrade
-# transformers git main needs regex >= 2025.10.22
-"$VENV_PYTHON" -m pip install --quiet "regex>=2025.10.22" --no-deps
-
-# VLLM_MLA_DISABLE=1: fall back from TRITON_MLA to standard FlashAttention.
-# Avoids bus errors seen with GLM's MLA attention on some vLLM versions.
-export VLLM_MLA_DISABLE=1
 export HF_HOME="$HF_HOME"
 export HUGGINGFACE_HUB_CACHE="$HF_HOME"
 
 echo "Starting vLLM server..."
-echo "(First run: model download ~17 GB, allow 5–10 min before benchmark starts)"
+echo "(First run: model download ~64 GB, allow 15–20 min before benchmark starts)"
 
 "$VENV_PYTHON" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --port "$VLLM_PORT" \
     --host 0.0.0.0 \
     --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization 0.92 \
     --tensor-parallel-size "$TP_SIZE" \
-    --dtype float16 \
-    --quantization awq \
+    --dtype bfloat16 \
     --trust-remote-code \
-    --enforce-eager \
     --enable-auto-tool-choice \
-    --tool-call-parser glm47
+    --tool-call-parser hermes
 
 echo "vLLM server exited at $(date)"
