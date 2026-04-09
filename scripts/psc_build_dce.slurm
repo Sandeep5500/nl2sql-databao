@@ -125,12 +125,18 @@ echo "Clearing datasource hashes to force full re-index..."
 "$VENV_PYTHON" - <<'PYEOF'
 import duckdb
 db = duckdb.connect('/ocean/projects/cis260009p/dpalagan/nl2sql-databao/spider2-dce/output/dce.duckdb')
-# Delete in FK-safe order: child tables first, then parent
+# Drop in FK-safe order: embedding vectors → chunks → registry → hashes
+tables = [r[0] for r in db.execute("SHOW TABLES").fetchall()]
+# Delete embedding vector tables first (they reference chunk)
+for t in tables:
+    if t.startswith("embedding_") and t != "embedding_model_registry":
+        db.execute(f'DELETE FROM "{t}"')
+        print(f"Cleared {t}")
 db.execute("DELETE FROM chunk")
 db.execute("DELETE FROM embedding_model_registry")
 db.execute("DELETE FROM datasource_context_hash")
 db.close()
-print("Hash table cleared — pass 2 will re-index all datasources")
+print("All index tables cleared — pass 2 will re-index all datasources with enriched descriptions")
 PYEOF
 
 # Rebuild embeddings with enriched YAMLs
