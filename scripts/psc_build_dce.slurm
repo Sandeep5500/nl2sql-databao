@@ -118,26 +118,10 @@ echo "Running enum enrichment at $(date)..."
 cd "$WORK_DIR"
 "$VENV_PYTHON" scripts/enrich_enum_columns.py 2>&1
 
-# Clear the content-hash table so pass 2 re-indexes all datasources.
-# Without this, dce build sees unchanged hashes and skips re-embedding,
-# leaving the enriched YAML text out of the vector index.
-echo "Clearing datasource hashes to force full re-index..."
-"$VENV_PYTHON" - <<'PYEOF'
-import duckdb
-db = duckdb.connect('/ocean/projects/cis260009p/dpalagan/nl2sql-databao/spider2-dce/output/dce.duckdb')
-# Drop in FK-safe order: embedding vectors → chunks → registry → hashes
-tables = [r[0] for r in db.execute("SHOW TABLES").fetchall()]
-# Delete embedding vector tables first (they reference chunk)
-for t in tables:
-    if t.startswith("embedding_") and t != "embedding_model_registry":
-        db.execute(f'DELETE FROM "{t}"')
-        print(f"Cleared {t}")
-db.execute("DELETE FROM chunk")
-db.execute("DELETE FROM embedding_model_registry")
-db.execute("DELETE FROM datasource_context_hash")
-db.close()
-print("All index tables cleared — pass 2 will re-index all datasources with enriched descriptions")
-PYEOF
+# Delete dce.duckdb so pass 2 builds a completely fresh index.
+# This is simpler and safer than clearing tables (avoids FK ordering issues).
+echo "Deleting dce.duckdb for clean rebuild with enriched YAMLs..."
+rm -f "$DCE_DIR/output/dce.duckdb"
 
 # Rebuild embeddings with enriched YAMLs
 echo ""
