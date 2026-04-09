@@ -3,7 +3,7 @@
 #SBATCH --partition=RM-shared
 #SBATCH --account=cis260009p
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=16G
 #SBATCH --time=02:00:00
 #SBATCH --output=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/dce_build_%j.log
 #SBATCH --error=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/dce_build_%j.err
