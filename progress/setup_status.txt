@@ -1,414 +1,228 @@
 ================================================================================
 PROJECT: databao-agent × Spider 2.0 Benchmark
 GOAL: Evaluate + improve databao-agent on Spider 2.0 local SQLite track (135 questions)
-      Baseline: 0/5 correct on first 5 questions. Goal: maximize accuracy on full 135-q run.
+      Baseline: 15/124 (12.1%) on full run (Apr 6). Goal: beat that with all fixes applied.
 ================================================================================
 
-Last updated: 2026-04-06 ~17:15 EDT
+Last updated: 2026-04-09 ~09:30 EDT
+
+⚠️  ACTIVE WORKING REPO IS NOW: /data/user_data/sandeep3/personal/nl2sql-databao/
+    All new work should happen there. This file is mirrored there too.
+    The capstone repo is no longer actively used.
 
 ── ENVIRONMENT ──────────────────────────────────────────────────────────────────
 
-  Workspace:   /data/user_data/sandeep3/personal/capstone/
-  Spider2:     Spider2/spider2-lite/  (135 local SQLite questions)
-  Agent:       databao-agent/  (LighthouseExecutor + LangGraph)
-  Enrichment:  databao-context-engine/  (DCE: schema extraction + vector index)
-  DCE project: spider2-dce/  (28 databases, vector index at output/dce.duckdb)
-  Scripts:     scripts/spider2_benchmark.py  (benchmark runner)
-               scripts/serve_vllm.slurm      (vLLM server SLURM job)
+  Active Workspace: /data/user_data/sandeep3/personal/nl2sql-databao/
+  Spider2:          Spider2/spider2-lite/  (135 local SQLite questions, 124 scoreable)
+  Agent source:     databao-agent/  (LighthouseExecutor + LangGraph)
+  DCE project:      spider2-dce/  (28 databases, vector index at output/dce.duckdb)
+  Benchmark script: scripts/spider2_benchmark.py
+  vLLM script:      scripts/serve_vllm.slurm
+  Python venv:      databao-agent/.venv  ← INDEPENDENT venv (not a symlink anymore)
+    - editable install points to nl2sql-databao/databao-agent source
+    - all deps synced from capstone/.venv (same packages, new .pth)
+    - use: /data/user_data/sandeep3/personal/nl2sql-databao/databao-agent/.venv/bin/python
 
-── CURRENTLY RUNNING (as of 2026-04-06 ~17:15 EDT) ─────────────────────────────
+  Ollama embed server: running on login node at localhost:11434
+    Model: nomic-embed-text:v1.5 (loaded, confirmed working)
+    PID: 664913 (/home/sandeep3/.dce/ollama/bin/ollama serve)
+    If it dies: pgrep -a ollama to check; restart with:
+      /home/sandeep3/.dce/ollama/bin/ollama serve &
 
-  Job 6988316  vllm_databao  RUNNING on babel-s9-24
-    → QuantTrio/GLM-4.7-Flash-AWQ, port 8765
-    → --quantization awq (NOT awq_marlin — bus error fix applied)
-    → VLLM_MLA_DISABLE=1, --dtype float16, --max-model-len 28000
-    → Serving stably since ~15:56 EDT (1h20m+ without crash)
+── CURRENT GPU STATUS (as of ~09:30 EDT Apr 9) ──────────────────────────────────
 
-  fast_embed_server  localhost:11434   RUNNING on login node (PID 1101840)
-    → Restarted this session after previous login node session died
-    → Must be restarted if login node session dies:
-        cd databao-context-engine && nohup uv run python ../scripts/fast_embed_server.py --port 11434 > /tmp/fast_embed_login.log 2>&1 &
+  RUNNING (endpoints live, ~3h left each):
+    Job 7022536  vllm_PRO6k   babel-z5-20:8765   RTX PRO 6000 (96GB)
+    Job 7022537  vllm_2xA6k   babel-w9-32:8765   2× A6000 (TP=2)
 
-  Benchmark Run 5 (GLM-4.7-Flash-AWQ, 20q)  IN PROGRESS
-    → Started ~16:32 EDT
-    → Log: logs/benchmark_glm_20q_20260406_163238.log
-    → Command: cd databao-agent && PYTHONUNBUFFERED=1 nohup uv run python -u \
-        ../scripts/spider2_benchmark.py --limit 20 \
-        2>&1 | tee ../logs/benchmark_glm_20q_$(date +%Y%m%d_%H%M%S).log > /tmp/benchmark_glm.log &
+  PENDING (race — first to land overwrites vllm_endpoint.txt):
+    Job 7026117  vllm_PRO6k_2   RTX_PRO_6000:1
+    Job 7026119  vllm_A100_2    A100_80GB:1
+    Job 7026120  vllm_PRO6k_3   RTX_PRO_6000:1
 
-── PARTIAL RESULTS (Run 5, first 5/20 questions seen) ──────────────────────────
+  Endpoint file: logs/vllm_endpoint.txt
+    Benchmark reads this at startup and uses that endpoint for the full run.
 
-  local002  E_commerce  → AGENT ERROR: Recursion limit (50 LangGraph nodes = 25 agent steps)
-                           Ran for ~38 min before hitting recursion limit — same loop issue as before
-  local003  E_commerce  → AGENT ERROR: 400 context overflow
-                           "prompt contains at least 25953 input tokens + 2048 output > 28000 limit"
-                           E_commerce schema + RFM.md external doc + accumulated context overflows GLM's 28K window
-  local004  E_commerce  → result_mismatch (3 rows returned, uses customer_id not customer_unique_id)
-  local007  Baseball    → PASS ✓ (score: 1, matches local007_c.csv)
-  local008  Baseball    → IN PROGRESS (running at ~17:15 EDT, KV cache ~39%, likely another long loop)
+  To submit another GPU:
+    cd /data/user_data/sandeep3/personal/nl2sql-databao
+    sbatch --job-name=vllm_A100 --gres=gpu:A100_80GB:1 --mem=64G \
+           --cpus-per-task=8 --time=12:00:00 scripts/serve_vllm.slurm
 
-── NEW ISSUES DISCOVERED IN RUN 5 ──────────────────────────────────────────────
+── LAST BENCHMARK RUN STATUS ────────────────────────────────────────────────────
 
-  ISSUE 1 — Recursion limit not preventing loops
-    The recursion_limit=25 in AgentConfig maps to LangGraph recursion_limit=50 because
-    LangGraph counts NODES (llm_node + tool_executor_node = 2 nodes per step).
-    25 steps × 2 min/step (at 15 tok/s, 2048 max_tokens) = ~38 min for local002.
-    Fix: Reduce AgentConfig recursion_limit from 25 → 12 in spider2_benchmark.py (= 24 LangGraph nodes).
+  Run: benchmark_full135_20260409_010934  (CRASHED — OOM killed at question 7/124)
+  Log: logs/benchmark_full135_20260409_010934.log
+  CSV: results/spider2_full135_20260409_010934.csv  (6 rows written before crash)
 
-  ISSUE 2 — Context overflow for E_commerce + external knowledge docs
-    local003 uses RFM.md external knowledge. E_commerce schema (even compressed to table names only)
-    + RFM.md + conversation history exceeds GLM's 28000 token context.
-    25953 input + 2048 output = 28001 > 28000.
-    Fix options:
-      a) Reduce max_tokens from 2048 → 1024 for GLM (leaves 2K more room for context)
-      b) Reduce max_schema_summary_length from 60K chars → 30K chars
-      c) Truncate external knowledge docs more aggressively (currently at 40K chars)
-    Best fix: (a) + (c) together — GLM rarely needs 2048 tokens for SQL output.
+  What happened:
+    Launched at ~01:09 EDT on login node via nohup (no SLURM, no memory limit).
+    Killed at ~01:37 EDT by Linux OOM killer (~72GB virtual memory from DuckDB).
+    local010 (Airlines + haversine_formula.md) triggered the OOM.
 
-  ISSUE 3 — GLM DOES have thinking mode (progress notes were wrong)
-    Tool call test confirmed GLM-4.7-Flash generates </think> tags in response content.
-    Unlike Qwen3, the thinking tokens appear BEFORE the response but tool calls still work.
-    The thinking overhead is small (~200-300 chars per response), manageable at max_tokens=2048.
-    No action needed unless we want to save tokens (can use --override-generation-config to disable).
+  Results from 6 completed questions:
+    local002  E_commerce   FAIL  recursion limit (30 steps, 352s)
+    local003  E_commerce   FAIL  result_mismatch (237s)
+    local004  E_commerce   FAIL  result_mismatch (192s)
+    local007  Baseball     PASS  matches local007_c.csv (74s)
+    local008  Baseball     FAIL  no_sql — empty-string type error loop (200s)
+    local009  Airlines     FAIL  recursion limit (30 steps, 634s)
 
-  ISSUE 4 — "JSON tags not found" mystery messages
-    During agent execution, "JSON tags not found" is printed to stdout 5 times (one per tool call).
-    Not found in any Python source file — likely from a binary/compiled component.
-    Does NOT block tool calling (local004 and local007 still made tool calls successfully).
-    No action needed.
+  ⚠️  CRITICAL: Run benchmark as SLURM CPU job, NOT nohup on login node.
+    See "HOW TO RESTART" below.
 
-── FIXES NEEDED BEFORE NEXT RUN ────────────────────────────────────────────────
+── BASELINE ─────────────────────────────────────────────────────────────────────
 
-  In scripts/spider2_benchmark.py:
+  Full run Apr 6 (no fixes):  15/124 = 12.1%
+  File: results/spider2_results_20260406_035831.csv
+  Correct instances: local007,022,025,030,038,040,054,058,071,085,131,198,210,221,329
 
-  1. Reduce recursion_limit: 25 → 12
-     Line 207: agent_config = AgentConfig(recursion_limit=12, min_retrievals=1)
-     This caps local008/local002-style loops at ~12 min instead of ~38 min.
+── ALL FIXES APPLIED (as of Apr 9) ─────────────────────────────────────────────
 
-  2. Reduce max_tokens: 2048 → 1024 for GLM
-     Lines 190: max_tokens=2048 → max_tokens=1024
-     Saves 1024 tokens of reserved output space, fixing local003's overflow.
-     GLM SQL output rarely exceeds 500 tokens; complex CTEs fit in 1024.
+  1. THINK-STRIPPER (spider2_benchmark.py ~line 193-320)
+     Monkey-patches databao.agent.executors.llm.chat to strip <think>...</think>
+     from AIMessage content before it enters history.
+     GLM chat template prepends <think>, so model emits "reasoning</think>response"
+     — handled by _LEADING_THINK_CLOSE_RE regex.
+     Empty messages after stripping → LLM summary call (max_tokens=120, 500-char cap).
+     Effect: history shrinks from ~90K chars to ~6.5K (93% reduction).
 
-  3. Tighten external knowledge doc truncation: 40K chars → 20K chars
-     Lines 222: if len(doc_text) > 40_000 → if len(doc_text) > 20_000
-     RFM.md and haversine_formula.md are long docs; 20K chars ≈ 5K tokens is plenty.
+  2. PRE-SUBMIT CHECKLIST (system_prompt.jinja, 6 items after "Make sure..." section)
+     1. Output shape — row count + columns match the literal question
+     2. Column minimalism — only columns the question asks for
+     3. Query ID selection — submit the CORRECT query_id, not the most recent one
+     4. Row count sanity — "top 10" → 10 rows, etc.
+     5. Filter completeness — filter on FACT table, not dimension table
+     6. External knowledge compliance — verify logic matches the provided doc exactly
 
-── PREVIOUS CRASH POST-MORTEM ───────────────────────────────────────────────────
+  3. AUTO_OUTPUT_MODALITY=FALSE (spider2_benchmark.py ~line 449)
+     bao.agent(..., auto_output_modality=False)
+     Disables post-submit Vega visualizer (caused httpx.ReadTimeout on local054).
 
-  Job 6987523 (previous run) crashed ~15:06 EDT with Bus error.
-  Root cause: Script was submitted with OLD version that used --quantization awq_marlin.
-  The serve_vllm.slurm had been updated to use --quantization awq AFTER job 6987523 was
-  submitted, so the fix wasn't in effect for that job. Job 6988316 uses the current script
-  and has been running stably for 1h20m+ without any Bus error or crash.
+  4. TRACE FIX (databao-agent/databao/agent/executors/base.py + core/thread.py)
+     Problem: thread.meta() re-ran the graph after a failure, overwriting the real trace.
+     Fix A (base.py _execute_stream_sync + _invoke_graph_sync):
+       Wraps streaming loop in try/except, attaches last partial state to exception
+       as e._partial_last_state before re-raising.
+     Fix B (base.py _execute_core):
+       On exception, reads e._partial_last_state and persists real failing messages
+       to cache via _update_message_history() before re-raising.
+     Fix C (thread.py _materialize_data):
+       try/finally bumps _opas_processed_count even on failure.
+       On failure, synthesizes ExecutionResult from cache so meta() never re-executes.
+     Result: trace JSON files now show the actual failing run, not a re-run.
 
-── GLM SETUP STATUS: RESOLVED ───────────────────────────────────────────────────
+  5. RECURSION LIMITS (spider2_benchmark.py)
+     agent_config = AgentConfig(recursion_limit=30, ...)   ← 30 agent steps
+     executor._graph_recursion_limit = 60                  ← 60 LangGraph nodes
+     (Was 16/32 → 24/48 → now 30/60)
+     Why 30 not 24: local002 was 2 steps from correct at step 24.
 
-  Bus error root cause: GLM-4.7-Flash uses TRITON_MLA attention backend by default.
-  This crashes on some A6000 nodes. Fix: VLLM_MLA_DISABLE=1 (replaces removed
-  VLLM_ATTENTION_BACKEND=FLASH_ATTN in vLLM >= 0.18.1)
+  6. DOOM-LOOP PREVENTION (system_prompt.jinja)
+     a. SET allowed: SET sqlite_all_varchar=true now explicitly permitted for
+        dirty SQLite columns (previously model saw the fix in error output but
+        the prompt said "Never use SET" so it couldn't apply it).
+     b. DuckDB tips:
+        - TRY_CAST(col AS DOUBLE) for empty-string numeric columns
+        - json_extract_string(col, '$.fieldname')::DOUBLE for JSON columns
+     c. Stuck-loop rule: after 3 consecutive same-kind errors, STOP and switch
+        to a fundamentally different approach.
 
-  awq_marlin bus error: Previous job (6987523) used --quantization awq_marlin (old script).
-  Script was updated to --quantization awq AFTER that job was submitted, so it still crashed.
-  Current serve_vllm.slurm correctly uses --quantization awq. Job 6988316 confirmed stable.
+  Files changed vs original:
+    databao-agent/databao/agent/core/thread.py              (fix C)
+    databao-agent/databao/agent/executors/base.py           (fixes A + B)
+    databao-agent/databao/agent/executors/lighthouse/system_prompt.jinja  (fixes 2, 6)
+    scripts/spider2_benchmark.py                            (fixes 1, 3, 4, 5)
 
-  dtype mismatch: AWQ needs float16 (A6000 defaults to bfloat16).
-  Fix: --dtype float16 added to serve_vllm.slurm.
+── HOW TO RESTART THE BENCHMARK ────────────────────────────────────────────────
 
-  transformers dep: glm4_moe_lite requires transformers from git main (5.6.0.dev0).
-  regex pin: uv.lock pins regex==2025.9.18 but git main needs >=2025.10.22.
-  Fix: serve_vllm.slurm uses $VENV_PYTHON directly (not `uv run`) + installs
-       regex==2026.4.4 --no-deps after transformers.
+  Step 1: Create scripts/run_benchmark.slurm if it doesn't exist:
 
-  GLM thinking mode: GLM-4.7-Flash DOES generate </think> tags (progress notes were wrong).
-  Thinking appears in content field before tool calls but doesn't block tool call parsing.
-  Tool calls confirmed working: finish_reason=tool_calls, correct arguments extracted.
-  No fix needed unless token budget becomes a concern.
+    #!/bin/bash
+    #SBATCH --job-name=spider2_bench
+    #SBATCH --partition=general
+    #SBATCH --cpus-per-task=4
+    #SBATCH --mem=32G
+    #SBATCH --time=12:00:00
+    #SBATCH --output=/data/user_data/sandeep3/personal/nl2sql-databao/logs/bench_%j.log
 
-── BENCHMARK RESULTS ────────────────────────────────────────────────────────────
+    VENV=/data/user_data/sandeep3/personal/nl2sql-databao/databao-agent/.venv/bin/python
+    SCRIPT=/data/user_data/sandeep3/personal/nl2sql-databao/scripts/spider2_benchmark.py
+    TS=$(date +%Y%m%d_%H%M%S)
+    cd /data/user_data/sandeep3/personal/nl2sql-databao
 
-  Run 1 (Qwen3-8B, 2026-04-03)             → 1/5 (20%) — 5q test
-  Run 2 (GLM-4.7-Flash-AWQ, v1 prompts)    → 1/5 (20%) — 5q test
-    File: results/spider2_results_20260405_130606.csv
-  Run 3 (GLM-4.7-Flash-AWQ, v2 prompts)    → 1/5 (20%) — 5q test
-    File: results/spider2_results_20260405_155821.csv
-  Run 4 (Qwen3-32B-AWQ, full 124q, 2026-04-06) → 15/123 (12.2%) — FIRST FULL RUN
-    File: results/spider2_results_20260406_035831.csv
-    Model: Qwen/Qwen3-32B-AWQ | awq_marlin | thinking=off | max_tokens=2048
-    Config: recursion_limit=25, min_retrievals=1, max_tokens_before_cleaning=10000 (default)
-    Duration: ~3.5 hours (03:58 to 07:31 EDT)
-  Run 5 (GLM-4.7-Flash-AWQ, 20q, 2026-04-06) → IN PROGRESS
-    File: logs/benchmark_glm_20q_20260406_163238.log (partial results visible)
-    Model: QuantTrio/GLM-4.7-Flash-AWQ | awq | VLLM_MLA_DISABLE=1 | max_tokens=2048
-    Config: recursion_limit=25, min_retrievals=1
-    Job: 6988316 on babel-s9-24:8765 (running stably, no Bus errors)
-    Partial results (5/20):
-      local002 → AGENT_ERROR recursion_limit (~38 min loop)
-      local003 → AGENT_ERROR 400 context overflow (25953+2048 > 28000)
-      local004 → result_mismatch (customer_id vs customer_unique_id)
-      local007 → PASS ✓
-      local008 → in progress
+    $VENV $SCRIPT \
+      --output results/spider2_full135_${TS}.csv \
+      --trace-dir logs/traces_full135_${TS} \
+      --full-trace
 
-    DB breakdown (passing):
-      chinook            2/3  (66%)  ← best
-      IPL                2/11 (18%)
-      Baseball           1/2  (50%)
-      Pagila             1/2  (50%)
-      Brazilian_EC       1/8  (12%)
-      modern_data        1/7  (14%)
-      education_business 1/5  (20%)
-      city_legislation   1/10 (10%)
-      northwind          1/2  (50%)
-      EntertainmentAgency 1/3 (33%)
-      delivery_center    1/3  (33%)
-      EU_soccer          1/5  (20%)
-      log                1/5  (20%)
-      E_commerce         0/3  — context overflow (schema ~25K tokens > 40960 limit)
-      bank_sales_trading 0/15 — largest category, 0 passes (main area to improve)
-      f1                 0/8  — result_mismatch on all
-      sqlite-sakila      0/7  — result_mismatch on all
+  Step 2: Submit:
+    cd /data/user_data/sandeep3/personal/nl2sql-databao
+    sbatch scripts/run_benchmark.slurm
 
-    Status breakdown:
-      result_mismatch : 54  ← main failure mode (model gets wrong answer)
-      no_sql          : 29  ← agent never generates SQL (recursion limit or context)
-      agent_error     : 25  ← context overflow (38913 input > 40960-2048 limit)
+  Step 3: Monitor:
+    squeue -u sandeep3
+    tail -f logs/bench_<jobid>.log
 
-  Per-question:
-    local002  regression + moving average  → result_mismatch  (FAIL)
-    local003  RFM segmentation             → result_mismatch  (FAIL — 11 rows, gold has 9)
-    local004  top 3 customers by payment   → result_mismatch  (FAIL — wrong customer column)
-    local007  avg career span              → PASS ✓  (78-89s)
-    local008  max games/runs/hits/HR       → agent_error / timeout  (FAIL — 33-min loop)
+  Step 4: Results:
+    VENV=/data/user_data/sandeep3/personal/nl2sql-databao/databao-agent/.venv/bin/python
+    $VENV -c "
+    import pandas as pd, glob, os
+    f = max(glob.glob('results/spider2_full135_*.csv'), key=os.path.getmtime)
+    df = pd.read_csv(f)
+    print(f'{f}: {int(df.score.sum())}/{len(df)} ({100*df.score.mean():.1f}%)')
+    print(df[df.score==1][['instance_id','score_detail']].to_string())
+    "
 
-── FAILURE ROOT CAUSE ANALYSIS (confirmed, 2026-04-05) ──────────────────────────
+── DOOM-LOOP ROOT CAUSES (for failure analysis) ─────────────────────────────────
 
-  local002 (regression + moving average):
-    Symptom: Result wrong (gold ~4187.69, agent ~different)
-    v1 behavior: Model hard-coded regression coefficients in the SQL literal.
-    v2 behavior: With NTILE/math hint, model now queries actual sales data first
-                 but still gets wrong regression or wrong moving average window.
-    Root cause: Model capability — complex multi-step (regression → predict Dec dates
-                → symmetric 5-day MA → sum). Likely failing at the regression step.
-    DUCKDB_HINTS already contains REGR_SLOPE/REGR_INTERCEPT hint (ignored in v1).
-    SQL structure: Now uses actual table data (improvement), but computes wrong answer.
+  Pattern A — Empty strings in numeric columns (Baseball batting: r/h/hr/g)
+    Error: TypeMismatchException: expected float or integer, found "" of type "text"
+    Hint in error says SET sqlite_all_varchar=true — now allowed in prompt
+    Also added: TRY_CAST(col AS DOUBLE) tip in DuckDB tips section
 
-  local003 (RFM segmentation):
-    Symptom: 11 segments returned, gold has 9; values differ.
-    Root cause: Wrong quintile scoring. Model uses linear percentage of max
-                (CASE WHEN recency <= MAX*0.2 THEN 1...) instead of NTILE(5).
-    v2 change: Added NTILE(5) hint to DUCKDB_HINTS. Still failing because
-               the agent correctly uses customer_unique_id (fixed from v1) but
-               the NTILE scoring may also need a different base date for Recency.
-    In v2, trace shows agent fixed ambiguous column reference errors iteratively
-    (good sign — agent is adapting). But 11 vs 9 segments means still wrong logic.
+  Pattern B — JSON coordinates column (Airlines airports table)
+    Column value: {"en": "Abakan", "ru": "Абакан", "lat": 53.7, "lon": 91.7}
+    Model tried string_split/array_extract/regexp_extract — all fail
+    Fix in prompt: json_extract_string(col, '$.lat')::DOUBLE
+    Stuck-loop rule prevents model from burning all 30 steps on this
 
-  local004 (top 3 customers by avg payment):
-    Symptom: Uses customer_id (FK in orders) instead of customer_unique_id
-             (requires JOIN to customers table).
-    Schema is in system prompt: BOTH customer_id and customer_unique_id are visible.
-    v1: Agent skipped search_context entirely, went straight to SQL.
-    v2: Agent now calls search_context(retrieve_text='orders customer_id ...') ✓
-        BUT still picks customer_id in final SQL — model sees both columns in
-        system prompt and chooses the wrong one.
-    Root cause: Model capability — question says "3 customers" (not unique), model
-                uses the first customer_id it sees rather than recognizing that
-                customer_unique_id is the true customer-level identifier.
-    NOTE: "Use less than 50 tool calls" hint is in system prompt (tool_limit=50).
-          Agent respects this (only 1-2 calls for local004). Problem is column choice.
+  Pattern C — Complex multi-step query (local002: regression + moving average)
+    Was 2 steps from answer at step 24 (old limit). Now limit is 30.
+    "toy" = brinquedos in Portuguese — search_context cold-start timeout on step 1
+    caused the model to search for "toy" (not found) for several steps.
 
-  local007 (career span): PASS ✓. No issues.
+── BENCHMARK RUN HISTORY ────────────────────────────────────────────────────────
 
-  local008 (max games/runs/hits/HR):
-    Symptom: Agent loops for 33 minutes (2023s), makes ~50-60 vLLM requests.
-    Root cause: Two schema mismatches the agent can't resolve:
-      1. name_given — Player table has name_given (e.g. "Peter Edward") which is
-         the gold-expected column. Agent keeps using name_first || name_last
-         (gives "Peter Rose" not "Peter Edward") and gets wrong results.
-      2. Per-season stats — batting table has g/r/h/hr per season per player.
-         Must SUM across seasons for career totals. Agent may use MAX or get
-         confused by the year/stint structure.
-    Correct gold SQL approach:
-      SELECT 'games_played', p.name_given, SUM(b.g)
-      FROM batting b JOIN player p ON b.player_id=p.player_id
-      GROUP BY p.player_id, p.name_given
-      ORDER BY 3 DESC LIMIT 1
-      UNION ALL ... (repeat for r, h, hr)
-    Fix needed: DCE enrichment for baseball may not surface name_given clearly.
-    recursion_limit=100 → tool_limit=50 in system prompt. Agent ignores the
-    soft limit and keeps looping. Need to reduce recursion_limit.
-
-── LOGGING BUG FIXED (2026-04-05) ──────────────────────────────────────────────
-
-  scripts/spider2_benchmark.py line 351:
-    Before: args.get('query','')    ← always printed '' (wrong key)
-    After:  args.get('retrieve_text','')  ← now shows actual search query
-
-  v2 benchmark confirmed search_context queries:
-    local002: search_context(retrieve_text='toy sales data product category toys')
-    local003: (search in step 2+, not step 1 — agent went direct to SQL first)
-    local004: search_context(retrieve_text='orders customer_id order_purchase_timestamp order_status')
-    local008: search_context(retrieve_text='batting table games played runs hits home runs columns')
-
-── PROMPTS CHANGED THIS SESSION (2026-04-05) ────────────────────────────────────
-
-  scripts/spider2_benchmark.py DUCKDB_HINTS added (end of block):
-    - NTILE(n) OVER (ORDER BY col) — for percentile/quantile/quintile scoring
-    - "Never compute numerical values in your head — let DuckDB compute via SQL"
-    - "If uncertain about column/table/join, call search_context before guessing"
-
-── NEXT STEPS ───────────────────────────────────────────────────────────────────
-
-  PRIORITY 1 — Apply the 3 benchmark fixes (spider2_benchmark.py)
-    1. recursion_limit: 25 → 12 (line 207)
-    2. max_tokens: 2048 → 1024 (line 190)
-    3. external knowledge truncation: 40K → 20K chars (line 222)
-    After fixes, kill current benchmark run (PID ~1162101) and re-run 20q to verify.
-    Kill command: pkill -f "spider2_benchmark.py" (wait for current question to finish first)
-
-  PRIORITY 2 — Verify no more crashes or context overflows
-    Run 5-question test first after fixes:
-      cd databao-agent && PYTHONUNBUFFERED=1 uv run python -u \
-        ../scripts/spider2_benchmark.py \
-        --instances local002,local003,local004,local007,local008 \
-        2>&1 | tee ../logs/benchmark_5q_glm_$(date +%Y%m%d_%H%M%S).log
-
-  PRIORITY 3 — Run full 135-question benchmark with GLM
-    Once 5q test confirms stable operation (no crashes, no 400 errors):
-      cd databao-agent
-      PYTHONUNBUFFERED=1 nohup uv run python -u ../scripts/spider2_benchmark.py \
-        2>&1 | tee ../logs/benchmark_full_glm_$(date +%Y%m%d_%H%M%S).log > /tmp/benchmark_full.log &
-    Expected time: 135 × avg 5 min = ~11 hours (with recursion_limit=12)
-
-  PRIORITY 4 — local004 customer_unique_id (ongoing)
-    Model picks customer_id instead of customer_unique_id even when both are in schema.
-    Fix: Add domain-level hint to DCE for E_commerce: "customer_unique_id is the true
-    customer identifier; customer_id in orders is an order-level foreign key"
-    File: spider2-dce/output/databases/e_commerce.yaml (add to DB-level description)
+  Run 1  (Qwen3-8B, 2026-04-03)                    →  1/5    (20%)   5q test
+  Run 2  (GLM, v1 prompts)                          →  1/5    (20%)   5q test
+  Run 3  (GLM, v2 prompts)                          →  1/5    (20%)   5q test
+  Run 4  (Qwen3-32B-AWQ, full 124q, 2026-04-06)    → 15/124  (12.1%) BASELINE
+  Run 5  (GLM, 20q, no think-stripper)              →  3/20   (15%)
+  Run 6  (GLM, 15q winners, no fixes)               →  0/15   (0%)
+  Run 7  (GLM, 15q winners, with fixes)             →  8/15   (53.3%) think-stripper works
+  Run 8  (GLM, 2q: local030+058, trace fix)         →  1/2    (50%)   local030 pass, 058 fail
+  Run 9  (GLM, full 124q, all fixes, OOM crash)     →  1/6    before crash at local010
 
 ── KEY COMMANDS ─────────────────────────────────────────────────────────────────
 
-  Check jobs:
-    squeue -u sandeep3
+  VENV=/data/user_data/sandeep3/personal/nl2sql-databao/databao-agent/.venv/bin/python
 
-  Check vLLM log (stdout — startup/routes):
-    tail -f logs/vllm_<jobid>.out
-
-  Check vLLM errors/crash (stderr — weights loading, bus errors):
-    tail -f logs/vllm_<jobid>.err
-
-  Check vLLM endpoint:
-    cat logs/vllm_endpoint.txt
-    curl -s http://<node>:8765/v1/models
-
-  Check if fast_embed_server is running:
-    curl -s --max-time 3 http://localhost:11434/api/tags
-
-  Start embed server (if not running):
-    cd /data/user_data/sandeep3/personal/capstone/databao-context-engine
-    nohup uv run python ../scripts/fast_embed_server.py --port 11434 > /tmp/fast_embed_login.log 2>&1 &
-    curl -s http://localhost:11434/api/tags  # verify
-
-  Submit vLLM server:
-    cd /data/user_data/sandeep3/personal/capstone
-    sbatch scripts/serve_vllm.slurm
-    # NOTE: VLLM_MLA_DISABLE=1 and --quantization awq are in the script — no override needed
-
-  Kill running benchmark (wait for current question to finish first):
-    pkill -f "spider2_benchmark.py"
-
-  Run 5-question test:
-    cd databao-agent
-    PYTHONUNBUFFERED=1 uv run python -u ../scripts/spider2_benchmark.py \
-      --instances local002,local003,local004,local007,local008 \
-      2>&1 | tee ../logs/benchmark_5q_$(date +%Y%m%d_%H%M%S).log
-
-  Run 20-question test:
-    cd databao-agent && PYTHONUNBUFFERED=1 nohup uv run python -u \
-      ../scripts/spider2_benchmark.py --limit 20 \
-      2>&1 | tee ../logs/benchmark_glm_20q_$(date +%Y%m%d_%H%M%S).log > /tmp/benchmark_glm.log &
-
-  Run full benchmark:
-    cd databao-agent && PYTHONUNBUFFERED=1 nohup uv run python -u \
-      ../scripts/spider2_benchmark.py \
-      2>&1 | tee ../logs/benchmark_full_glm_$(date +%Y%m%d_%H%M%S).log > /tmp/benchmark_full.log &
-
-── KEY FILES CHANGED THIS SESSION ───────────────────────────────────────────────
-
-  scripts/serve_vllm.slurm  (fully stable as of job 6988316)
-    - MODEL default: QuantTrio/GLM-4.7-Flash-AWQ
-    - max_model_len: 28000 (GLM KV cache limit on A6000 w/ 0.92 util)
-    - --quantization awq (NOT awq_marlin — bus error fix)
-    - --dtype float16, --enforce-eager, --trust-remote-code
-    - VLLM_MLA_DISABLE=1 (replaces removed VLLM_ATTENTION_BACKEND env var)
-    - Changed `uv run python` → $VENV_PYTHON (skips lockfile sync)
-    - Added separate regex==2026.4.4 --no-deps install after transformers
-
-  scripts/spider2_benchmark.py  (NEEDS UPDATES — see PRIORITY 1 in NEXT STEPS)
-    - VLLM_MODEL default: QuantTrio/GLM-4.7-Flash-AWQ
-    - max_tokens: 2048 (→ should be reduced to 1024 for GLM)
-    - timeout: 180s
-    - recursion_limit: 25 (→ should be reduced to 12)
-    - external_knowledge doc truncation: 40K chars (→ should be reduced to 20K)
-    - max_schema_summary_length: 60_000 chars (~15K tokens)
-    - DUCKDB_HINTS: NTILE hint, math-in-SQL rule, search_context uncertainty rule
-    - Logging fix: search_context now logs retrieve_text correctly
-    - DCE temp project isolation: per-question temp dir with single DB YAML
-
-── HOW DCE RETRIEVAL WORKS (for reference) ──────────────────────────────────────
-
-  Each database has chunks stored in dce.duckdb:
-    - TABLE chunk: embeddable_text = "orders is a table with 14 columns. PK: orderid. FK to..."
-                   display_text = YAML with full table (all columns + samples + constraints)
-    - COLUMN chunk: embeddable_text = "freight is a column type REAL in orders. Not nullable. [desc]"
-                    display_text = YAML with column (type + description + stats)
-
-  Search flow:
-    Agent calls search_context("customer payment total")
-    → query embedded with nomic-embed-text:v1.5 (768-dim)
-    → cosine similarity against all chunks in dce.duckdb
-    → top-K results returned as list[{data_source_name, score, context_result}]
-    → context_result = display_text YAML (table or column chunk)
-    → agent reads the YAML to understand schema, then writes SQL
-
-  The embed server (fast_embed_server.py) must be running on the same machine as
-  benchmark for search_context to work (localhost:11434).
+  Check jobs:           squeue -u sandeep3
+  Check endpoint:       cat logs/vllm_endpoint.txt
+  Probe endpoint:       curl -s http://babel-z5-20:8765/v1/models
+  Check Ollama:         curl -s --max-time 3 http://localhost:11434/api/tags
+  Submit GPU:           sbatch --gres=gpu:A100_80GB:1 --mem=64G --cpus-per-task=8 \
+                                --time=12:00:00 scripts/serve_vllm.slurm
+  Submit benchmark:     sbatch scripts/run_benchmark.slurm
+  Watch benchmark:      grep -E "^\[|AGENT ERROR|score=" logs/bench_<jobid>.log
+  Results:              $VENV -c "import pandas as pd; df=pd.read_csv('results/spider2_full135_<ts>.csv'); print(f'{int(df.score.sum())}/{len(df)}')"
 
 ── MODEL DETAILS ────────────────────────────────────────────────────────────────
 
-  Model:     QuantTrio/GLM-4.7-Flash-AWQ
-  Source:    zai-org/GLM-4.7-Flash (30B-A3B MoE)
-  Quant:     INT4 AWQ (~17GB VRAM, fits single A6000 48GB)
-  Context:   40960 tokens (was 32768 for Qwen3-8B → fixes local008 overflow)
-  HF Cache:  /data/user_data/sandeep3/.cache/huggingface (weights already downloaded)
-  vLLM args: --tool-call-parser glm47 (glm47 parser in vLLM >= 0.18.1)
-             --enforce-eager (no CUDA graph capture — avoids OOM on A6000)
-             --quantization awq (force standard AWQ, avoid awq_marlin bus error)
-             --dtype float16 (AWQ requires float16; A6000 defaults to bfloat16)
-             VLLM_ATTENTION_BACKEND=FLASH_ATTN (avoids TRITON_MLA crash)
-  max_tokens: 8192 (for thinking blocks + SQL output; up from 4096)
-  timeout:    180s per LLM request
-
-  FALLBACK OPTION (if GLM issues recur):
-    Model:  Qwen/Qwen3-32B-AWQ (~18GB, fits A6000)
-    Args:   --tool-call-parser hermes
-            --override-generation-config '{"enable_thinking": false}'
-    Why:    Well-tested with vLLM, 32B major upgrade from 8B, no thinking overhead.
-
-── KEY CONFIG NOTES ─────────────────────────────────────────────────────────────
-
-  - use_responses_api=False in LLMConfig — required for vLLM
-  - stream_ask=False in bao.agent() — required for thread.code()/thread.df() to work
-  - --enable-auto-tool-choice + --tool-call-parser glm47 — required for GLM tool calls
-  - AgentConfig(recursion_limit=100) — currently 100; consider reducing to 25
-  - max_tokens=8192 — for thinking blocks + SQL output
-  - fast_embed_server.py must run on login node (localhost:11434) for search_context
-  - EXCLUDE_DBS = {"oracle_sql", "stacking"} in benchmark — broken views crash DuckDB
-
-── BENCHMARK INFRASTRUCTURE ─────────────────────────────────────────────────────
-
-  Gold files:  Spider2/spider2-lite/evaluation_suite/gold/exec_result/local*.csv
-  Eval config: Spider2/spider2-lite/evaluation_suite/gold/spider2lite_eval.jsonl
-               → condition_cols (which columns to check) + ignore_order per question
-  Scoring:     compare_dataframes() with abs_tol=1e-2, supports ignore_order + condition_cols
-  Excluded:    oracle_sql, stacking (broken views crash DuckDB schema inspection)
-  Scoreable:   ~133 local questions (135 minus 2 excluded)
+  Model:     QuantTrio/GLM-4.7-Flash-AWQ (MoE 30B-A3B, INT4 AWQ, ~17GB VRAM)
+  Context:   60000 tokens max_model_len
+  vLLM:      VLLM_MLA_DISABLE=1, --quantization awq, --dtype float16,
+             --enforce-eager, --tool-call-parser glm47, --enable-auto-tool-choice
+  Benchmark: timeout=180s/call, max_tokens=8192/response, stream_ask=False
+  HF cache:  /data/user_data/sandeep3/.cache/huggingface (weights already downloaded)
+  Excluded:  oracle_sql, stacking (broken views crash DuckDB)
