@@ -98,15 +98,35 @@ for i in $(seq 1 60); do
     sleep 5
 done
 
-# Run dce build
+# Run dce build (first pass — generates output YAMLs from SQLite schemas)
 echo ""
-echo "Running dce build at $(date)..."
+echo "Running dce build (pass 1) at $(date)..."
 DCE_CLI=$(dirname "$VENV_PYTHON")/dce
 if [ -f "$DCE_CLI" ]; then
     cd "$DCE_DIR"
     "$DCE_CLI" build
 else
     # Fallback: run via python module
+    cd "$DCE_DIR"
+    "$VENV_PYTHON" -m databao_context_engine.cli.commands build
+fi
+
+# Run enum enrichment AFTER dce build (dce build regenerates output YAMLs,
+# overwriting any prior enrichment — so enrichment must always come last)
+echo ""
+echo "Running enum enrichment at $(date)..."
+cd "$WORK_DIR"
+"$VENV_PYTHON" scripts/enrich_enum_columns.py 2>&1
+
+# Rebuild embeddings with enriched YAMLs
+echo ""
+echo "Rebuilding dce.duckdb with enriched YAMLs at $(date)..."
+rm -f "$DCE_DIR/output/dce.duckdb"
+DCE_CLI=$(dirname "$VENV_PYTHON")/dce
+if [ -f "$DCE_CLI" ]; then
+    cd "$DCE_DIR"
+    "$DCE_CLI" build
+else
     cd "$DCE_DIR"
     "$VENV_PYTHON" -m databao_context_engine.cli.commands build
 fi
