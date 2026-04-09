@@ -118,10 +118,23 @@ echo "Running enum enrichment at $(date)..."
 cd "$WORK_DIR"
 "$VENV_PYTHON" scripts/enrich_enum_columns.py 2>&1
 
+# Clear the content-hash table so pass 2 re-indexes all datasources.
+# Without this, dce build sees unchanged hashes and skips re-embedding,
+# leaving the enriched YAML text out of the vector index.
+echo "Clearing datasource hashes to force full re-index..."
+"$VENV_PYTHON" - <<'PYEOF'
+import duckdb
+db = duckdb.connect('/ocean/projects/cis260009p/dpalagan/nl2sql-databao/spider2-dce/output/dce.duckdb')
+db.execute("DELETE FROM datasource_context_hash")
+db.execute("DELETE FROM chunk")
+db.execute("DELETE FROM embedding_model_registry")
+db.close()
+print("Hash table cleared — pass 2 will re-index all datasources")
+PYEOF
+
 # Rebuild embeddings with enriched YAMLs
 echo ""
 echo "Rebuilding dce.duckdb with enriched YAMLs at $(date)..."
-rm -f "$DCE_DIR/output/dce.duckdb"
 DCE_CLI=$(dirname "$VENV_PYTHON")/dce
 if [ -f "$DCE_CLI" ]; then
     cd "$DCE_DIR"
