@@ -1,9 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=dce_build
-#SBATCH --partition=RM-shared
+#SBATCH --partition=GPU-shared
 #SBATCH --account=cis260009p
-#SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=1900M
+#SBATCH --gres=gpu:v100-32:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
 #SBATCH --time=02:00:00
 #SBATCH --output=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/dce_build_%j.log
 #SBATCH --error=/ocean/projects/cis260009p/dpalagan/nl2sql-databao/logs/dce_build_%j.err
