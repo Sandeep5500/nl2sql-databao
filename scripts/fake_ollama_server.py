@@ -44,9 +44,12 @@ def _load_embed_model():
     global _embed_model
     if _embed_model is not None:
         return _embed_model
-    log.info("Loading nomic-embed-text-v1.5 via sentence-transformers...")
+    # BAAI/bge-base-en-v1.5: 768-dim, no trust_remote_code needed, ~438MB.
+    # Matches DCE's expected model_dim=768. Avoids the nomic model's
+    # dynamic-module/einops check that fails spuriously in some venv setups.
+    log.info("Loading BAAI/bge-base-en-v1.5 via sentence-transformers...")
     from sentence_transformers import SentenceTransformer
-    _embed_model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True)
+    _embed_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
     log.info("Embedding model loaded (dim=768)")
     return _embed_model
 
