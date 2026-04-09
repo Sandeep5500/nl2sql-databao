@@ -41,7 +41,12 @@ import pandas as pd
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 CAPSTONE_DIR = Path(__file__).parent.parent
-SPIDER2_DIR = Path("/data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite")
+# SPIDER2_DIR: path to the spider2-lite directory containing questions + databases.
+# Override with SPIDER2_DIR env var to run on a different machine without editing this file.
+#   On babel cluster:  /data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite
+#   On PSC Bridges-2:  /jet/home/dpalagan/nl2sql-databao/Spider2/spider2-lite
+_DEFAULT_SPIDER2_DIR = "/data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite"
+SPIDER2_DIR = Path(os.environ.get("SPIDER2_DIR", _DEFAULT_SPIDER2_DIR))
 SQLITE_DIR = SPIDER2_DIR / "resource/databases/spider2-localdb"
 EVAL_SUITE_DIR = SPIDER2_DIR / "evaluation_suite"
 GOLD_EXEC_DIR = EVAL_SUITE_DIR / "gold/exec_result"
@@ -554,26 +559,98 @@ def log_agent_trace(thread, instance_id: str, full: bool = False, trace_dir: Pat
         print(f"  [trace] no messages in thread state for {instance_id}")
         return
 
-    # Optional raw JSON dump (lossless, for offline inspection)
+    # Optional rich JSON dump for offline error analysis
     if trace_dir is not None:
         trace_dir.mkdir(parents=True, exist_ok=True)
+
+        # Classify a tool result string into an error bucket
+        def _classify_tool_result(content: str) -> str:
+            if "BinderException" in content or "Binder Error" in content:
+                return "sql_error:binder"
+            if "ParserException" in content or "Parser Error" in content:
+                return "sql_error:parser"
+            if "ConversionException" in content or "Conversion Error" in content:
+                return "sql_error:conversion"
+            if "TypeMismatch" in content:
+                return "sql_error:type_mismatch"
+            if "Context is not built" in content or "OllamaTransientError" in content:
+                return "dce_error"
+            if "RecursionError" in content or "recursion" in content.lower():
+                return "recursion_error"
+            if "timeout" in content.lower() or "Timeout" in content:
+                return "timeout"
+            if '"error"' in content or "'error'" in content:
+                return "tool_error"
+            return "ok"
+
         dump = []
-        for m in messages:
-            entry = {
+        step = 0
+        for i, m in enumerate(messages):
+            entry: dict = {
+                "msg_index": i,
                 "type": type(m).__name__,
-                "content": m.content if isinstance(m.content, (str, list, dict)) else str(m.content),
             }
+            content_str = m.content if isinstance(m.content, str) else str(m.content)
+            entry["content"] = content_str
+
             if isinstance(m, AIMessage):
-                entry["tool_calls"] = [
-                    {"name": tc.get("name"), "args": tc.get("args", {}), "id": tc.get("id")}
-                    for tc in (m.tool_calls or [])
-                ]
+                step += 1
+                entry["step"] = step
+                tool_calls = []
+                for tc in (m.tool_calls or []):
+                    tc_entry = {
+                        "name": tc.get("name"),
+                        "id": tc.get("id"),
+                        "args": tc.get("args", {}),
+                    }
+                    # Extract SQL separately for easy reading
+                    args = tc.get("args", {})
+                    if "sql_query" in args:
+                        tc_entry["sql"] = args["sql_query"]
+                    elif "query" in args:
+                        tc_entry["sql"] = args["query"]
+                    tool_calls.append(tc_entry)
+                entry["tool_calls"] = tool_calls
+                entry["n_tool_calls"] = len(tool_calls)
+
             if isinstance(m, ToolMessage):
-                entry["name"] = getattr(m, "name", None)
+                entry["tool_name"] = getattr(m, "name", None)
                 entry["tool_call_id"] = getattr(m, "tool_call_id", None)
+                entry["result_class"] = _classify_tool_result(content_str)
+                # Count rows returned if result looks like tabular data
+                lines = [l for l in content_str.split("\n") if l.strip()]
+                entry["result_lines"] = len(lines)
+                entry["result_truncated"] = len(content_str) > 2000
+
             dump.append(entry)
+
+        # Compute per-question summary stats for the outer JSON wrapper
+        n_sql = sum(1 for e in dump if e["type"] == "AIMessage"
+                    and any(tc["name"] == "run_sql_query" for tc in e.get("tool_calls", [])))
+        n_search = sum(1 for e in dump if e["type"] == "AIMessage"
+                       and any(tc["name"] == "search_context" for tc in e.get("tool_calls", [])))
+        n_submit = sum(1 for e in dump if e["type"] == "AIMessage"
+                       and any(tc["name"] == "submit_result" for tc in e.get("tool_calls", [])))
+        errors_by_type: dict = {}
+        for e in dump:
+            rc = e.get("result_class", "")
+            if rc and rc != "ok":
+                errors_by_type[rc] = errors_by_type.get(rc, 0) + 1
+
+        wrapped = {
+            "instance_id": instance_id,
+            "n_messages": len(dump),
+            "n_steps": step,
+            "tool_call_counts": {
+                "search_context": n_search,
+                "run_sql_query": n_sql,
+                "submit_result": n_submit,
+            },
+            "tool_errors": errors_by_type,
+            "messages": dump,
+        }
         out_file = trace_dir / f"{instance_id}.json"
-        out_file.write_text(json.dumps(dump, indent=2, default=str))
+        out_file.write_text(json.dumps(wrapped, indent=2, default=str))
         print(f"  [trace] wrote {len(dump)} messages → {out_file}")
 
     sys_cap = 10_000 if full else 200
