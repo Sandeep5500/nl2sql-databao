@@ -34,6 +34,8 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -41,14 +43,14 @@ import pandas as pd
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 CAPSTONE_DIR = Path(__file__).parent.parent
-SPIDER2_DIR = Path("/data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite")
+SPIDER2_DIR = CAPSTONE_DIR / "Spider2" / "spider2-lite"
 SQLITE_DIR = SPIDER2_DIR / "resource/databases/spider2-localdb"
 EVAL_SUITE_DIR = SPIDER2_DIR / "evaluation_suite"
 GOLD_EXEC_DIR = EVAL_SUITE_DIR / "gold/exec_result"
 EVAL_JSONL = EVAL_SUITE_DIR / "gold/spider2lite_eval.jsonl"
 DOCS_DIR = SPIDER2_DIR / "resource/documents"
 QUESTIONS_FILE = SPIDER2_DIR / "spider2-lite.jsonl"
-DCE_PROJECT_DIR = Path("/data/user_data/sandeep3/personal/capstone/spider2-dce")
+DCE_PROJECT_DIR = CAPSTONE_DIR / "spider2-dce"
 RESULTS_DIR = CAPSTONE_DIR / "results"
 ENDPOINT_FILE = CAPSTONE_DIR / "logs/vllm_endpoint.txt"
 
@@ -110,6 +112,35 @@ def get_vllm_endpoint():
         return f"http://{node}:{node_port}", model
     print("WARNING: No vLLM endpoint found. Set VLLM_HOST or run serve_vllm.slurm first.")
     return None, model
+
+
+def wait_for_vllm(timeout_seconds: int = 1800, check_interval: int = 10) -> str | None:
+    """Wait for vLLM to be ready, re-reading the endpoint file on each poll.
+
+    Returns the base URL once healthy, or None on timeout.
+    """
+    start_time = time.time()
+    last_url = None
+    while time.time() - start_time < timeout_seconds:
+        url, _ = get_vllm_endpoint()
+        if url and url != last_url:
+            print(f"  Endpoint updated: {url}")
+            last_url = url
+        if url:
+            try:
+                req = urllib.request.Request(f"{url}/v1/models", method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        elapsed = round(time.time() - start_time, 1)
+                        print(f"✓ vLLM server is ready at {url} ({elapsed}s)")
+                        return url
+            except (urllib.error.URLError, OSError, TimeoutError):
+                pass
+        elapsed = round(time.time() - start_time, 1)
+        print(f"  Waiting for vLLM... ({elapsed}s elapsed)")
+        time.sleep(check_interval)
+    print(f"✗ vLLM server not ready after {timeout_seconds}s — aborting.")
+    return None
 
 
 # ── DuckDB capability hints injected into every agent context ─────────────────
@@ -636,6 +667,7 @@ def log_agent_trace(thread, instance_id: str, full: bool = False, trace_dir: Pat
 def main():
     parser = argparse.ArgumentParser(description="Spider 2.0 local track benchmark for databao-agent")
     parser.add_argument("--instances", type=str, help="Comma-separated instance IDs (e.g. local003,local008)")
+    parser.add_argument("--skip-instances", type=str, help="Comma-separated instance IDs to skip (e.g. local002,local003)")
     parser.add_argument("--limit", type=int, help="Run only first N questions")
     parser.add_argument("--output", type=str, help="Output CSV file path")
     parser.add_argument("--full-trace", action="store_true",
@@ -646,18 +678,27 @@ def main():
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
 
     instances = args.instances.split(",") if args.instances else None
+    skip_instances = set(args.skip_instances.split(",")) if args.skip_instances else set()
     questions = load_questions(instances=instances, limit=args.limit)
+
+    # Filter out skipped instances
+    if skip_instances:
+        questions = [q for q in questions if q["instance_id"] not in skip_instances]
+        print(f"Skipping {len(skip_instances)} instance(s)")
 
     if not questions:
         print("No questions matched the filters.")
         sys.exit(1)
 
     standards = load_eval_standards()
-    vllm_base_url, model_name = get_vllm_endpoint()
+    _, model_name = get_vllm_endpoint()
 
     print(f"Running {len(questions)} questions | model: {model_name}")
-    if vllm_base_url:
-        print(f"vLLM endpoint: {vllm_base_url}")
+    print("Waiting for vLLM to be ready...")
+    vllm_base_url = wait_for_vllm()
+    if not vllm_base_url:
+        sys.exit(1)
+    print(f"vLLM endpoint: {vllm_base_url}")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

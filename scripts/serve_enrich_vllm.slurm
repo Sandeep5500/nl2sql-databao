@@ -5,8 +5,8 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=03:00:00
-#SBATCH --output=/data/user_data/sandeep3/personal/capstone/logs/dce_enrich_%j.out
-#SBATCH --error=/data/user_data/sandeep3/personal/capstone/logs/dce_enrich_%j.err
+#SBATCH --output=/data/user_data/sandeep3/personal/nl2sql-databao/logs/dce/dce_enrich_%j.out
+#SBATCH --error=/data/user_data/sandeep3/personal/nl2sql-databao/logs/dce/dce_enrich_%j.err
 
 # Self-contained DCE enrichment job.
 # Starts vLLM (Qwen3-32B-AWQ) + fast_embed_server on the compute node,
