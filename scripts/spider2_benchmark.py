@@ -114,7 +114,7 @@ def get_vllm_endpoint():
     return None, model
 
 
-def wait_for_vllm(timeout_seconds: int = 1800, check_interval: int = 10) -> str | None:
+def wait_for_vllm(timeout_seconds: int = 7200, check_interval: int = 10) -> str | None:
     """Wait for vLLM to be ready, re-reading the endpoint file on each poll.
 
     Returns the base URL once healthy, or None on timeout.

@@ -17,5 +17,5 @@ cd /data/user_data/sandeep3/personal/nl2sql-databao/databao-agent
 /home/sandeep3/.local/bin/uv run python ../scripts/spider2_benchmark.py \
   --output ../results/spider2_full135_${TS}.csv \
   --trace-dir ../logs/traces/traces_full135_${TS} \
-  --skip-instances "local002,local003,local004,local007,local008,local009,local010,local015,local017,local018,local019,local020,local021,local022,local023,local024,local025,local026,local028,local029,local030,local031,local032,local034,local035,local037,local038,local039,local040,local041,local049,local054,local055,local198,local056,local058,local059,local060,local063,local061,local050,local062,local067,local070,local071,local072,local068,local073" \
+  --skip-instances "local002,local003,local004,local007,local008,local009,local010,local015,local017,local018,local019,local020,local021,local022,local023,local024,local025,local026,local028,local029,local030,local031,local032,local034,local035,local037,local038,local039,local040,local041,local049,local054,local055,local056,local058,local059,local060,local061,local063,local198" \
   --full-trace
