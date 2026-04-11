@@ -7,7 +7,7 @@ predicted SQL output DataFrames against the official exec_result gold CSVs
 (same logic as Spider2's evaluate.py).
 
 Usage:
-    # Run all local questions (requires vLLM server running)
+    # Run all local questions (requires OpenAI API key or compatible endpoint)
     uv --project ../databao-agent run python spider2_benchmark.py
 
     # Run specific instances
@@ -16,10 +16,13 @@ Usage:
     # Run first N questions
     uv --project ../databao-agent run python spider2_benchmark.py --limit 10
 
+    # Use a specific model
+    uv --project ../databao-agent run python spider2_benchmark.py --model gpt-4.1
+
 Environment variables:
-    VLLM_HOST    hostname of vLLM server (default: read from logs/vllm_endpoint.txt)
-    VLLM_PORT    port of vLLM server (default: 8765)
-    VLLM_MODEL   model name (default: Qwen/Qwen3-32B-AWQ)
+    OPENAI_API_KEY    OpenAI API key (required for OpenAI models)
+    API_BASE_URL      Base URL for OpenAI-compatible API (optional, for custom endpoints)
+    MODEL             Model name (default: gpt-4.1)
 """
 
 from __future__ import annotations
@@ -41,23 +44,22 @@ import pandas as pd
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 CAPSTONE_DIR = Path(__file__).parent.parent
-SPIDER2_DIR = Path("/data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite")
+SPIDER2_DIR = CAPSTONE_DIR / "Spider2" / "spider2-lite"
 SQLITE_DIR = SPIDER2_DIR / "resource/databases/spider2-localdb"
 EVAL_SUITE_DIR = SPIDER2_DIR / "evaluation_suite"
 GOLD_EXEC_DIR = EVAL_SUITE_DIR / "gold/exec_result"
 EVAL_JSONL = EVAL_SUITE_DIR / "gold/spider2lite_eval.jsonl"
 DOCS_DIR = SPIDER2_DIR / "resource/documents"
 QUESTIONS_FILE = SPIDER2_DIR / "spider2-lite.jsonl"
-DCE_PROJECT_DIR = Path("/data/user_data/sandeep3/personal/capstone/spider2-dce")
+DCE_PROJECT_DIR = CAPSTONE_DIR / "spider2-dce"
 RESULTS_DIR = CAPSTONE_DIR / "results"
-ENDPOINT_FILE = CAPSTONE_DIR / "logs/vllm_endpoint.txt"
 
 EXCLUDE_DBS = {"oracle_sql", "stacking"}  # broken views crash DuckDB schema inspection
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
-def load_questions(instances=None, limit=None):
+def load_questions(instances=None, skip_instances=None, limit=None):
     questions = []
     with open(QUESTIONS_FILE) as f:
         for line in f:
@@ -70,6 +72,9 @@ def load_questions(instances=None, limit=None):
     if instances:
         inst_set = set(instances)
         questions = [q for q in questions if q["instance_id"] in inst_set]
+    if skip_instances:
+        skip_set = set(skip_instances)
+        questions = [q for q in questions if q["instance_id"] not in skip_set]
     if limit:
         questions = questions[:limit]
     return questions
@@ -95,25 +100,7 @@ def get_db_path(db_name: str) -> Path | None:
     return None
 
 
-def get_vllm_endpoint():
-    host = os.environ.get("VLLM_HOST")
-    port = os.environ.get("VLLM_PORT", "8765")
-    model = os.environ.get("VLLM_MODEL", "QuantTrio/GLM-4.7-Flash-AWQ")
-    if host:
-        return f"http://{host}:{port}", model
-    if ENDPOINT_FILE.exists():
-        lines = ENDPOINT_FILE.read_text().strip().splitlines()
-        node, node_port = lines[0].strip().rsplit(":", 1)
-        for line in lines:
-            if line.startswith("Model:"):
-                model = line.split(":", 1)[1].strip()
-        return f"http://{node}:{node_port}", model
-    print("WARNING: No vLLM endpoint found. Set VLLM_HOST or run serve_vllm.slurm first.")
-    return None, model
-
-
 # ── DuckDB capability hints injected into every agent context ─────────────────
-# Prevents the agent from refusing statistical/regression questions as "ML tasks".
 DUCKDB_HINTS = """
 DuckDB SQL capabilities you MUST use instead of Python or external tools:
 - Linear regression: REGR_SLOPE(y, x), REGR_INTERCEPT(y, x), REGR_R2(y, x) — use these for any prediction/regression task
@@ -153,8 +140,7 @@ def _make_temp_dce_project(db_name: str) -> Path:
     if src_yaml.exists():
         shutil.copy(src_yaml, tmp / "src" / "databases" / src_yaml.name)
 
-    # output/ gets its own directory (so init_or_get_dce_project can write there freely),
-    # but dce.duckdb is symlinked from the shared index (read-only search, never written).
+    # output/ gets its own directory, but dce.duckdb is symlinked from the shared index.
     out = tmp / "output"
     out.mkdir()
     (out / "databases").mkdir()
@@ -171,242 +157,22 @@ def _make_temp_dce_project(db_name: str) -> Path:
     return tmp
 
 
-# ── <think>-tag stripper ──────────────────────────────────────────────────────
-#
-# Thinking models (GLM-4.7-Flash, DeepSeek R1, Qwen3 with thinking enabled, etc.)
-# emit verbose <think>...</think> monologue before each tool call. The model still
-# benefits from this on the *current* turn (chain-of-thought is preserved during
-# generation), but if we let the raw assistant message flow back into the chat
-# history, every subsequent turn re-reads the full prior monologue. Across a
-# 16-step agent loop that's thousands of wasted input tokens.
-#
-# This monkey-patch wraps databao.agent.executors.llm.chat so the *last* message
-# in the returned list (the new AIMessage) has its <think> blocks stripped before
-# being stored back into LangGraph state. Per-turn quality is unaffected (the
-# model still thinks during generation); only the cumulative history shrinks.
-#
-# Equivalent server-side option: launch vLLM with --reasoning-parser glm45 (the
-# vLLM 0.18.1 GLM-4.5 family parser, which uses the DeepSeek V3 thinking-parser
-# implementation). When that's enabled vLLM splits reasoning_content from
-# content automatically, and this client-side patch becomes a no-op.
-
-# GLM-4.7-Flash chat template prepends <think> as part of the assistant prefill,
-# so the model only emits "reasoning</think>response" in `content` — no opening
-# tag in the message string. We split on the LAST </think> to separate reasoning
-# from narrative. If there's substantive narrative after </think>, we keep it.
-# If there's no narrative (common: GLM often emits only tool_calls after </think>),
-# we replace the reasoning with a brief LLM-generated summary so the model has a
-# decision anchor when re-reading its history. The summary call is capped at
-# max_tokens=120 and hard-truncated to 500 chars so a runaway summary can't
-# balloon history anyway.
-
-_SUMMARY_MAX_CHARS = 500
-_SUMMARY_MAX_TOKENS = 120
-_SUMMARY_MIN_REASONING_CHARS = 80  # below this, don't bother summarizing
-
-_SUMMARY_SYSTEM_PROMPT = (
-    "You compress an AI agent's internal reasoning into a terse note the agent "
-    "can use as a memory anchor. Output at most 2 short sentences. Focus on: "
-    "(1) the decision the agent made, (2) WHY. Do not echo the reasoning; "
-    "extract the conclusion. Do not include <think> tags. Be direct."
-)
-
-_summary_client = None  # OpenAI client pointed at vLLM, configured via _configure_summarizer
-_summary_model_name = None
-
-
-def _configure_summarizer(vllm_base_url: str | None, model_name: str) -> None:
-    """Initialize the summarizer client once we know the vLLM endpoint."""
-    global _summary_client, _summary_model_name
-    if _summary_client is not None or not vllm_base_url:
-        return
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return
-    _summary_client = OpenAI(base_url=f"{vllm_base_url.rstrip('/')}/v1", api_key="EMPTY", timeout=60)
-    _summary_model_name = model_name
-
-
-def _get_summary_client():
-    return _summary_client, _summary_model_name
-
-
-def _summarize_reasoning(reasoning: str) -> str:
-    """Ask the LLM to compress a block of reasoning into ≤2 sentences.
-
-    Falls back to the tail of the reasoning (last ~400 chars, trimmed to sentence
-    boundary) if the summary call fails or the endpoint is not configured.
-    """
-    reasoning = reasoning.strip()
-    if len(reasoning) < _SUMMARY_MIN_REASONING_CHARS:
-        return reasoning[:_SUMMARY_MAX_CHARS]
-
-    client, model_name = _get_summary_client()
-    if client is not None:
-        try:
-            resp = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Reasoning:\n{reasoning}\n\nCompressed note:"},
-                ],
-                temperature=0.0,
-                max_tokens=_SUMMARY_MAX_TOKENS,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
-            summary = (resp.choices[0].message.content or "").strip()
-            # Strip any stray think tags the summarizer might have produced
-            summary = re.sub(r"<think>.*?</think>\s*", "", summary, flags=re.DOTALL)
-            summary = re.sub(r"</?think>", "", summary).strip()
-            if summary:
-                return summary[:_SUMMARY_MAX_CHARS]
-        except Exception as e:
-            print(f"  [think-stripper] summary call failed: {e}; falling back to tail heuristic")
-
-    # Fallback: last ~400 chars trimmed to a sentence boundary.
-    tail = reasoning[-400:]
-    # Find first sentence start in the tail so we don't land mid-sentence.
-    m = re.search(r"(?<=[.!?])\s+", tail)
-    if m:
-        tail = tail[m.end():]
-    return tail.strip()[:_SUMMARY_MAX_CHARS]
-
-
-def _strip_think_from_text(text: str) -> str:
-    # Unclosed <think> with no closer: truncated generation. Strip everything
-    # from the opener onward and summarize what was cut.
-    if "<think>" in text and "</think>" not in text:
-        pre, _, rest = text.partition("<think>")
-        summary = _summarize_reasoning(rest)
-        return ((pre.strip() + "\n" + summary).strip() if pre.strip() else summary)
-
-    if "</think>" not in text:
-        return text  # no reasoning at all
-
-    # Split on LAST </think> so any intermediate reasoning is fully captured as
-    # "reasoning" and whatever the model wrote after its final </think> is
-    # treated as narrative output.
-    idx = text.rfind("</think>")
-    reasoning = text[:idx]
-    narrative = text[idx + len("</think>"):]
-    # Clean any embedded think tags inside the reasoning block itself.
-    reasoning = re.sub(r"</?think>", "", reasoning)
-
-    if narrative.strip():
-        # The model emitted real narrative after </think> — keep that verbatim,
-        # drop the reasoning entirely. Narrative is already a natural anchor.
-        return narrative.lstrip()
-
-    # No post-</think> narrative → summarize the reasoning so the model has
-    # SOMETHING to re-read when parsing its own history on the next turn.
-    return _summarize_reasoning(reasoning)
-
-
-def _strip_think_from_message_content(content):
-    """Strip <think>...</think> blocks from a langchain message content field.
-
-    langchain messages allow content as either str or list[dict]. We handle both.
-    """
-    if isinstance(content, str):
-        return _strip_think_from_text(content)
-    if isinstance(content, list):
-        out = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
-                stripped = _strip_think_from_text(block["text"])
-                if stripped:
-                    out.append({**block, "text": stripped})
-            else:
-                out.append(block)
-        return out
-    return content
-
-
-_THINK_PATCH_INSTALLED = False
-
-
-def _install_think_stripper_once() -> None:
-    """Monkey-patch databao.agent.executors.llm.chat to strip <think> from responses."""
-    global _THINK_PATCH_INSTALLED
-    if _THINK_PATCH_INSTALLED:
-        return
-    from databao.agent.executors import llm as _databao_llm
-
-    _orig_chat = _databao_llm.chat
-
-    def _chat_strip_think(messages, config, model=None):
-        result = _orig_chat(messages, config, model)
-        if not result:
-            return result
-        last = result[-1]
-        # Only strip if last message has a `content` attribute (AIMessage does).
-        if hasattr(last, "content") and last.content:
-            new_content = _strip_think_from_message_content(last.content)
-            if new_content != last.content:
-                # langchain messages are pydantic; use model_copy to update in-place semantics.
-                if hasattr(last, "model_copy"):
-                    new_last = last.model_copy(update={"content": new_content})
-                else:
-                    last.content = new_content
-                    new_last = last
-                result = [*result[:-1], new_last]
-        return result
-
-    _databao_llm.chat = _chat_strip_think
-    # graph.py imported `chat` directly into its module namespace, so patch that too.
-    try:
-        from databao.agent.executors.lighthouse import graph as _lh_graph
-        if hasattr(_lh_graph, "chat"):
-            _lh_graph.chat = _chat_strip_think
-    except Exception:
-        pass
-    _THINK_PATCH_INSTALLED = True
-    print("  [think-stripper] installed: <think>...</think> blocks will be stripped from AIMessage content before history reuse")
-
-
-def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, external_knowledge_doc: str | None = None):
+def setup_agent(db_path: Path, model_name: str, api_base_url: str | None = None,
+                external_knowledge_doc: str | None = None):
     """Create a databao agent with DCE retrieval enabled for a single database."""
     import databao.agent as bao
     from databao.agent.configs.agent import AgentConfig
     from databao.agent.configs.llm import LLMConfig
 
-    _install_think_stripper_once()
-    _configure_summarizer(vllm_base_url, model_name)
+    llm_config = LLMConfig(
+        name=model_name,
+        temperature=0.0,
+        **({"api_base_url": api_base_url} if api_base_url else {}),
+    )
 
-    is_qwen3 = "Qwen3" in model_name or "qwen3" in model_name.lower()
-
-    if vllm_base_url:
-        llm_config = LLMConfig(
-            name=model_name,
-            api_base_url=f"{vllm_base_url}/v1",
-            temperature=0.0,
-            # 4096 output tokens: on A100 80GB at max_model_len=60000 we no longer need
-            # to starve max_tokens. Lifted from 1024 (the A6000 setting) because GLM's
-            # verbose pre-tool-call reasoning was being truncated mid-thought, causing
-            # the final assistant turn to land with empty tool_calls and the agent to
-            # terminate without emitting SQL (observed on local022, local025).
-            max_tokens=4096,
-            timeout=180,
-            use_responses_api=False,
-            # Qwen3 only: disable thinking mode via chat_template_kwargs per-request.
-            # GLM-4.7-Flash does not have thinking mode, so this is skipped for GLM.
-            **({"model_kwargs": {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}}
-               if is_qwen3 else {}),
-        )
-    else:
-        ollama_model = os.environ.get("OLLAMA_SQL_MODEL", "glm4.7-flash:latest")
-        llm_config = LLMConfig(
-            name=f"ollama:{ollama_model}",
-            temperature=0.0,
-            max_tokens=8192,
-            use_responses_api=False,
-        )
-
-    agent_config = AgentConfig(recursion_limit=30, min_retrievals=1)
+    agent_config = AgentConfig()
 
     # Build a temp DCE project with only this DB's YAML — enables search_context tool
-    # without loading all 28 databases into DuckDB simultaneously.
     tmp_dce = _make_temp_dce_project(db_path.stem)
 
     domain = bao.domain(project_dir=tmp_dce)
@@ -416,9 +182,6 @@ def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, exter
         doc_path = DOCS_DIR / external_knowledge_doc
         if doc_path.exists():
             doc_text = doc_path.read_text()
-            # Guard against very large external knowledge docs consuming too much context.
-            # At ~4 chars/token, 20K chars ≈ 5K tokens. GLM context is only 28K, so
-            # haversine_formula.md and similar long docs must be tightly truncated.
             if len(doc_text) > 20_000:
                 doc_text = doc_text[:20_000] + "\n\n[... external knowledge truncated ...]"
                 print(f"  WARN: external_knowledge doc truncated to 20K chars")
@@ -429,26 +192,7 @@ def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, exter
     from databao.agent.executors import LighthouseExecutor
 
     executor = LighthouseExecutor()
-    # Cap schema at ~60K chars (~15K tokens). LighthouseExecutor has a 3-tier fallback:
-    #   1. Full schema with columns (if ≤ 60K chars)
-    #   2. Table names only, no columns (if > 60K chars) — agent uses search_context for details
-    #   3. Schema overview only (if still > 60K chars)
-    # Default is 250K chars which doesn't help on a 40K-token context model.
-    executor._max_schema_summary_length = 60_000
-    # Override _graph_recursion_limit (default 50 in base.py) so LangGraph actually
-    # respects our recursion_limit. base.py uses max(self._graph_recursion_limit,
-    # agent_config.recursion_limit), so we must set both to cap loop depth.
-    # 30 agent steps × 2 LangGraph nodes/step = 60 LangGraph nodes.
-    # Bumped from 24/48 after local002 was 2 steps away from a correct answer at step 24.
-    # Doom-loop prompt rules (3-consecutive-error cutoff) are the primary guard against
-    # runaway loops; the step limit is a hard backstop only.
-    executor._graph_recursion_limit = 60
 
-    # auto_output_modality=False: skip the post-submit Vega visualizer agent. Spider 2.0
-    # scoring only needs SQL + dataframe; the visualizer fires extra LLM calls after
-    # submit_result that can hit the 180s read timeout and bubble up an httpx.ReadTimeout
-    # — which the benchmark loop then mis-marks as a full question failure even though
-    # submit_result already succeeded (observed on local054 in the 15-winner A100 run).
     agent = bao.agent(domain=domain, llm_config=llm_config, agent_config=agent_config,
                       data_executor=executor, stream_ask=False, auto_output_modality=False)
     return agent, tmp_dce
@@ -500,11 +244,7 @@ def compare_dataframes(pred: pd.DataFrame, gold: pd.DataFrame, condition_cols=No
 
 
 def score_against_gold(pred_df: pd.DataFrame, instance_id: str, standards: dict) -> tuple[int, str]:
-    """
-    Compare pred_df against all gold exec_result CSVs for this instance.
-    Returns (score 0/1, description).
-    """
-    # Find gold files: local002_a.csv, local002_b.csv, etc.
+    """Compare pred_df against all gold exec_result CSVs for this instance."""
     pattern = re.compile(rf"^{re.escape(instance_id)}(_[a-z])?\.csv$")
     gold_files = sorted(GOLD_EXEC_DIR / f for f in os.listdir(GOLD_EXEC_DIR) if pattern.match(f))
 
@@ -515,9 +255,8 @@ def score_against_gold(pred_df: pd.DataFrame, instance_id: str, standards: dict)
     condition_cols = standard.get("condition_cols")
     ignore_order = standard.get("ignore_order", False)
 
-    # Flatten nested condition_cols if needed (Spider2 stores them as list of lists)
     if isinstance(condition_cols, list) and condition_cols and isinstance(condition_cols[0], list):
-        flat_cols = condition_cols  # multiple gold files → list of per-gold condition_cols
+        flat_cols = condition_cols
     else:
         flat_cols = [condition_cols] * len(gold_files)
 
@@ -526,7 +265,7 @@ def score_against_gold(pred_df: pd.DataFrame, instance_id: str, standards: dict)
             gold_df = pd.read_csv(gold_file)
             if compare_dataframes(pred_df, gold_df, condition_cols=cols, ignore_order=ignore_order):
                 return 1, f"matches {gold_file.name}"
-        except Exception as e:
+        except Exception:
             continue
 
     return 0, "result_mismatch"
@@ -535,12 +274,7 @@ def score_against_gold(pred_df: pd.DataFrame, instance_id: str, standards: dict)
 # ── Agent trace logging ───────────────────────────────────────────────────────
 
 def log_agent_trace(thread, instance_id: str, full: bool = False, trace_dir: Path | None = None) -> None:
-    """Print the full agent conversation trace: every tool call and its result.
-
-    If `full` is True, no truncation is applied to message bodies / tool results /
-    SQL previews. If `trace_dir` is set, the raw message history is also written
-    as a JSON file at `<trace_dir>/<instance_id>.json` for offline inspection.
-    """
+    """Print the full agent conversation trace and optionally write to JSON."""
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
     try:
@@ -554,7 +288,6 @@ def log_agent_trace(thread, instance_id: str, full: bool = False, trace_dir: Pat
         print(f"  [trace] no messages in thread state for {instance_id}")
         return
 
-    # Optional raw JSON dump (lossless, for offline inspection)
     if trace_dir is not None:
         trace_dir.mkdir(parents=True, exist_ok=True)
         dump = []
@@ -636,7 +369,12 @@ def log_agent_trace(thread, instance_id: str, full: bool = False, trace_dir: Pat
 def main():
     parser = argparse.ArgumentParser(description="Spider 2.0 local track benchmark for databao-agent")
     parser.add_argument("--instances", type=str, help="Comma-separated instance IDs (e.g. local003,local008)")
+    parser.add_argument("--skip-instances", type=str, help="Comma-separated instance IDs to skip")
     parser.add_argument("--limit", type=int, help="Run only first N questions")
+    parser.add_argument("--model", type=str, default=os.environ.get("MODEL", "gpt-4.1"),
+                        help="Model name (default: gpt-4.1)")
+    parser.add_argument("--api-base-url", type=str, default=os.environ.get("API_BASE_URL"),
+                        help="Base URL for OpenAI-compatible API (optional)")
     parser.add_argument("--output", type=str, help="Output CSV file path")
     parser.add_argument("--full-trace", action="store_true",
                         help="Print agent traces without truncating message bodies / tool results.")
@@ -646,18 +384,23 @@ def main():
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
 
     instances = args.instances.split(",") if args.instances else None
-    questions = load_questions(instances=instances, limit=args.limit)
+    skip_instances = args.skip_instances.split(",") if args.skip_instances else None
+    questions = load_questions(instances=instances, skip_instances=skip_instances, limit=args.limit)
 
     if not questions:
         print("No questions matched the filters.")
         sys.exit(1)
 
+    if skip_instances:
+        print(f"Skipping {len(skip_instances)} instance(s)")
+
     standards = load_eval_standards()
-    vllm_base_url, model_name = get_vllm_endpoint()
+    model_name = args.model
+    api_base_url = args.api_base_url
 
     print(f"Running {len(questions)} questions | model: {model_name}")
-    if vllm_base_url:
-        print(f"vLLM endpoint: {vllm_base_url}")
+    if api_base_url:
+        print(f"API base URL: {api_base_url}")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -710,7 +453,7 @@ def main():
 
             tmp_dce = None
             try:
-                agent, tmp_dce = setup_agent(db_path, vllm_base_url, model_name, ext_doc)
+                agent, tmp_dce = setup_agent(db_path, model_name, api_base_url, ext_doc)
                 thread = agent.thread()
                 thread.ask(question)
 
@@ -756,10 +499,8 @@ def main():
                 try:
                     log_agent_trace(thread, instance_id, full=args.full_trace, trace_dir=trace_dir)
                 except Exception as trace_err:
-                    # Surface the failure instead of silently dropping the trace
                     print(f"  [trace] log_agent_trace raised: {trace_err}")
 
-            # Clean up per-question temp DCE project dir
             if tmp_dce is not None:
                 shutil.rmtree(tmp_dce, ignore_errors=True)
 
