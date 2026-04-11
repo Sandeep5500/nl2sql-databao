@@ -286,7 +286,7 @@ def main() -> None:
     parser.add_argument(
         "--dce-dir",
         type=Path,
-        default=Path("/data/user_data/sandeep3/personal/capstone/spider2-dce"),
+        default=Path(__file__).parent.parent / "spider2-dce",
         help="Path to the DCE project directory (contains dce.ini)",
     )
     parser.add_argument(

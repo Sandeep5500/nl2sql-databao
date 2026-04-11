@@ -7,15 +7,17 @@ Run after downloading SQLite files to spider2-localdb/:
   python setup_dce_spider2.py
 
 Expects sqlite files at:
-  /data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite/resource/databases/spider2-localdb/
+  Spider2/spider2-lite/resource/databases/spider2-localdb/
 """
 
 import os
 import re
 import sys
+from pathlib import Path
 
-SQLITE_DIR = "/data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite/resource/databases/spider2-localdb"
-DCE_OUTPUT_DIR = "/data/user_data/sandeep3/personal/capstone/spider2-dce/src/databases"
+REPO_DIR = Path(__file__).parent.parent
+SQLITE_DIR = str(REPO_DIR / "Spider2" / "spider2-lite" / "resource" / "databases" / "spider2-localdb")
+DCE_OUTPUT_DIR = str(REPO_DIR / "spider2-dce" / "src" / "databases")
 
 # Exclude oracle_sql — broken view (emp_hire_periods_with_name) that crashes DuckDB schema inspection
 EXCLUDE_DBS = {"oracle_sql"}

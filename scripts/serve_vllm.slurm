@@ -5,8 +5,8 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --time=12:00:00
-#SBATCH --output=/data/user_data/sandeep3/personal/nl2sql-databao/logs/vllm_%j.out
-#SBATCH --error=/data/user_data/sandeep3/personal/nl2sql-databao/logs/vllm_%j.err
+#SBATCH --output=/data/user_data/sandeep3/personal/nl2sql-databao/logs/vllm/vllm_%j.out
+#SBATCH --error=/data/user_data/sandeep3/personal/nl2sql-databao/logs/vllm/vllm_%j.err
 
 # Serve a local LLM via vLLM with OpenAI-compatible API for databao-agent.
 #
@@ -80,26 +80,24 @@ module load cuda-12.1 2>/dev/null || true
 cd "$CAPSTONE_DIR/databao-agent"
 VENV_PYTHON="$CAPSTONE_DIR/databao-agent/.venv/bin/python"
 
+if [ ! -f "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "import torch.types" 2>/dev/null; then
+    echo "Recreating venv (missing or broken torch)..."
+    rm -rf "$CAPSTONE_DIR/databao-agent/.venv"
+    python3.12 -m venv "$CAPSTONE_DIR/databao-agent/.venv"
+fi
+
 if ! "$VENV_PYTHON" -c "import vllm" 2>/dev/null; then
-    echo "Installing vllm..."
-    uv pip install --python "$VENV_PYTHON" vllm --quiet
+    echo "Installing vllm==0.18.1..."
+    uv pip install --python "$VENV_PYTHON" "vllm==0.18.1" numpy --quiet
 fi
 
 # GLM-4.7-Flash requires transformers from git main (glm4_moe_lite architecture).
 # Qwen3 works with stable PyPI transformers. We always restore stable first,
 # then upgrade to git main only for GLM.
-echo "Restoring stable transformers..."
-uv pip install --python "$VENV_PYTHON" --quiet "transformers" --upgrade
-
-if [[ "$MODEL" == *"GLM"* ]] || [[ "$MODEL" == *"glm"* ]]; then
-    echo "GLM model: installing transformers from git main (required for glm4_moe_lite)..."
-    uv pip install --python "$VENV_PYTHON" --quiet \
-        "git+https://github.com/huggingface/transformers.git" \
-        --upgrade
-    # uv.lock pins regex==2025.9.18; transformers git main requires >=2025.10.22.
-    echo "Force-upgrading regex (bypasses uv.lock pin)..."
-    uv pip install --python "$VENV_PYTHON" --quiet "regex==2026.4.4" --no-deps
-fi
+# GLM-4.7-Flash-AWQ uses the glm4_moe_lite architecture which requires transformers >= 5.x.
+# Pin to 5.5.3 (tested working) and ensure regex >= 2025.10.22 (required by transformers 5.x).
+echo "Installing transformers==5.5.3 + regex (for glm4_moe_lite support)..."
+uv pip install --python "$VENV_PYTHON" --quiet "transformers==5.5.3" "regex>=2025.10.22" --upgrade
 
 echo "Starting vLLM server..."
 
