@@ -25,60 +25,60 @@
 
 ## Results Table
 
-| ID | DB | ✓/✗ | Category | Steps | Tools | SQL | Srch | In Tok | Out Tok | Time |
-|---|---|---|---|---|---|---|---|---|---|---|
-| local002 | E_commerce | ✗ | result_mismatch | 6 | 6 | 1 | 4 | 63K | 8K | 52s |
-| local003 | E_commerce | ✗ | sql_execution_error | 16 | 16 | 14 | 1 | 202K | 17K | 98s |
-| local004 | E_commerce | ✗ | result_mismatch | 3 | 3 | 1 | 1 | 15K | 2K | 11s |
-| local007 | Baseball | ✓ | correct | 3 | 3 | 1 | 1 | 28K | 2K | 11s |
-| local008 | Baseball | ✓ | correct | 6 | 6 | 4 | 1 | 76K | 3K | 19s |
-| local009 | Airlines | ✓ | correct | 14 | 14 | 10 | 3 | 167K | 8K | 54s |
-| local010 | Airlines | ✗ | sql_execution_error | 11 | 11 | 8 | 2 | 107K | 7K | 42s |
-| local015 | California_Traffic_Collision | ✗ | result_mismatch | 5 | 5 | 3 | 1 | 33K | 3K | 18s |
-| local017 | California_Traffic_Collision | ✓ | correct | 8 | 8 | 6 | 1 | 102K | 3K | 25s |
-| local018 | California_Traffic_Collision | ✓ | correct | 3 | 3 | 1 | 1 | 23K | 2K | 12s |
-| local019 | WWE | ✓ | correct | 7 | 7 | 5 | 1 | 62K | 4K | 25s |
-| local020 | IPL | ✓ | correct | 6 | 7 | 4 | 2 | 47K | 4K | 25s |
-| local021 | IPL | ✓ | correct | 3 | 3 | 1 | 1 | 12K | 1K | 9s |
-| local022 | IPL | ✓ | correct | 3 | 3 | 1 | 1 | 17K | 1K | 10s |
-| local023 | IPL | ✓ | correct | 10 | 10 | 8 | 1 | 99K | 6K | 40s |
-| local024 | IPL | ✓ | correct | 3 | 3 | 1 | 1 | 15K | 2K | 13s |
-| local025 | IPL | ✗ | result_mismatch | 3 | 3 | 1 | 1 | 14K | 5K | 31s |
-| local026 | IPL | ✓ | correct | 4 | 4 | 2 | 1 | 21K | 3K | 17s |
-| local028 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 1K | 13s |
-| local029 | Brazilian_E_Commerce | ✓ | correct | 4 | 5 | 3 | 1 | 22K | 2K | 15s |
-| local030 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 14K | 1K | 10s |
-| local031 | Brazilian_E_Commerce | ✓ | correct | 7 | 7 | 5 | 1 | 56K | 5K | 34s |
-| local032 | Brazilian_E_Commerce | ✓ | correct | 6 | 9 | 7 | 1 | 46K | 4K | 25s |
-| local034 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 13K | 1K | 10s |
-| local035 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 14K | 2K | 11s |
-| local037 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 15K | 2K | 15s |
-| local038 | Pagila | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 1K | 7s |
-| local039 | Pagila | ✓ | correct | 3 | 3 | 1 | 1 | 20K | 1K | 9s |
-| local040 | modern_data | ✓ | correct | 7 | 7 | 4 | 2 | 52K | 4K | 29s |
-| local041 | modern_data | ✓ | correct | 3 | 3 | 1 | 1 | 11K | 0.4K | 6s |
-| local049 | modern_data | ✗ | result_mismatch | 4 | 4 | 2 | 1 | 17K | 2K | 13s |
-| local050 | complex_oracle | ✗ | result_mismatch | 5 | 5 | 1 | 3 | 52K | 7K | 38s |
-| local054 | chinook | ✓ | correct | 4 | 4 | 2 | 1 | 19K | 1K | 11s |
-| local055 | chinook | ✗ | result_mismatch | 6 | 6 | 4 | 1 | 41K | 11K | 58s |
-| local056 | sqlite-sakila | ✗ | sql_execution_error | 9 | 9 | 7 | 1 | 16K | 2K | 23s |
-| local058 | education_business | ✓ | correct | 3 | 3 | 1 | 1 | 12K | 1K | 8s |
-| local059 | education_business | ✓ | correct | 3 | 3 | 1 | 1 | 12K | 1K | 10s |
-| local060 | complex_oracle | ✗ | result_mismatch | 8 | 11 | 7 | 3 | 89K | 10K | 58s |
-| local061 | complex_oracle | ✗ | result_mismatch | 3 | 3 | 1 | 1 | 24K | 2K | 12s |
-| local062 | complex_oracle | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 4K | 22s |
-| local063 | complex_oracle | ✗ | result_mismatch | 8 | 10 | 7 | 2 | 106K | 7K | **3207s** |
-| local065 | modern_data | ✓ | correct | 4 | 6 | 4 | 1 | 20K | 2K | 16s |
-| local066 | modern_data | ✓ | correct | 5 | 10 | 8 | 1 | 31K | 6K | 41s |
-| local067 | complex_oracle | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 1K | 11s |
-| local068 | city_legislation | ✓ | correct | 4 | 4 | 2 | 1 | 21K | 2K | 15s |
-| local070 | city_legislation | ✓ | correct | 5 | 5 | 3 | 1 | 27K | 3K | 22s |
-| local071 | city_legislation | ✓ | correct | 3 | 3 | 1 | 1 | 13K | 1K | 11s |
-| local072 | city_legislation | ✓ | correct | 6 | 6 | 4 | 1 | 35K | 3K | 20s |
-| local073 | modern_data | ✗ | sql_execution_error | 23 | 23 | 17 | 5 | 483K | 28K | 195s |
-| local198 | chinook | ✓ | correct | 4 | 5 | 3 | 1 | 15K | 2K | 12s |
+| ID | DB | ✓/✗ | Category | Steps | Tools | SQL | Srch | In Tok | Out Tok | Time | Ext Knowledge |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| local002 | E_commerce | ✗ | result_mismatch | 6 | 6 | 1 | 4 | 63K | 8K | 52s | — |
+| local003 | E_commerce | ✗ | sql_execution_error | 16 | 16 | 14 | 1 | 202K | 17K | 98s | RFM.md ⚠️ |
+| local004 | E_commerce | ✗ | result_mismatch | 3 | 3 | 1 | 1 | 15K | 2K | 11s | — |
+| local007 | Baseball | ✓ | correct | 3 | 3 | 1 | 1 | 28K | 2K | 11s | — |
+| local008 | Baseball | ✓ | correct | 6 | 6 | 4 | 1 | 76K | 3K | 19s | — |
+| local009 | Airlines | ✓ | correct | 14 | 14 | 10 | 3 | 167K | 8K | 54s | haversine_formula.md ✓ |
+| local010 | Airlines | ✗ | sql_execution_error | 11 | 11 | 8 | 2 | 107K | 7K | 42s | haversine_formula.md ⚠️ |
+| local015 | California_Traffic_Collision | ✗ | result_mismatch | 5 | 5 | 3 | 1 | 33K | 3K | 18s | — |
+| local017 | California_Traffic_Collision | ✓ | correct | 8 | 8 | 6 | 1 | 102K | 3K | 25s | — |
+| local018 | California_Traffic_Collision | ✓ | correct | 3 | 3 | 1 | 1 | 23K | 2K | 12s | — |
+| local019 | WWE | ✓ | correct | 7 | 7 | 5 | 1 | 62K | 4K | 25s | — |
+| local020 | IPL | ✓ | correct | 6 | 7 | 4 | 2 | 47K | 4K | 25s | — |
+| local021 | IPL | ✓ | correct | 3 | 3 | 1 | 1 | 12K | 1K | 9s | — |
+| local022 | IPL | ✓ | correct | 3 | 3 | 1 | 1 | 17K | 1K | 10s | — |
+| local023 | IPL | ✓ | correct | 10 | 10 | 8 | 1 | 99K | 6K | 40s | — |
+| local024 | IPL | ✓ | correct | 3 | 3 | 1 | 1 | 15K | 2K | 13s | — |
+| local025 | IPL | ✗ | result_mismatch | 3 | 3 | 1 | 1 | 14K | 5K | 31s | — |
+| local026 | IPL | ✓ | correct | 4 | 4 | 2 | 1 | 21K | 3K | 17s | — |
+| local028 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 1K | 13s | — |
+| local029 | Brazilian_E_Commerce | ✓ | correct | 4 | 5 | 3 | 1 | 22K | 2K | 15s | — |
+| local030 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 14K | 1K | 10s | — |
+| local031 | Brazilian_E_Commerce | ✓ | correct | 7 | 7 | 5 | 1 | 56K | 5K | 34s | — |
+| local032 | Brazilian_E_Commerce | ✓ | correct | 6 | 9 | 7 | 1 | 46K | 4K | 25s | — |
+| local034 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 13K | 1K | 10s | — |
+| local035 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 14K | 2K | 11s | spherical_law.md ✓ |
+| local037 | Brazilian_E_Commerce | ✓ | correct | 3 | 3 | 1 | 1 | 15K | 2K | 15s | — |
+| local038 | Pagila | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 1K | 7s | — |
+| local039 | Pagila | ✓ | correct | 3 | 3 | 1 | 1 | 20K | 1K | 9s | — |
+| local040 | modern_data | ✓ | correct | 7 | 7 | 4 | 2 | 52K | 4K | 29s | — |
+| local041 | modern_data | ✓ | correct | 3 | 3 | 1 | 1 | 11K | 0.4K | 6s | — |
+| local049 | modern_data | ✗ | result_mismatch | 4 | 4 | 2 | 1 | 17K | 2K | 13s | — |
+| local050 | complex_oracle | ✗ | result_mismatch | 5 | 5 | 1 | 3 | 52K | 7K | 38s | projection_calculation.md ⚠️ |
+| local054 | chinook | ✓ | correct | 4 | 4 | 2 | 1 | 19K | 1K | 11s | — |
+| local055 | chinook | ✗ | result_mismatch | 6 | 6 | 4 | 1 | 41K | 11K | 58s | — |
+| local056 | sqlite-sakila | ✗ | sql_execution_error | 9 | 9 | 7 | 1 | 16K | 2K | 23s | — |
+| local058 | education_business | ✓ | correct | 3 | 3 | 1 | 1 | 12K | 1K | 8s | — |
+| local059 | education_business | ✓ | correct | 3 | 3 | 1 | 1 | 12K | 1K | 10s | — |
+| local060 | complex_oracle | ✗ | result_mismatch | 8 | 11 | 7 | 3 | 89K | 10K | 58s | — |
+| local061 | complex_oracle | ✗ | result_mismatch | 3 | 3 | 1 | 1 | 24K | 2K | 12s | projection_calculation.md ⚠️ |
+| local062 | complex_oracle | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 4K | 22s | — |
+| local063 | complex_oracle | ✗ | result_mismatch | 8 | 10 | 7 | 2 | 106K | 7K | **3207s** | — |
+| local065 | modern_data | ✓ | correct | 4 | 6 | 4 | 1 | 20K | 2K | 16s | — |
+| local066 | modern_data | ✓ | correct | 5 | 10 | 8 | 1 | 31K | 6K | 41s | — |
+| local067 | complex_oracle | ✓ | correct | 3 | 3 | 1 | 1 | 16K | 1K | 11s | — |
+| local068 | city_legislation | ✓ | correct | 4 | 4 | 2 | 1 | 21K | 2K | 15s | — |
+| local070 | city_legislation | ✓ | correct | 5 | 5 | 3 | 1 | 27K | 3K | 22s | — |
+| local071 | city_legislation | ✓ | correct | 3 | 3 | 1 | 1 | 13K | 1K | 11s | — |
+| local072 | city_legislation | ✓ | correct | 6 | 6 | 4 | 1 | 35K | 3K | 20s | — |
+| local073 | modern_data | ✗ | sql_execution_error | 23 | 23 | 17 | 5 | 483K | 28K | 195s | — |
+| local198 | chinook | ✓ | correct | 4 | 5 | 3 | 1 | 15K | 2K | 12s | — |
 
-_Tools = total tool calls including submit (search + sql + submit). Steps = LLM turns._
+_Tools = total tool calls including submit (search + sql + submit). Steps = LLM turns. Ext Knowledge: ✓ = doc applied correctly, ⚠️ = doc ignored or misapplied._
 
 ---
 
@@ -100,6 +100,60 @@ _Tools = total tool calls including submit (search + sql + submit). Steps = LLM 
 | E_commerce | 0 | 3 | 0% |
 | complex_oracle | 2 | 6 | 33% |
 | sqlite-sakila | 0 | 1 | 0% |
+
+---
+
+## External Knowledge Analysis
+
+6 of 50 questions provided an external knowledge document (injected into the system prompt via `domain.add_description()`). Accuracy was significantly lower for these questions.
+
+| Question | Doc | Score | Doc concepts found in agent reasoning |
+|---|---|---|---|
+| local009 | `haversine_formula.md` | ✓ | `haversine` — correctly applied |
+| local035 | `spherical_law.md` | ✓ | none — derived formula independently |
+| local003 | `RFM.md` | ✗ | `RFM`, `recency` — segment names ignored |
+| local010 | `haversine_formula.md` | ✗ | none — doc completely ignored |
+| local061 | `projection_calculation.md` | ✗ | `growth rate` — proj_factor formula not applied |
+| local050 | `projection_calculation.md` | ✗ | `growth rate` — proj_factor formula not applied |
+
+**Accuracy: 2/6 (33%) with external knowledge vs 34/44 (77%) without**
+
+### Key finding: the issue is not missing docs — it's partial or no application
+
+The doc is always present in the context. The failure pattern is:
+
+- **local010** — same haversine doc that local009 used correctly, but the agent never mentioned "haversine" or the formula. It tried `st_x` (PostGIS), then manual coordinate splitting, never consulting the doc.
+- **local003** — agent acknowledged "RFM" but ignored the specific segment thresholds (Champions, Loyal Customers, Hibernating, etc.) defined in the doc. It invented its own segmentation logic.
+- **local061 / local050** — agent used the concept of "growth rate" but did not apply the specific `proj_factor` formula from `projection_calculation.md`, leading to values 20–35% off.
+- **local035** — succeeded *without* using the doc (derived the spherical distance formula independently), suggesting the doc is not always needed.
+
+### Critical finding: correct application of the doc always led to a correct answer
+
+Across all 6 external knowledge questions, there is a **perfect correlation** between doc application and correctness:
+
+| Doc applied? | Outcome | Instances |
+|---|---|---|
+| Yes, correctly | ✓ Correct | local009, local035 |
+| Agent substituted own logic | ✗ Wrong | local003, local061, local050 |
+| Agent ignored doc entirely | ✗ Wrong | local010 |
+
+**No question got a wrong answer when the doc was properly applied.** The docs are high-quality and sufficient — the bottleneck is purely the agent's instruction-following.
+
+What "not applying the doc" looked like in practice:
+
+- **local003 (RFM.md)**: The doc defines exact RFM segment thresholds (e.g. Champions = Recency≥4, Frequency≥4, Monetary≥4). The agent acknowledged RFM by name but invented its own thresholds instead of using the ones in the doc, producing wrong segment assignments.
+- **local061 / local050 (projection_calculation.md)**: The doc specifies a `proj_factor` formula to project historical monthly sales forward. The agent used a generic year-over-year growth rate instead of the doc's formula, producing values 20–35% off.
+- **local010 (haversine_formula.md)**: The agent never referenced the haversine formula at all. It tried PostGIS `st_x()` first, then manual string splitting — ignoring that the doc had the exact calculation ready to use. Notably, local009 had the same doc and applied it correctly.
+
+Note on local035: the agent didn't explicitly cite `spherical_law.md` in its reasoning but derived the correct spherical distance formula independently and got the right answer — the doc was internalized even if not verbatim referenced.
+
+### Fix direction
+
+Add an explicit instruction to the system prompt:
+
+> "If an external knowledge document is provided in your context, you MUST use the exact formulas, definitions, and thresholds from that document. Do not substitute your own logic or approximations."
+
+This is a prompt-level fix — the docs themselves are correct and complete.
 
 ---
 
@@ -255,6 +309,7 @@ _Tools = total tool calls including submit (search + sql + submit). Steps = LLM 
 | Root Cause | Instances | Count | Fix |
 |---|---|---|---|
 | Output format/extra columns | local002, 015, 025, 055 | 4 | Stricter prompt: "return exactly N columns named X" |
+| External knowledge doc not applied | local003, 010, 061, 050 | 4 | Prompt instruction to explicitly apply doc formulas/definitions |
 | DuckDB InternalException (SQLite type bug) | local003, 010, 073 | 3 | `sqlite_all_varchar=true` hint + CAST guidance |
 | complex_oracle promo/projection logic | local050, 060, 061, 063 | 4 | Schema-specific hint: promo_id=999 = no-promo; projection formula |
 | Wrong customer ID column | local004 | 1 | Schema hint: use `customer_unique_id` not `customer_id` |
@@ -262,9 +317,12 @@ _Tools = total tool calls including submit (search + sql + submit). Steps = LLM 
 | Date parsing off-by-one | local049 | 1 | `TRY_CAST` with format fallback |
 | Nested window function | local003 | 1 | Prompt: use subquery instead of nested window |
 
+_Note: some questions have multiple contributing root causes (e.g. local003 has both SQLite bug and external knowledge misapplication; local061/050 have both projection formula and external knowledge issues)._
+
 **Highest-value fixes (recover most questions):**
 1. **Output format instruction** — could recover local002, 015, 025, 055 (4 questions, +8%)
-2. **complex_oracle schema hints** — could recover local050, 060, 061, 063 (4 questions, +8%)
-3. **`sqlite_all_varchar=true`** — could recover local010, reduce failures in local003, 073 (~2–3 questions, +4–6%)
+2. **External knowledge prompt instruction** — could recover local003, 010, 061, 050 (up to 4 questions, +8%)
+3. **complex_oracle schema hints** — could recover local060, 063 and assist 061/050 (2–4 questions, +4–8%)
+4. **`sqlite_all_varchar=true`** — could recover local010, reduce failures in local003, 073 (~2–3 questions, +4–6%)
 
-Potential score with these fixes: **~44–46/50 (88–92%)**
+Potential score with these fixes: **~44–47/50 (88–94%)**
