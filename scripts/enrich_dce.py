@@ -6,7 +6,7 @@ API directly, bypassing the Ollama layer entirely.  All other DCE internals
 (embedding, chunking, indexing) are used unchanged.
 
 Usage (standalone, server already running):
-    cd /data/user_data/sandeep3/personal/capstone/databao-context-engine
+    cd <repo>/databao-context-engine
     uv run python ../scripts/enrich_dce.py \\
         --vllm-host babel-u9-20 --vllm-port 8766 \\
         --vllm-model Qwen/Qwen3-32B-AWQ \\
@@ -286,7 +286,7 @@ def main() -> None:
     parser.add_argument(
         "--dce-dir",
         type=Path,
-        default=Path("/data/user_data/sandeep3/personal/capstone/spider2-dce"),
+        default=Path(__file__).parent.parent / "spider2-dce",
         help="Path to the DCE project directory (contains dce.ini)",
     )
     parser.add_argument(

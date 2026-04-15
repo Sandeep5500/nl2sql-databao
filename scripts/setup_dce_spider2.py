@@ -7,15 +7,17 @@ Run after downloading SQLite files to spider2-localdb/:
   python setup_dce_spider2.py
 
 Expects sqlite files at:
-  /data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite/resource/databases/spider2-localdb/
+  <repo>/Spider2/spider2-lite/resource/databases/sqlite/
 """
 
 import os
 import re
 import sys
+from pathlib import Path
 
-SQLITE_DIR = "/data/user_data/sandeep3/personal/capstone/Spider2/spider2-lite/resource/databases/spider2-localdb"
-DCE_OUTPUT_DIR = "/data/user_data/sandeep3/personal/capstone/spider2-dce/src/databases"
+_REPO_ROOT = Path(__file__).parent.parent
+SQLITE_DIR = str(_REPO_ROOT / "Spider2" / "spider2-lite" / "resource" / "databases" / "sqlite")
+DCE_OUTPUT_DIR = str(_REPO_ROOT / "spider2-dce" / "src" / "databases")
 
 # Exclude oracle_sql — broken view (emp_hire_periods_with_name) that crashes DuckDB schema inspection
 EXCLUDE_DBS = {"oracle_sql"}
@@ -62,8 +64,8 @@ connection:
     print(f"\nGenerated {len(generated)} configs, skipped {len(skipped)}")
     print(f"Output: {DCE_OUTPUT_DIR}")
     print("\nNext steps:")
-    print("  cd /data/user_data/sandeep3/personal/capstone/spider2-dce")
-    print("  alias dce='uv --project /data/user_data/sandeep3/personal/capstone/databao-context-engine run dce'")
+    print(f"  cd {_REPO_ROOT / 'spider2-dce'}")
+    print(f"  alias dce='uv --project {_REPO_ROOT / 'databao-context-engine'} run dce'")
     print("  dce datasource check")
     print("  dce build")
     print("  dce index")
