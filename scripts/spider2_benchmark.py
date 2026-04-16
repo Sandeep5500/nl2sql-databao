@@ -1,4 +1,23 @@
-#!/usr/bin/env python3
+from __future__ import annotations
+# Force UTF-8 mode on Windows
+import os
+import sys
+if os.name == 'nt' and os.environ.get('PYTHONUTF8') != '1':
+    os.environ['PYTHONUTF8'] = '1'
+    import subprocess
+    try:
+        sys.exit(subprocess.run([sys.executable] + sys.argv).returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+from pathlib import Path
+
+# Ensure databao-agent is in the path for all imports in this file
+CAPSTONE_DIR = Path(__file__).parent.parent.resolve()
+agent_path = str(CAPSTONE_DIR / "databao-agent")
+if agent_path not in sys.path:
+    sys.path.insert(0, agent_path)
+
 """
 Spider 2.0 (local SQLite track) benchmark runner for databao-agent.
 
@@ -22,46 +41,50 @@ Environment variables:
     VLLM_MODEL   model name (default: Qwen/Qwen3-32B-AWQ)
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import json
 import math
-import os
 import re
 import shutil
-import sys
 import tempfile
 import time
-import urllib.request
+import sqlite3
+import pandas as pd
+import requests
 import urllib.error
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
-
 # ── Paths ────────────────────────────────────────────────────────────────────
-CAPSTONE_DIR = Path(__file__).parent.parent
-SPIDER2_DIR = CAPSTONE_DIR / "Spider2" / "spider2-lite"
-SQLITE_DIR = SPIDER2_DIR / "resource/databases/spider2-localdb"
-EVAL_SUITE_DIR = SPIDER2_DIR / "evaluation_suite"
-GOLD_EXEC_DIR = EVAL_SUITE_DIR / "gold/exec_result"
-EVAL_JSONL = EVAL_SUITE_DIR / "gold/spider2lite_eval.jsonl"
-DOCS_DIR = SPIDER2_DIR / "resource/documents"
-QUESTIONS_FILE = SPIDER2_DIR / "spider2-lite.jsonl"
-DCE_PROJECT_DIR = CAPSTONE_DIR / "spider2-dce"
-RESULTS_DIR = CAPSTONE_DIR / "results"
-ENDPOINT_FILE = CAPSTONE_DIR / "logs/vllm_endpoint.txt"
+CAPSTONE_DIR = Path(__file__).parent.parent.resolve()
+SPIDER2_DIR = (CAPSTONE_DIR / "Spider2" / "spider2-lite").resolve()
+GOLD_EXEC_DIR = (SPIDER2_DIR / "evaluation_suite" / "gold" / "exec_result").resolve()
+GOLD_SQL_DIR = (SPIDER2_DIR / "evaluation_suite" / "gold" / "sql").resolve()
+SQLITE_DIR = (SPIDER2_DIR / "resource" / "databases" / "spider2-localdb").resolve()
+EVAL_SUITE_DIR = (SPIDER2_DIR / "evaluation_suite").resolve()
+EVAL_JSONL = (EVAL_SUITE_DIR / "gold" / "spider2lite_eval.jsonl").resolve()
+DOCS_DIR = (SPIDER2_DIR / "resource" / "documents").resolve()
+QUESTIONS_FILE = (SPIDER2_DIR / "spider2-lite.jsonl").resolve()
+DCE_PROJECT_DIR = (CAPSTONE_DIR / "spider2-dce").resolve()
+RESULTS_DIR = (CAPSTONE_DIR / "results").resolve()
+ENDPOINT_FILE = (CAPSTONE_DIR / "logs" / "vllm_endpoint.txt").resolve()
+
+# Vertex AI Configuration
+os.environ["VERTEX_PROJECT"] = os.environ.get("VERTEX_PROJECT", "lunar-geography-433410-n6")
+os.environ["VERTEX_LOCATION"] = os.environ.get("VERTEX_LOCATION", "us-central1")
+
+print(f"DEBUG: CAPSTONE_DIR = {CAPSTONE_DIR}")
+print(f"DEBUG: DCE_PROJECT_DIR = {DCE_PROJECT_DIR}")
+print(f"DEBUG: SQLITE_DIR = {SQLITE_DIR}")
 
 EXCLUDE_DBS = {"oracle_sql", "stacking"}  # broken views crash DuckDB schema inspection
-
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
 def load_questions(instances=None, limit=None):
     questions = []
-    with open(QUESTIONS_FILE) as f:
+    with open(QUESTIONS_FILE, encoding="utf-8") as f:
         for line in f:
             q = json.loads(line)
             if not q["instance_id"].startswith("local"):
@@ -76,16 +99,14 @@ def load_questions(instances=None, limit=None):
         questions = questions[:limit]
     return questions
 
-
 def load_eval_standards() -> dict:
     """Load per-question eval config (condition_cols, ignore_order) from spider2lite_eval.jsonl."""
     standards = {}
-    with open(EVAL_JSONL) as f:
+    with open(EVAL_JSONL, encoding="utf-8") as f:
         for line in f:
             item = json.loads(line)
             standards[item["instance_id"]] = item
     return standards
-
 
 def get_db_path(db_name: str) -> Path | None:
     for candidate in [SQLITE_DIR / f"{db_name}.sqlite", SQLITE_DIR / f"{db_name.lower()}.sqlite"]:
@@ -96,15 +117,18 @@ def get_db_path(db_name: str) -> Path | None:
             return f
     return None
 
-
 def get_vllm_endpoint():
     host = os.environ.get("VLLM_HOST")
     port = os.environ.get("VLLM_PORT", "8765")
-    model = os.environ.get("VLLM_MODEL", "QuantTrio/GLM-4.7-Flash-AWQ")
+    model = os.environ.get("VLLM_MODEL", "gemini-2.5-pro")
+    
+    if "gemini" in model.lower() or "google" in model.lower():
+        return None, model
+
     if host:
         return f"http://{host}:{port}", model
     if ENDPOINT_FILE.exists():
-        lines = ENDPOINT_FILE.read_text().strip().splitlines()
+        lines = ENDPOINT_FILE.read_text(encoding="utf-8").strip().splitlines()
         node, node_port = lines[0].strip().rsplit(":", 1)
         for line in lines:
             if line.startswith("Model:"):
@@ -113,12 +137,8 @@ def get_vllm_endpoint():
     print("WARNING: No vLLM endpoint found. Set VLLM_HOST or run serve_vllm.slurm first.")
     return None, model
 
-
 def wait_for_vllm(timeout_seconds: int = 7200, check_interval: int = 10) -> str | None:
-    """Wait for vLLM to be ready, re-reading the endpoint file on each poll.
-
-    Returns the base URL once healthy, or None on timeout.
-    """
+    """Wait for vLLM to be ready, re-reading the endpoint file on each poll."""
     start_time = time.time()
     last_url = None
     while time.time() - start_time < timeout_seconds:
@@ -142,9 +162,7 @@ def wait_for_vllm(timeout_seconds: int = 7200, check_interval: int = 10) -> str 
     print(f"✗ vLLM server not ready after {timeout_seconds}s — aborting.")
     return None
 
-
 # ── DuckDB capability hints injected into every agent context ─────────────────
-# Prevents the agent from refusing statistical/regression questions as "ML tasks".
 DUCKDB_HINTS = """
 DuckDB SQL capabilities you MUST use instead of Python or external tools:
 - Linear regression: REGR_SLOPE(y, x), REGR_INTERCEPT(y, x), REGR_R2(y, x) — use these for any prediction/regression task
@@ -164,181 +182,49 @@ Never compute numerical values (coefficients, statistics, aggregates, scores) in
 If you are uncertain about which column, table, or join path to use, call search_context to look up the schema before writing SQL rather than guessing.
 """.strip()
 
-
 # ── Agent setup ───────────────────────────────────────────────────────────────
 
 def _make_temp_dce_project(db_name: str) -> Path:
-    """Create a minimal per-question DCE project dir.
-
-    Contains only the src YAML for the relevant database and symlinks/copies
-    the shared dce.duckdb so search_context works without loading all 28 DBs.
-    """
+    """Create a minimal per-question DCE project dir."""
     tmp = Path(tempfile.mkdtemp(prefix=f"dce_{db_name.lower()}_"))
-
-    # Project config
     shutil.copy(DCE_PROJECT_DIR / "dce.ini", tmp / "dce.ini")
-
-    # Only this database's source YAML
-    (tmp / "src" / "databases").mkdir(parents=True)
+    (tmp / "src").mkdir(parents=True, exist_ok=True)
     src_yaml = DCE_PROJECT_DIR / "src" / "databases" / f"{db_name.lower()}.yaml"
     if src_yaml.exists():
-        shutil.copy(src_yaml, tmp / "src" / "databases" / src_yaml.name)
-
-    # output/ gets its own directory (so init_or_get_dce_project can write there freely),
-    # but dce.duckdb is symlinked from the shared index (read-only search, never written).
+        shutil.copy(src_yaml, tmp / "src" / src_yaml.name)
+    with open(tmp / "dce_project.yaml", "w", encoding="utf-8") as f:
+        f.write("name: spider2-context-engine\n")
+        f.write("sources:\n")
+        f.write(f"  - {db_name.lower()}.yaml\n")
     out = tmp / "output"
-    out.mkdir()
-    (out / "databases").mkdir()
-
+    out.mkdir(exist_ok=True)
     shared_db = DCE_PROJECT_DIR / "output" / "dce.duckdb"
     if shared_db.exists():
-        (out / "dce.duckdb").symlink_to(shared_db)
-
-    # Copy the enriched output YAML so the domain has descriptions available
+        try:
+            (out / "dce.duckdb").symlink_to(shared_db)
+        except OSError:
+            try:
+                os.link(shared_db, out / "dce.duckdb")
+            except OSError:
+                print(f"  WARN: Could not symlink/link dce.duckdb to {out}. Context search may fail.")
     out_yaml = DCE_PROJECT_DIR / "output" / "databases" / f"{db_name.lower()}.yaml"
     if out_yaml.exists():
-        shutil.copy(out_yaml, out / "databases" / out_yaml.name)
-
+        shutil.copy(out_yaml, out / out_yaml.name)
     return tmp
 
-
-# ── <think>-tag stripper ──────────────────────────────────────────────────────
-#
-# Thinking models (GLM-4.7-Flash, DeepSeek R1, Qwen3 with thinking enabled, etc.)
-# emit verbose <think>...</think> monologue before each tool call. The model still
-# benefits from this on the *current* turn (chain-of-thought is preserved during
-# generation), but if we let the raw assistant message flow back into the chat
-# history, every subsequent turn re-reads the full prior monologue. Across a
-# 16-step agent loop that's thousands of wasted input tokens.
-#
-# This monkey-patch wraps databao.agent.executors.llm.chat so the *last* message
-# in the returned list (the new AIMessage) has its <think> blocks stripped before
-# being stored back into LangGraph state. Per-turn quality is unaffected (the
-# model still thinks during generation); only the cumulative history shrinks.
-#
-# Equivalent server-side option: launch vLLM with --reasoning-parser glm45 (the
-# vLLM 0.18.1 GLM-4.5 family parser, which uses the DeepSeek V3 thinking-parser
-# implementation). When that's enabled vLLM splits reasoning_content from
-# content automatically, and this client-side patch becomes a no-op.
-
-# GLM-4.7-Flash chat template prepends <think> as part of the assistant prefill,
-# so the model only emits "reasoning</think>response" in `content` — no opening
-# tag in the message string. We split on the LAST </think> to separate reasoning
-# from narrative. If there's substantive narrative after </think>, we keep it.
-# If there's no narrative (common: GLM often emits only tool_calls after </think>),
-# we replace the reasoning with a brief LLM-generated summary so the model has a
-# decision anchor when re-reading its history. The summary call is capped at
-# max_tokens=120 and hard-truncated to 500 chars so a runaway summary can't
-# balloon history anyway.
-
-_SUMMARY_MAX_CHARS = 500
-_SUMMARY_MAX_TOKENS = 120
-_SUMMARY_MIN_REASONING_CHARS = 80  # below this, don't bother summarizing
-
-_SUMMARY_SYSTEM_PROMPT = (
-    "You compress an AI agent's internal reasoning into a terse note the agent "
-    "can use as a memory anchor. Output at most 2 short sentences. Focus on: "
-    "(1) the decision the agent made, (2) WHY. Do not echo the reasoning; "
-    "extract the conclusion. Do not include <think> tags. Be direct."
-)
-
-_summary_client = None  # OpenAI client pointed at vLLM, configured via _configure_summarizer
-_summary_model_name = None
-
-
-def _configure_summarizer(vllm_base_url: str | None, model_name: str) -> None:
-    """Initialize the summarizer client once we know the vLLM endpoint."""
-    global _summary_client, _summary_model_name
-    if _summary_client is not None or not vllm_base_url:
-        return
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return
-    _summary_client = OpenAI(base_url=f"{vllm_base_url.rstrip('/')}/v1", api_key="EMPTY", timeout=60)
-    _summary_model_name = model_name
-
-
-def _get_summary_client():
-    return _summary_client, _summary_model_name
-
-
-def _summarize_reasoning(reasoning: str) -> str:
-    """Ask the LLM to compress a block of reasoning into ≤2 sentences.
-
-    Falls back to the tail of the reasoning (last ~400 chars, trimmed to sentence
-    boundary) if the summary call fails or the endpoint is not configured.
-    """
-    reasoning = reasoning.strip()
-    if len(reasoning) < _SUMMARY_MIN_REASONING_CHARS:
-        return reasoning[:_SUMMARY_MAX_CHARS]
-
-    client, model_name = _get_summary_client()
-    if client is not None:
-        try:
-            resp = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Reasoning:\n{reasoning}\n\nCompressed note:"},
-                ],
-                temperature=0.0,
-                max_tokens=_SUMMARY_MAX_TOKENS,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            )
-            summary = (resp.choices[0].message.content or "").strip()
-            # Strip any stray think tags the summarizer might have produced
-            summary = re.sub(r"<think>.*?</think>\s*", "", summary, flags=re.DOTALL)
-            summary = re.sub(r"</?think>", "", summary).strip()
-            if summary:
-                return summary[:_SUMMARY_MAX_CHARS]
-        except Exception as e:
-            print(f"  [think-stripper] summary call failed: {e}; falling back to tail heuristic")
-
-    # Fallback: last ~400 chars trimmed to a sentence boundary.
-    tail = reasoning[-400:]
-    # Find first sentence start in the tail so we don't land mid-sentence.
-    m = re.search(r"(?<=[.!?])\s+", tail)
-    if m:
-        tail = tail[m.end():]
-    return tail.strip()[:_SUMMARY_MAX_CHARS]
-
-
 def _strip_think_from_text(text: str) -> str:
-    # Unclosed <think> with no closer: truncated generation. Strip everything
-    # from the opener onward and summarize what was cut.
-    if "<think>" in text and "</think>" not in text:
-        pre, _, rest = text.partition("<think>")
-        summary = _summarize_reasoning(rest)
-        return ((pre.strip() + "\n" + summary).strip() if pre.strip() else summary)
+    """Relatively simple stripping of <think> blocks."""
+    if not isinstance(text, str):
+        return text
+    # Remove complete think blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Remove dangling tags if any
+    text = re.sub(r"</?think>", "", text)
+    return text.strip()
 
-    if "</think>" not in text:
-        return text  # no reasoning at all
-
-    # Split on LAST </think> so any intermediate reasoning is fully captured as
-    # "reasoning" and whatever the model wrote after its final </think> is
-    # treated as narrative output.
-    idx = text.rfind("</think>")
-    reasoning = text[:idx]
-    narrative = text[idx + len("</think>"):]
-    # Clean any embedded think tags inside the reasoning block itself.
-    reasoning = re.sub(r"</?think>", "", reasoning)
-
-    if narrative.strip():
-        # The model emitted real narrative after </think> — keep that verbatim,
-        # drop the reasoning entirely. Narrative is already a natural anchor.
-        return narrative.lstrip()
-
-    # No post-</think> narrative → summarize the reasoning so the model has
-    # SOMETHING to re-read when parsing its own history on the next turn.
-    return _summarize_reasoning(reasoning)
-
+# (Previously here were complex think-stripping functions using another LLM. Now simplified to regex.)
 
 def _strip_think_from_message_content(content):
-    """Strip <think>...</think> blocks from a langchain message content field.
-
-    langchain messages allow content as either str or list[dict]. We handle both.
-    """
     if isinstance(content, str):
         return _strip_think_from_text(content)
     if isinstance(content, list):
@@ -353,437 +239,353 @@ def _strip_think_from_message_content(content):
         return out
     return content
 
-
 _THINK_PATCH_INSTALLED = False
 
-
 def _install_think_stripper_once() -> None:
-    """Monkey-patch databao.agent.executors.llm.chat to strip <think> from responses."""
+    """Installs patches for the LLM execution."""
     global _THINK_PATCH_INSTALLED
     if _THINK_PATCH_INSTALLED:
         return
+    
+    from databao.agent.configs import llm as _databao_llm_config
     from databao.agent.executors import llm as _databao_llm
-
-    _orig_chat = _databao_llm.chat
-
-    def _chat_strip_think(messages, config, model=None):
-        result = _orig_chat(messages, config, model)
-        if not result:
-            return result
-        last = result[-1]
-        # Only strip if last message has a `content` attribute (AIMessage does).
-        if hasattr(last, "content") and last.content:
-            new_content = _strip_think_from_message_content(last.content)
-            if new_content != last.content:
-                # langchain messages are pydantic; use model_copy to update in-place semantics.
-                if hasattr(last, "model_copy"):
-                    new_last = last.model_copy(update={"content": new_content})
-                else:
-                    last.content = new_content
-                    new_last = last
-                result = [*result[:-1], new_last]
-        return result
-
-    _databao_llm.chat = _chat_strip_think
-    # graph.py imported `chat` directly into its module namespace, so patch that too.
-    try:
-        from databao.agent.executors.lighthouse import graph as _lh_graph
-        if hasattr(_lh_graph, "chat"):
-            _lh_graph.chat = _chat_strip_think
-    except Exception:
-        pass
-    _THINK_PATCH_INSTALLED = True
-    print("  [think-stripper] installed: <think>...</think> blocks will be stripped from AIMessage content before history reuse")
-
-
-def setup_agent(db_path: Path, vllm_base_url: str | None, model_name: str, external_knowledge_doc: str | None = None):
-    """Create a databao agent with DCE retrieval enabled for a single database."""
-    import databao.agent as bao
-    from databao.agent.configs.agent import AgentConfig
-    from databao.agent.configs.llm import LLMConfig
-
-    _install_think_stripper_once()
-    _configure_summarizer(vllm_base_url, model_name)
-
-    is_qwen3 = "Qwen3" in model_name or "qwen3" in model_name.lower()
-
-    if vllm_base_url:
-        llm_config = LLMConfig(
-            name=model_name,
-            api_base_url=f"{vllm_base_url}/v1",
-            temperature=0.0,
-            # 4096 output tokens: on A100 80GB at max_model_len=60000 we no longer need
-            # to starve max_tokens. Lifted from 1024 (the A6000 setting) because GLM's
-            # verbose pre-tool-call reasoning was being truncated mid-thought, causing
-            # the final assistant turn to land with empty tool_calls and the agent to
-            # terminate without emitting SQL (observed on local022, local025).
-            max_tokens=4096,
-            timeout=180,
-            use_responses_api=False,
-            # Qwen3 only: disable thinking mode via chat_template_kwargs per-request.
-            # GLM-4.7-Flash does not have thinking mode, so this is skipped for GLM.
-            **({"model_kwargs": {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}}
-               if is_qwen3 else {}),
-        )
-    else:
-        ollama_model = os.environ.get("OLLAMA_SQL_MODEL", "glm4.7-flash:latest")
-        llm_config = LLMConfig(
-            name=f"ollama:{ollama_model}",
-            temperature=0.0,
-            max_tokens=8192,
-            use_responses_api=False,
-        )
-
-    agent_config = AgentConfig(recursion_limit=30, min_retrievals=1)
-
-    # Build a temp DCE project with only this DB's YAML — enables search_context tool
-    # without loading all 28 databases into DuckDB simultaneously.
-    tmp_dce = _make_temp_dce_project(db_path.stem)
-
-    domain = bao.domain(project_dir=tmp_dce)
-    domain.add_description(DUCKDB_HINTS)
-
-    if external_knowledge_doc:
-        doc_path = DOCS_DIR / external_knowledge_doc
-        if doc_path.exists():
-            doc_text = doc_path.read_text()
-            # Guard against very large external knowledge docs consuming too much context.
-            # At ~4 chars/token, 20K chars ≈ 5K tokens. GLM context is only 28K, so
-            # haversine_formula.md and similar long docs must be tightly truncated.
-            if len(doc_text) > 20_000:
-                doc_text = doc_text[:20_000] + "\n\n[... external knowledge truncated ...]"
-                print(f"  WARN: external_knowledge doc truncated to 20K chars")
-            domain.add_description(doc_text)
-        else:
-            print(f"  WARN: external_knowledge doc not found: {doc_path}")
-
-    from databao.agent.executors import LighthouseExecutor
-
-    executor = LighthouseExecutor()
-    # Cap schema at ~60K chars (~15K tokens). LighthouseExecutor has a 3-tier fallback:
-    #   1. Full schema with columns (if ≤ 60K chars)
-    #   2. Table names only, no columns (if > 60K chars) — agent uses search_context for details
-    #   3. Schema overview only (if still > 60K chars)
-    # Default is 250K chars which doesn't help on a 40K-token context model.
-    executor._max_schema_summary_length = 60_000
-    # Override _graph_recursion_limit (default 50 in base.py) so LangGraph actually
-    # respects our recursion_limit. base.py uses max(self._graph_recursion_limit,
-    # agent_config.recursion_limit), so we must set both to cap loop depth.
-    # 30 agent steps × 2 LangGraph nodes/step = 60 LangGraph nodes.
-    # Bumped from 24/48 after local002 was 2 steps away from a correct answer at step 24.
-    # Doom-loop prompt rules (3-consecutive-error cutoff) are the primary guard against
-    # runaway loops; the step limit is a hard backstop only.
-    executor._graph_recursion_limit = 60
-
-    # auto_output_modality=False: skip the post-submit Vega visualizer agent. Spider 2.0
-    # scoring only needs SQL + dataframe; the visualizer fires extra LLM calls after
-    # submit_result that can hit the 180s read timeout and bubble up an httpx.ReadTimeout
-    # — which the benchmark loop then mis-marks as a full question failure even though
-    # submit_result already succeeded (observed on local054 in the 15-winner A100 run).
-    agent = bao.agent(domain=domain, llm_config=llm_config, agent_config=agent_config,
-                      data_executor=executor, stream_ask=False, auto_output_modality=False)
-    return agent, tmp_dce
-
-
-# ── Evaluation (ported from Spider2's evaluate.py) ────────────────────────────
-
-def _normalize(value):
-    if pd.isna(value):
-        return 0
-    return value
-
-
-def _vectors_match(v1, v2, tol=1e-2, ignore_order=False):
-    v1 = [_normalize(x) for x in v1]
-    v2 = [_normalize(x) for x in v2]
-    if ignore_order:
-        v1 = sorted(v1, key=lambda x: (x is None, str(x), isinstance(x, (int, float))))
-        v2 = sorted(v2, key=lambda x: (x is None, str(x), isinstance(x, (int, float))))
-    if len(v1) != len(v2):
-        return False
-    for a, b in zip(v1, v2):
-        if pd.isna(a) and pd.isna(b):
-            continue
-        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            if not math.isclose(float(a), float(b), abs_tol=tol):
-                return False
-        elif a != b:
-            return False
-    return True
-
-
-def compare_dataframes(pred: pd.DataFrame, gold: pd.DataFrame, condition_cols=None, ignore_order: bool = False) -> bool:
-    """Return True if pred matches gold (using Spider2's comparison logic)."""
-    if condition_cols:
-        if not isinstance(condition_cols, (list, tuple)):
-            condition_cols = [condition_cols]
-        gold_check = gold.iloc[:, condition_cols]
-    else:
-        gold_check = gold
-
-    t_gold = gold_check.transpose().values.tolist()
-    t_pred = pred.transpose().values.tolist()
-
-    for gold_vector in t_gold:
-        if not any(_vectors_match(gold_vector, pv, ignore_order=ignore_order) for pv in t_pred):
-            return False
-    return True
-
-
-def score_against_gold(pred_df: pd.DataFrame, instance_id: str, standards: dict) -> tuple[int, str]:
-    """
-    Compare pred_df against all gold exec_result CSVs for this instance.
-    Returns (score 0/1, description).
-    """
-    # Find gold files: local002_a.csv, local002_b.csv, etc.
-    pattern = re.compile(rf"^{re.escape(instance_id)}(_[a-z])?\.csv$")
-    gold_files = sorted(GOLD_EXEC_DIR / f for f in os.listdir(GOLD_EXEC_DIR) if pattern.match(f))
-
-    if not gold_files:
-        return 0, "no_gold_files"
-
-    standard = standards.get(instance_id, {})
-    condition_cols = standard.get("condition_cols")
-    ignore_order = standard.get("ignore_order", False)
-
-    # Flatten nested condition_cols if needed (Spider2 stores them as list of lists)
-    if isinstance(condition_cols, list) and condition_cols and isinstance(condition_cols[0], list):
-        flat_cols = condition_cols  # multiple gold files → list of per-gold condition_cols
-    else:
-        flat_cols = [condition_cols] * len(gold_files)
-
-    for gold_file, cols in zip(gold_files, flat_cols):
-        try:
-            gold_df = pd.read_csv(gold_file)
-            if compare_dataframes(pred_df, gold_df, condition_cols=cols, ignore_order=ignore_order):
-                return 1, f"matches {gold_file.name}"
-        except Exception as e:
-            continue
-
-    return 0, "result_mismatch"
-
-
-# ── Agent trace logging ───────────────────────────────────────────────────────
-
-def log_agent_trace(thread, instance_id: str, full: bool = False, trace_dir: Path | None = None) -> None:
-    """Print the full agent conversation trace: every tool call and its result.
-
-    If `full` is True, no truncation is applied to message bodies / tool results /
-    SQL previews. If `trace_dir` is set, the raw message history is also written
-    as a JSON file at `<trace_dir>/<instance_id>.json` for offline inspection.
-    """
+    from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+    import litellm
 
-    try:
-        meta = thread.meta()
-    except Exception as e:
-        print(f"  [trace] thread.meta() failed: {e}")
-        return
+    class GeminiModel(BaseChatModel):
+        name: str
+        max_tokens: int
+        
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            litellm_messages = []
+            for m in messages:
+                role = "user"
+                if isinstance(m, HumanMessage): role = "user"
+                elif isinstance(m, SystemMessage): role = "system"
+                elif isinstance(m, AIMessage): role = "assistant"
+                elif isinstance(m, ToolMessage): role = "tool"
+                msg_dict = {"role": role, "content": m.content}
+                if role == "assistant" and getattr(m, "tool_calls", None):
+                    msg_dict["tool_calls"] = [
+                        {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}}
+                        for tc in m.tool_calls
+                    ]
+                if role == "tool":
+                    msg_dict["tool_call_id"] = getattr(m, "tool_call_id", None)
+                litellm_messages.append(msg_dict)
+            
+            tools = None
+            if "tools" in kwargs:
+                from langchain_core.utils.function_calling import convert_to_openai_tool
+                tools = [convert_to_openai_tool(t) for t in kwargs["tools"]]
 
-    messages = meta.get("messages", [])
-    if not messages:
-        print(f"  [trace] no messages in thread state for {instance_id}")
-        return
+            target_model = f"vertex_ai/{self.name}"
+            if "vertex_ai/" in self.name: target_model = self.name
+            
+            response = litellm.completion(
+                model=target_model,
+                messages=litellm_messages,
+                tools=tools,
+                tool_choice="auto" if tools else None,
+                temperature=0.0,
+                max_tokens=self.max_tokens,
+                vertex_project=os.environ.get("VERTEX_PROJECT"),
+                vertex_location=os.environ.get("VERTEX_LOCATION"),
+            )
+            
+            choice = response.choices[0].message
+            content = choice.content or ""
+            tool_calls = []
+            if hasattr(choice, "tool_calls") and choice.tool_calls:
+                for tc in choice.tool_calls:
+                    tool_calls.append({"name": tc.function.name, "args": json.loads(tc.function.arguments), "id": tc.id})
+            
+            ai_msg = AIMessage(content=content, tool_calls=tool_calls)
+            from langchain_core.outputs import ChatGeneration, ChatResult
+            return ChatResult(generations=[ChatGeneration(message=ai_msg)])
 
-    # Optional raw JSON dump (lossless, for offline inspection)
+        def bind_tools(self, tools, **kwargs):
+            return self.bind(tools=tools, **kwargs)
+
+        @property
+        def _llm_type(self) -> str: return "gemini-litellm"
+
+    _orig_new_chat_model = _databao_llm_config.LLMConfig.new_chat_model
+    def _new_chat_model_patch(self):
+        if "gemini" in self.name.lower() or "google" in self.name.lower():
+            return GeminiModel(name=self.name, max_tokens=self.max_tokens)
+        return _orig_new_chat_model(self)
+    
+    _databao_llm_config.LLMConfig.new_chat_model = _new_chat_model_patch
+    
+    _orig_chat = _databao_llm.chat
+    def _chat_patched_for_think(messages, config, model=None):
+        out_messages = _orig_chat(messages, config, model)
+        last = out_messages[-1]
+        if isinstance(last, AIMessage):
+            last.content = _strip_think_from_message_content(last.content)
+        return out_messages
+    
+    _databao_llm.chat = _chat_patched_for_think
+    _THINK_PATCH_INSTALLED = True
+    print("  [think-stripper] installed: thinking blocks will be stripped for history reuse")
+
+def log_agent_trace(thread, instance_id, full=False, trace_dir=None):
+    """Dump the full conversation history for debugging."""
     if trace_dir is not None:
         trace_dir.mkdir(parents=True, exist_ok=True)
         dump = []
-        for m in messages:
-            entry = {
-                "type": type(m).__name__,
-                "content": m.content if isinstance(m.content, (str, list, dict)) else str(m.content),
-            }
-            if isinstance(m, AIMessage):
-                entry["tool_calls"] = [
-                    {"name": tc.get("name"), "args": tc.get("args", {}), "id": tc.get("id")}
-                    for tc in (m.tool_calls or [])
-                ]
-            if isinstance(m, ToolMessage):
-                entry["name"] = getattr(m, "name", None)
+        for m in thread.meta().get("messages", []):
+            entry = {"role": m.type, "content": m.content}
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                entry["tool_calls"] = m.tool_calls
+            if m.type == "tool":
                 entry["tool_call_id"] = getattr(m, "tool_call_id", None)
             dump.append(entry)
         out_file = trace_dir / f"{instance_id}.json"
-        out_file.write_text(json.dumps(dump, indent=2, default=str))
-        print(f"  [trace] wrote {len(dump)} messages → {out_file}")
+        out_file.write_text(json.dumps(dump, indent=2, default=str), encoding="utf-8")
+        print(f"  [trace] wrote {len(dump)} messages -> {out_file}")
 
     sys_cap = 10_000 if full else 200
-    user_cap = 10_000 if full else 300
-    ai_cap = 10_000 if full else 400
-    sql_cap = 10_000 if full else 300
     tool_cap = 10_000 if full else 400
-    args_cap = 10_000 if full else 200
+    print(f"\n{'-'*60}\nAGENT TRACE  [{instance_id}]  ({len(thread.meta().get('messages', []))} messages)\n{'-'*60}")
+    for m in thread.meta().get("messages", []):
+        icon = "[USER]" if m.type == "human" else "[SYS ]" if m.type == "system" else "[AI  ]" if m.type == "ai" else "[TOOL]"
+        text = str(m.content)
+        cap = sys_cap if m.type in ("human", "system", "ai") else tool_cap
+        if len(text) > cap:
+            text = text[:cap] + "... (truncated)"
+        print(f"\n{icon} {text}")
+        if hasattr(m, "tool_calls") and m.tool_calls:
+            for tc in m.tool_calls:
+                print(f"       * Tool Call: {tc['name']}({tc['args']})")
+    print(f"\n{'-'*60}\n")
 
-    print(f"\n{'─'*60}")
-    print(f"AGENT TRACE  [{instance_id}]  ({len(messages)} messages)")
-    print(f"{'─'*60}")
+# ── Evaluation ────────────────────────────────────────────────────────────────
 
-    step = 0
-    for i, msg in enumerate(messages):
+def get_gold_path(instance_id: str) -> Path:
+    return GOLD_EXEC_DIR / f"{instance_id}.csv"
+
+def get_gold_sql_path(instance_id: str) -> Path:
+    return GOLD_SQL_DIR / f"{instance_id}.sql"
+
+def execute_gold_sql(instance_id: str, db_name: str) -> pd.DataFrame:
+    sql_path = get_gold_sql_path(instance_id)
+    if not sql_path.exists():
+        return None
+    
+    sql = sql_path.read_text(encoding="utf-8")
+    db_path = get_db_path(db_name)
+    if not db_path:
+        return None
+        
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        df = pd.read_sql_query(sql, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        print(f"  [eval] error executing gold SQL for {instance_id}: {e}")
+        return None
+
+def compare_results(pred: pd.DataFrame, gold: pd.DataFrame, eval_config: dict) -> tuple[int, str]:
+    """Official Spider2 lenient comparison logic."""
+    if pred is None:
+        return 0, "no_prediction"
+    if pred.empty and gold.empty:
+        return 1, "both_empty"
+    if pred.empty or gold.empty:
+        return 0, "mismatch_empty"
+
+    condition_cols = eval_config.get("condition_cols", [])
+    ignore_order = eval_config.get("ignore_order", False)
+    tolerance = 1e-2
+
+    def normalize(value):
+        if pd.isna(value):
+            return 0
+        return value
+
+    def vectors_match(v1, v2, tol=tolerance, ignore_order_=False):
+        v1 = [normalize(x) for x in v1]
+        v2 = [normalize(x) for x in v2]
+        if ignore_order_:
+            # Sort for comparison
+            v1 = sorted(v1, key=lambda x: (x is None, str(x), isinstance(x, (int, float))))
+            v2 = sorted(v2, key=lambda x: (x is None, str(x), isinstance(x, (int, float))))
+        if len(v1) != len(v2):
+            return False
+        for a, b in zip(v1, v2):
+            if pd.isna(a) and pd.isna(b):
+                continue
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                if not math.isclose(float(a), float(b), abs_tol=tol):
+                    return False
+            elif a != b:
+                return False
+        return True
+
+    # Filter gold columns if specified
+    if condition_cols:
         try:
-            if isinstance(msg, SystemMessage):
-                content = str(msg.content)
-                print(f"\n[SYS] {content[:sys_cap].strip()}{'...' if len(content) > sys_cap else ''}")
+            # Spider2 stores condition_cols as indices or list of indices
+            if isinstance(condition_cols, (list, tuple)) and condition_cols and isinstance(condition_cols[0], list):
+                # If multiple gold files, we are called per-gold, but condition_cols might be nested
+                # For simplicity in this benchmark loop, we assume single gold per call or flat indices
+                gold_cols = gold.iloc[:, condition_cols[0]] 
+            else:
+                gold_cols = gold.iloc[:, condition_cols]
+        except Exception:
+            gold_cols = gold
+    else:
+        gold_cols = gold
 
-            elif isinstance(msg, HumanMessage):
-                print(f"\n[USER] {str(msg.content)[:user_cap]}")
+    # Transpose to get columns as lists
+    t_gold_list = gold_cols.transpose().values.tolist()
+    t_pred_list = pred.transpose().values.tolist()
 
-            elif isinstance(msg, AIMessage):
-                step += 1
-                text = msg.content if isinstance(msg.content, str) else ""
-                if isinstance(msg.content, list):
-                    text = " ".join(p.get("text", "") for p in msg.content if isinstance(p, dict))
-                if text and text.strip():
-                    print(f"\n[AI step {step}] {text.strip()[:ai_cap]}")
+    for gold_vector in t_gold_list:
+        if not any(vectors_match(gold_vector, pred_vector, ignore_order_=ignore_order) for pred_vector in t_pred_list):
+            return 0, "column_mismatch"
 
-                for tc in (msg.tool_calls or []):
-                    name = tc.get("name", "?")
-                    args = tc.get("args", {}) or {}
-                    if name == "run_sql_query":
-                        print(f"\n  → TOOL CALL: run_sql_query")
-                        print(f"    SQL: {str(args.get('sql', ''))[:sql_cap]}")
-                    elif name == "search_context":
-                        print(f"\n  → TOOL CALL: search_context(retrieve_text={args.get('retrieve_text','')!r})")
-                    elif name == "submit_result":
-                        print(f"\n  → TOOL CALL: submit_result(query_id={args.get('query_id')!r})")
-                        print(f"    description: {str(args.get('result_description',''))[:args_cap]}")
-                    else:
-                        print(f"\n  → TOOL CALL: {name}  args={str(args)[:args_cap]}")
-
-            elif isinstance(msg, ToolMessage):
-                name = getattr(msg, "name", None) or "tool"
-                content_str = str(msg.content)
-                preview = content_str[:tool_cap]
-                suffix = "" if len(content_str) <= tool_cap else f"  [+{len(content_str)-tool_cap} more chars]"
-                print(f"\n  ← TOOL RESULT [{name}] ({len(content_str)} chars): {preview}{suffix}")
-        except Exception as e:
-            print(f"  [trace] error printing message {i} ({type(msg).__name__}): {e}")
-
-    print(f"\n{'─'*60}")
-
+    return 1, "match"
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Spider 2.0 local track benchmark for databao-agent")
-    parser.add_argument("--instances", type=str, help="Comma-separated instance IDs (e.g. local003,local008)")
-    parser.add_argument("--skip-instances", type=str, help="Comma-separated instance IDs to skip (e.g. local002,local003)")
-    parser.add_argument("--limit", type=int, help="Run only first N questions")
-    parser.add_argument("--output", type=str, help="Output CSV file path")
-    parser.add_argument("--full-trace", action="store_true",
-                        help="Print agent traces without truncating message bodies / tool results.")
-    parser.add_argument("--trace-dir", type=str,
-                        help="Directory to write per-question raw message JSON for offline inspection.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--instances", type=str, help="Comma-separated instance IDs (e.g. local001,local002)")
+    parser.add_argument("--limit", type=int, help="Limit number of questions")
+    parser.add_argument("--vllm-wait", action="store_true", help="Wait for vLLM server to be ready")
+    parser.add_argument("--full-trace", action="store_true", help="Print full non-truncated traces")
     args = parser.parse_args()
-    trace_dir = Path(args.trace_dir) if args.trace_dir else None
 
     instances = args.instances.split(",") if args.instances else None
-    skip_instances = set(args.skip_instances.split(",")) if args.skip_instances else set()
     questions = load_questions(instances=instances, limit=args.limit)
+    eval_standards = load_eval_standards()
 
-    # Filter out skipped instances
-    if skip_instances:
-        questions = [q for q in questions if q["instance_id"] not in skip_instances]
-        print(f"Skipping {len(skip_instances)} instance(s)")
+    vllm_host = None
+    vllm_model_name = "QuantTrio/GLM-4.7-Flash-AWQ"
+    if args.vllm_wait:
+        vllm_host = wait_for_vllm()
+    else:
+        vllm_host, vllm_model_name = get_vllm_endpoint()
 
-    if not questions:
-        print("No questions matched the filters.")
-        sys.exit(1)
+    print(f"Running {len(questions)} questions | model: {vllm_model_name}")
+    if "gemini" in vllm_model_name.lower() or "google" in vllm_model_name.lower():
+        print("Using Gemini API for LLM generation.")
 
-    standards = load_eval_standards()
-    _, model_name = get_vllm_endpoint()
-
-    print(f"Running {len(questions)} questions | model: {model_name}")
-    print("Waiting for vLLM to be ready...")
-    vllm_base_url = wait_for_vllm()
-    if not vllm_base_url:
-        sys.exit(1)
-    print(f"vLLM endpoint: {vllm_base_url}")
-
-    RESULTS_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = args.output or str(RESULTS_DIR / f"spider2_results_{timestamp}.csv")
-
-    fieldnames = [
-        "instance_id", "db", "question", "external_knowledge",
-        "predicted_sql", "execution_result", "score", "score_detail", "error", "time_s",
-    ]
+    output_path = RESULTS_DIR / f"spider2_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    trace_dir = RESULTS_DIR / "traces"
 
     correct = 0
     total_scored = 0
     errors = 0
 
-    with open(output_path, "w", newline="") as csvf:
+    from databao.agent import domain as db_agent_domain
+    from databao.agent.configs.agent import DEFAULT_AGENT_CONFIG
+    from databao.agent.configs.llm import LLMConfig
+    from databao.agent.executors.lighthouse.executor import LighthouseExecutor
+    from databao.agent.databases import SQLiteConnectionConfig
+    from databao.agent.core.agent import Agent
+    from databao.agent.caches.in_mem_cache import InMemCache
+    from databao.agent.visualizers.dumb import DumbVisualizer
+
+    with open(output_path, "w", newline="", encoding="utf-8") as csvf:
+        fieldnames = ["instance_id", "db", "question", "external_knowledge", "predicted_sql", "execution_result", "score", "score_detail", "error", "time_s"]
         writer = csv.DictWriter(csvf, fieldnames=fieldnames)
         writer.writeheader()
 
-        for i, q in enumerate(questions):
+        for idx, q in enumerate(questions, 1):
             instance_id = q["instance_id"]
             db_name = q["db"]
             question = q["question"]
             ext_doc = q.get("external_knowledge")
 
-            print(f"\n[{i+1}/{len(questions)}] {instance_id} ({db_name})")
+            print(f"\n[{idx}/{len(questions)}] {instance_id} ({db_name})")
             print(f"  Q: {question[:100]}...")
-            if ext_doc:
-                print(f"  external_knowledge: {ext_doc}")
-
-            db_path = get_db_path(db_name)
-            if not db_path:
-                print(f"  ERROR: SQLite file not found for '{db_name}'")
-                writer.writerow({
-                    "instance_id": instance_id, "db": db_name, "question": question,
-                    "external_knowledge": ext_doc or "",
-                    "predicted_sql": "", "execution_result": "db_missing",
-                    "score": 0, "score_detail": "db_missing", "error": "db not found", "time_s": 0,
-                })
-                csvf.flush()
-                errors += 1
-                continue
 
             t0 = time.time()
             predicted_sql = ""
-            exec_result = "not_run"
+            exec_result = ""
             score = 0
             score_detail = ""
             error = ""
             thread = None
-
             tmp_dce = None
+
             try:
-                agent, tmp_dce = setup_agent(db_path, vllm_base_url, model_name, ext_doc)
+                _install_think_stripper_once()
+
+                # 1. Prepare minimal DCE project and domain
+                tmp_dce = _make_temp_dce_project(db_name)
+                domain = db_agent_domain(tmp_dce)
+                
+                # 2. Inject hints and external knowledge into domain description
+                ctx = DUCKDB_HINTS
+                if ext_doc:
+                    doc_path = DOCS_DIR / ext_doc
+                    if doc_path.exists():
+                        ctx += f"\n\n## External Knowledge for Question\n\n{doc_path.read_text(encoding='utf-8')}"
+                domain.add_description(ctx)
+
+                # 4. Initialize Agent
+                llm_cfg = LLMConfig(name=vllm_model_name, max_tokens=8192)
+                agent = Agent(
+                    domain=domain,
+                    llm=llm_cfg,
+                    agent_config=DEFAULT_AGENT_CONFIG,
+                    data_executor=LighthouseExecutor(),
+                    visualizer=DumbVisualizer(),
+                    cache=InMemCache(),
+                    rows_limit=2000,
+                    stream_ask=False
+                )
+
+                # 5. Execute
                 thread = agent.thread()
                 thread.ask(question)
-
-                predicted_sql = thread.code() or ""
+                
+                predicted_sql = thread.code()
                 if predicted_sql:
-                    print(f"  SQL: {predicted_sql[:120]}...")
+                    # 6. Evaluation
+                    df = thread.df()
+                    gold_df = None
+                    execution_source = "csv"
+                    
+                    gold_path = get_gold_path(instance_id)
+                    if gold_path.exists():
+                        gold_df = pd.read_csv(gold_path)
+                    else:
+                        # Fallback to executing gold SQL
+                        gold_df = execute_gold_sql(instance_id, db_name)
+                        execution_source = "sql_exec"
+                    
+                    if gold_df is None:
+                        exec_result = "error: gold_not_found"
+                        score = 0
+                        score_detail = f"Gold file missing (CSV/SQL) for {instance_id}"
+                    else:
+                        score, score_detail = compare_results(df, gold_df, eval_standards.get(instance_id, {}))
+                        exec_result = "success" if score == 1 else "mismatch"
+                        if score == 1:
+                            correct += 1
+                        total_scored += 1
+                        if execution_source == "sql_exec":
+                            print(f"  [eval] used gold SQL fallback for {instance_id}")
                 else:
-                    print("  SQL: (none generated)")
-
-                pred_df = thread.df()
-
-                if pred_df is not None and not pred_df.empty:
-                    exec_result = f"{len(pred_df)} rows"
-                    score, score_detail = score_against_gold(pred_df, instance_id, standards)
-                    if score == 1:
-                        correct += 1
-                    total_scored += 1
-                    print(f"  RESULT: {exec_result} | score: {score} ({score_detail})")
-                elif predicted_sql:
-                    exec_result = "empty_result"
-                    score, score_detail = score_against_gold(pd.DataFrame(), instance_id, standards)
-                    total_scored += 1
-                    print(f"  RESULT: empty df | score: {score}")
-                else:
-                    exec_result = "no_sql_generated"
+                    exec_result = "no_sql"
                     score = 0
-                    score_detail = "no_sql"
+                    score_detail = "agent_returned_empty_code"
                     total_scored += 1
                     errors += 1
                     print("  RESULT: no SQL generated")
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 error = str(e)[:500]
                 exec_result = "agent_error"
                 score = 0
@@ -792,46 +594,30 @@ def main():
                 errors += 1
                 print(f"  AGENT ERROR: {e}")
 
-            # Always dump the full agent trace for visibility
             if thread is not None:
                 try:
                     log_agent_trace(thread, instance_id, full=args.full_trace, trace_dir=trace_dir)
                 except Exception as trace_err:
-                    # Surface the failure instead of silently dropping the trace
                     print(f"  [trace] log_agent_trace raised: {trace_err}")
 
-            # Clean up per-question temp DCE project dir
             if tmp_dce is not None:
                 shutil.rmtree(tmp_dce, ignore_errors=True)
 
             elapsed = round(time.time() - t0, 2)
-
             writer.writerow({
-                "instance_id": instance_id,
-                "db": db_name,
-                "question": question,
-                "external_knowledge": ext_doc or "",
-                "predicted_sql": predicted_sql,
-                "execution_result": exec_result,
-                "score": score,
-                "score_detail": score_detail,
-                "error": error,
-                "time_s": elapsed,
+                "instance_id": instance_id, "db": db_name, "question": question,
+                "external_knowledge": ext_doc or "", "predicted_sql": predicted_sql,
+                "execution_result": exec_result, "score": score, "score_detail": score_detail,
+                "error": error, "time_s": elapsed
             })
             csvf.flush()
 
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"RESULTS SUMMARY")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}\nRESULTS SUMMARY\n{'='*60}")
     print(f"Total questions:   {len(questions)}")
     print(f"Scored:            {total_scored}")
     print(f"Correct:           {correct} / {total_scored}  ({100*correct//max(total_scored,1)}%)")
     print(f"Errors/no-SQL:     {errors}")
-    print(f"\nResults → {output_path}")
-    print(f"\nNote: Spider2-lite official score = correct / 547 (all tracks)")
-    print(f"      Local-track score = {correct} / {total_scored} ({100*correct//max(total_scored,1)}%)")
-
+    print(f"\nResults -> {output_path}")
 
 if __name__ == "__main__":
     main()
