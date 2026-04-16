@@ -70,10 +70,6 @@ DCE_PROJECT_DIR = (CAPSTONE_DIR / "spider2-dce").resolve()
 RESULTS_DIR = (CAPSTONE_DIR / "results").resolve()
 ENDPOINT_FILE = (CAPSTONE_DIR / "logs" / "vllm_endpoint.txt").resolve()
 
-# Vertex AI Configuration
-os.environ["VERTEX_PROJECT"] = os.environ.get("VERTEX_PROJECT", "lunar-geography-433410-n6")
-os.environ["VERTEX_LOCATION"] = os.environ.get("VERTEX_LOCATION", "us-central1")
-
 print(f"DEBUG: CAPSTONE_DIR = {CAPSTONE_DIR}")
 print(f"DEBUG: DCE_PROJECT_DIR = {DCE_PROJECT_DIR}")
 print(f"DEBUG: SQLITE_DIR = {SQLITE_DIR}")
