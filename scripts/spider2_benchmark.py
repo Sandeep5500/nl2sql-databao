@@ -22,6 +22,10 @@ Usage:
     # Use a specific model
     uv --project ../databao-agent run python spider2_benchmark.py --model gpt-4.1
 
+    # Gemini on Vertex via langchain-google-genai (ChatGoogleGenerativeAI)
+    uv --project ../databao-agent run python spider2_benchmark.py --instances local002 \\
+        --google-genai-vertex --model gemini-3.1-pro-preview
+
 Environment variables:
     OPENAI_API_KEY    OpenAI API key (required for OpenAI models)
     API_BASE_URL      Base URL for OpenAI-compatible API (optional, for custom endpoints)
@@ -245,6 +249,7 @@ def setup_agent(
     vertex_project: str | None = None,
     vertex_location: str | None = None,
     google_application_credentials: str | None = None,
+    google_genai_vertex: bool = False,
     debug_progress: bool = False,
     dce_vector_index: Path | None = None,
 ):
@@ -268,13 +273,28 @@ def setup_agent(
     # Normalize plain Gemini model IDs to a Vertex provider-qualified model.
     resolved_model_name = model_name
     if ":" not in resolved_model_name and resolved_model_name.lower().startswith("gemini"):
-        resolved_model_name = f"google_vertexai:{resolved_model_name}"
+        if google_genai_vertex:
+            resolved_model_name = f"google_genai_vertex:{resolved_model_name}"
+        else:
+            resolved_model_name = f"google_vertexai:{resolved_model_name}"
+
+    # Gemini 3.1 Pro (preview) is on the Vertex *global* endpoint only (`locations/global/...`).
+    # Defaulting to us-central1 yields 404 NOT_FOUND for the publisher model.
+    # https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/3-1-pro
+    if "gemini-3.1-pro-preview" in resolved_model_name.lower():
+        vertex_location = "global"
 
     # Vertex AI env wiring (safe no-op for non-Vertex models).
     if vertex_project:
         os.environ["VERTEX_PROJECT"] = vertex_project
+        os.environ.setdefault("GOOGLE_CLOUD_PROJECT", vertex_project)
     if vertex_location:
         os.environ["VERTEX_LOCATION"] = vertex_location
+    if resolved_model_name.startswith("google_genai_vertex:"):
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+        # Avoid google-genai mixing API-key (AI Studio) auth with Vertex ADC/SA (warns + can stall).
+        os.environ.pop("GOOGLE_API_KEY", None)
+        os.environ.pop("GEMINI_API_KEY", None)
     if google_application_credentials:
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = google_application_credentials
 
@@ -781,7 +801,8 @@ def main():
     parser.add_argument("--skip-instances", type=str, help="Comma-separated instance IDs to skip")
     parser.add_argument("--limit", type=int, help="Run only first N questions")
     parser.add_argument("--model", type=str, default=os.environ.get("MODEL", "gpt-4.1"),
-                        help="Model name (e.g. gpt-4.1, google_vertexai:gemini-2.5-pro, gemini-2.5-pro)")
+                        help="Model name (e.g. gpt-4.1, google_vertexai:gemini-2.5-pro, "
+                        "google_genai_vertex:gemini-3.1-pro-preview, gemini-2.5-pro)")
     parser.add_argument("--api-base-url", type=str, default=os.environ.get("API_BASE_URL"),
                         help="Base URL for OpenAI-compatible API (optional)")
     parser.add_argument(
@@ -801,6 +822,12 @@ def main():
         type=str,
         default=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
         help="Path to service-account JSON for Vertex auth",
+    )
+    parser.add_argument(
+        "--google-genai-vertex",
+        action="store_true",
+        help="Use ChatGoogleGenerativeAI (langchain-google-genai, vertexai=True) for bare gemini-* "
+        "model IDs instead of ChatVertexAI (langchain_google_vertexai).",
     )
     parser.add_argument("--output", type=str, help="Output CSV file path")
     parser.add_argument(
@@ -864,12 +891,16 @@ def main():
     vertex_project = args.vertex_project
     vertex_location = args.vertex_location
     google_application_credentials = args.google_application_credentials
+    effective_vertex_location = (
+        "global" if "gemini-3.1-pro-preview" in model_name.lower() else vertex_location
+    )
 
     run_meta = {
         "model": model_name,
         "api_base_url": api_base_url,
         "vertex_project": vertex_project,
-        "vertex_location": vertex_location,
+        "vertex_location": effective_vertex_location,
+        "google_genai_vertex": args.google_genai_vertex,
         "timestamp": timestamp,
         "dce_vector_index": str(dce_vector_index),
     }
@@ -890,8 +921,16 @@ def main():
     print(f"DCE vector index: {dce_vector_index}")
     if api_base_url:
         print(f"API base URL: {api_base_url}")
-    if "gemini" in model_name.lower() or model_name.startswith("google_vertexai:"):
-        print(f"Vertex:       {vertex_project} / {vertex_location}")
+    if (
+        "gemini" in model_name.lower()
+        or model_name.startswith("google_vertexai:")
+        or model_name.startswith("google_genai_vertex:")
+        or args.google_genai_vertex
+    ):
+        backend = "ChatGoogleGenerativeAI (google-genai SDK)" if (
+            args.google_genai_vertex or model_name.startswith("google_genai_vertex:")
+        ) else "ChatVertexAI"
+        print(f"Vertex:       {vertex_project} / {effective_vertex_location}  [{backend}]")
         if google_application_credentials:
             print(f"Credentials:  {google_application_credentials}")
         else:
@@ -994,11 +1033,17 @@ def main():
                     vertex_project=vertex_project,
                     vertex_location=vertex_location,
                     google_application_credentials=google_application_credentials,
+                    google_genai_vertex=args.google_genai_vertex,
                     debug_progress=args.debug_progress,
                     dce_vector_index=dce_vector_index,
                 )
                 _progress(args.debug_progress, "Creating thread")
                 thread = agent.thread()
+                if "gemini-3.1-pro-preview" in model_name.lower():
+                    print(
+                        "  Note: Gemini 3.1 Pro can take many minutes before the first model reply "
+                        "(long thinking); this is normal. Use --debug-progress to log setup steps."
+                    )
                 _progress(args.debug_progress, "Starting thread.ask(question)")
                 thread.ask(question)
                 _progress(args.debug_progress, "thread.ask(question) finished")
@@ -1125,11 +1170,11 @@ def main():
     print(f"Scored:            {total_scored}")
     print(f"Correct:           {correct} / {total_scored}  ({100*correct//max(total_scored,1)}%)")
     print(f"Errors/no-SQL:     {errors}")
-    print(f"\nResults → {output_path}")
+    print(f"\nResults -> {output_path}")
     if status_path:
-        print(f"Status  → {status_path}")
+        print(f"Status  -> {status_path}")
     if trace_dir:
-        print(f"Traces  → {trace_dir}/")
+        print(f"Traces  -> {trace_dir}/")
     print(f"\nToken usage (this run):")
     print(f"  Input:  {run_input_tokens:,}  tokens")
     print(f"  Output: {run_output_tokens:,}  tokens")
