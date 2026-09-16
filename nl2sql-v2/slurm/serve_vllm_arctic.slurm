@@ -25,7 +25,7 @@ echo "$(hostname):${VLLM_PORT}" > "$CAPSTONE_DIR/logs/vllm_endpoint_arctic.txt"
 echo "Model: $MODEL" >> "$CAPSTONE_DIR/logs/vllm_endpoint_arctic.txt"
 
 module load cuda-12.1 2>/dev/null || true
-VENV_PYTHON="$CAPSTONE_DIR/databao-agent/.venv/bin/python"
+VENV_PYTHON="$CAPSTONE_DIR/.vllm-venv/bin/python"
 
 echo "Ensuring transformers==5.5.3 + regex>=2025.10.22 (see CLAUDE.md)..."
 uv pip install --python "$VENV_PYTHON" --quiet "transformers==5.5.3" "regex>=2025.10.22" --upgrade

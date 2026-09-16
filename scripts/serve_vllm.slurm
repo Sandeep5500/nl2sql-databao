@@ -78,12 +78,12 @@ echo "Started: $(date)" >> "$CAPSTONE_DIR/logs/vllm_endpoint.txt"
 module load cuda-12.1 2>/dev/null || true
 
 cd "$CAPSTONE_DIR/databao-agent"
-VENV_PYTHON="$CAPSTONE_DIR/databao-agent/.venv/bin/python"
+VENV_PYTHON="$CAPSTONE_DIR/.vllm-venv/bin/python"
 
 if [ ! -f "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "import torch.types" 2>/dev/null; then
     echo "Recreating venv (missing or broken torch)..."
-    rm -rf "$CAPSTONE_DIR/databao-agent/.venv"
-    python3.12 -m venv "$CAPSTONE_DIR/databao-agent/.venv"
+    rm -rf "$CAPSTONE_DIR/.vllm-venv"
+    python3.12 -m venv "$CAPSTONE_DIR/.vllm-venv"
 fi
 
 if ! "$VENV_PYTHON" -c "import vllm" 2>/dev/null; then

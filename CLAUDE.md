@@ -4,146 +4,82 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Overview
 
-NL2SQL benchmarking system for [Spider 2.0](https://spider2-sql.github.io/) using the [databao-agent](https://github.com/databao-ai/databao-agent) framework. The system runs LLM agents (currently GLM-4.7-Flash-AWQ via vLLM) against 135 local SQLite questions, using the databao-context-engine for semantic schema retrieval.
+NL2SQL benchmarking for [Spider 2.0-Lite](https://spider2-sql.github.io/) (local split: 135 SQLite questions).
+The agent is **nl2sql-v2/** — a lean OpenAI-SDK tool-call loop (currently Qwen3.5-9B via vLLM) with
+**databao-context-engine** as the semantic schema retrieval library. The old databao-agent (LangGraph)
+execution path was removed Sept 2026; its history lives in git and in `documents/spider2_attack_plan.md`.
 
-**Three git submodules:**
-- `databao-agent/` — LangGraph-based SQL agent library
-- `databao-context-engine/` — Vector search + schema enrichment engine (DCE)
-- `Spider2/` — Spider 2.0 dataset (`spider2-lite/` = 135 local SQLite questions)
+**Layout:**
+- `nl2sql-v2/` — the harness: `src/nl2sql/` (agent loop, tools, memory, eval), `scripts/` (runners), `slurm/` (serve scripts)
+- `databao-context-engine/` — submodule, branch `spider2-patches` (DCE_OLLAMA_HOST env override)
+- `Spider2/` — submodule; SQLite DBs are downloaded separately (see SETUP.md)
+- `spider2-dce/` — DCE project: enriched YAMLs (tracked) + `output/dce.duckdb` vector index (gitignored, 1.2GB)
+- `scripts/` — enrichment (`enrich_dce.py` lib, `enrich_one_db.py`), `setup_dce_spider2.py`, GLM serve script
+- `.vllm-venv/` — shared vLLM serving venv (gitignored; serve scripts auto-create it if missing)
+- `results/`, `logs/` — gitignored; CSVs, traces, server logs stay on the cluster
 
-**Local project:**
-- `spider2-dce/` — DCE project dir (enriched YAMLs + `output/dce.duckdb` vector index)
+Fresh-machine setup: **SETUP.md**. Results and experiment log: **documents/spider2_attack_plan.md**.
 
 ## Running the Benchmark
 
-All benchmark commands run from `databao-agent/` using `uv run`:
-
 ```bash
-cd databao-agent
+# 1. serve the model (SLURM; general partition rejects our QOS — use lilab or preempt)
+sbatch --partition=lilab --qos=lilab_qos --gres=gpu:A6000:1 nl2sql-v2/slurm/serve_vllm_qwen35.slurm
+# wait for "Application startup complete" in logs/vllm/vllm_<jobid>.err
 
-# Quick test (5 questions)
-uv run python ../scripts/spider2_benchmark.py \
-  --instances local002,local007,local009
+# 2. Ollama embeds on the same node (for search_context), as an overlapping step:
+srun --jobid=<vllm_jobid> --overlap -n1 --cpus-per-task=4 --gres=gpu:A6000:1 bash -c \
+  'OLLAMA_HOST=0.0.0.0:11434 OLLAMA_KEEP_ALIVE=24h exec ~/.dce/ollama/bin/ollama serve' &
 
-# Skip already-completed questions
-uv run python ../scripts/spider2_benchmark.py \
-  --skip-instances "local002,local007,..." \
-  --output ../results/spider2_partial.csv \
-  --trace-dir ../logs/traces/traces_run_$(date +%Y%m%d_%H%M%S) \
-  --full-trace
-
-# SLURM (production run)
-cd /data/user_data/sandeep3/personal/nl2sql-databao
-sbatch scripts/run_benchmark.slurm
+# 3. run (from nl2sql-v2/); endpoint auto-read from logs/vllm_endpoint.txt
+cd nl2sql-v2
+DCE_OLLAMA_HOST=<vllm_node> uv run python scripts/run_benchmark.py \
+  --schema-overview --instances local002,local007          # smoke
+DCE_OLLAMA_HOST=<vllm_node> uv run python scripts/run_benchmark.py \
+  --schema-overview --resume --output ../results/run.csv \
+  --trace-dir ../logs/traces/run_$(date +%Y%m%d)           # full 135, resumable
 ```
 
-The benchmark auto-reads the vLLM endpoint from `logs/vllm_endpoint.txt`. If vLLM isn't running it falls back to Ollama (`OLLAMA_SQL_MODEL` env var).
+Key runner flags: `--resume` (skip done, append), `--temperature` (pass@K sampling),
+`--context-mode search|full|oracle` (ablations), `--critic-model/-endpoint`,
+`--draft-model/-endpoint`, `--text-sql-fallback`, `--max-steps` (default 30).
+Single-shot lane: `scripts/run_single_shot.py`. Long runs: wrap with
+`../logs/bench/run_lane.sh <tag> <command...>` for auto-restart (up to 15 attempts).
 
-## Serving vLLM (SLURM)
+Traces auto-convert to Inspect AI logs (`logs/inspect/`); view with
+`uv run inspect view --log-dir ../logs/inspect --port 7591` (forward the port in VSCode).
 
-```bash
-# Default: GLM-4.7-Flash-AWQ on A100_80GB
-sbatch scripts/serve_vllm.slurm
+## Serving notes (hard-won)
 
-# Reduced context for L40S (48GB VRAM)
-MAX_MODEL_LEN=25000 sbatch --gres=gpu:L40S:1 scripts/serve_vllm.slurm
+- **A6000 needs `--enforce-eager`** (bus errors otherwise) and even then vLLM can SIGBUS
+  after ~24h uptime — treat servers as ~1-day services; runners auto-resume through restarts.
+- transformers must be `==5.5.3` with `regex>=2025.10.22` (serve scripts pin this;
+  a `uv sync`/editable reinstall elsewhere can silently downgrade regex).
+- Qwen3.5 serve flags: `--tool-call-parser qwen3_coder --reasoning-parser qwen3`;
+  vLLM exposes reasoning as message field `reasoning` (not `reasoning_content`).
+- Two servers on one node/port: the second binds IPv6 and curl still hits the first —
+  use distinct `VLLM_PORT`s.
+- Session/subshell cgroup is ~16GB — heavy multi-lane runs get OOM-killed (exit 137);
+  the resume wrappers absorb this.
 
-# Monitor startup (~8 min for weight loading)
-tail -f logs/vllm/vllm_<jobid>.out   # weight loading + "Application startup complete"
-tail -f logs/vllm/vllm_<jobid>.err   # error output
-```
+## Scoring
 
-**Critical GLM-4.7-Flash vLLM flags** (do not remove):
-- `VLLM_MLA_DISABLE=1` — disables TRITON_MLA attention, forces FLASH_ATTN (bus errors otherwise)
-- `--enforce-eager` — disables CUDA graph warmup (avoids OOM)
-- `--quantization awq` — required for AWQ quantized weights
+`nl2sql/eval.py` ports Spider2's comparison: each gold column (value vector) must match
+some predicted column; **extra predicted columns are tolerated**; `condition_cols` /
+`ignore_order` come from `evaluation_suite/gold/spider2lite_eval.jsonl`. Gold exec CSVs
+exist for all 547 instances; gold SQL only for 24 locals (basis of the oracle ablation).
 
-**transformers version**: Must be `==5.5.3` with `regex>=2025.10.22`. The `glm4_moe_lite` architecture isn't in transformers 4.x, and transformers 5.x with the old regex causes SIGBUS on first inference. The `serve_vllm.slurm` script pins both.
+## DCE enrichment
 
-## Checking Benchmark Results
+One-time per database. Single DB (~4 min): from `spider2-dce/`,
+`uv run --project ../nl2sql-v2 python ../scripts/enrich_one_db.py --datasource databases/<name>.yaml
+--vllm-host <node> --vllm-port 8765 --vllm-model Qwen/Qwen3.5-9B --embed-host <node> --embed-port 11434 --dce-dir .`
+Datasource names are lowercase with non-alnum → `_` (question db `Db-IMDB` → `db_imdb.yaml`);
+`run_benchmark.py::resolve_datasource` handles the mapping. Don't rebuild the index while
+a search-mode run is reading `dce.duckdb`.
 
-```bash
-python3 -c "
-import csv
-with open('results/spider2_full135_<timestamp>.csv') as f:
-    rows = list(csv.DictReader(f))
-correct = sum(1 for r in rows if r.get('score','0') == '1')
-print(f'{correct}/{len(rows)} correct ({100*correct//len(rows)}%)')
-for r in rows:
-    mark = '✓' if r['score']=='1' else '✗'
-    print(f'  {mark} {r[\"instance_id\"]}: {r[\"score_detail\"]}')
-"
-```
+## Known result baselines (Sept 2026, Qwen3.5-9B)
 
-Gold CSVs for comparison: `Spider2/spider2-lite/evaluation_suite/gold/exec_result/<instance>_*.csv`
-
-## Architecture: How a Question Runs
-
-1. **Benchmark script** loads question from `spider2-dce/spider2-lite.jsonl`, creates a temp DCE project pointing at the question's database YAML and the shared `dce.duckdb`.
-2. **Agent** (LighthouseExecutor, LangGraph) receives the question + system prompt with schema summary.
-3. **`search_context` tool** embeds the query via Ollama (`nomic-embed-text-v1.5`) and retrieves matching schema chunks from `dce.duckdb`. The `min_retrievals=1` config forces at least one call.
-4. **Agent iterates** (up to 30 steps / 60 LangGraph nodes): calls `run_sql_query` to try SQL, observes results, refines.
-5. **Think-stripper** monkey-patches LangGraph message handling to replace GLM's `<think>...</think>` blocks with 2-sentence summaries (max 120 tokens) before storing in history.
-6. **`submit_result`** triggers evaluation: output DataFrame compared against gold CSV.
-7. Trace written to `logs/traces/<run>/local###.json`.
-
-## Agent Configuration (spider2_benchmark.py)
-
-Key settings applied at runtime in `scripts/spider2_benchmark.py`:
-
-| Setting | Value | Why |
-|---|---|---|
-| `max_tokens` | 4096 | GLM reasoning was being truncated at 1024 |
-| `temperature` | 0.0 | Deterministic output |
-| `recursion_limit` | 30 steps / 60 nodes | Old limit of 12 hit 2 steps before correct answers |
-| `min_retrievals` | 1 | Forces schema exploration before writing SQL |
-| `max_tokens_before_cleaning` | 5000 (default) | Compacts message history when exceeded |
-| `wait_for_vllm` timeout | 7200s (2hr) | Allows bench to wait for slow SLURM queue |
-
-## DCE Enrichment (One-Time Setup)
-
-The `spider2-dce/output/dce.duckdb` vector index is pre-built. To rebuild or re-enrich:
-
-```bash
-# Enrich schemas (needs vLLM running)
-cd spider2-dce
-uv run python ../scripts/enrich_dce.py \
-  --vllm-host <node> --vllm-port 8766 \
-  --vllm-model Qwen/Qwen3-32B-AWQ \
-  --dce-dir .
-
-# Rebuild index
-dce build && dce index
-```
-
-The critique enrichment pass (in `scripts/enrich_dce.py`) runs a second LLM call per table to rewrite ambiguous column descriptions using concrete sample values — critical for tables with similar column names (e.g., `customer_id` vs `customer_unique_id`).
-
-## Log Layout
-
-```
-logs/
-  vllm/           # vLLM server stdout/stderr per job
-  bench/          # benchmark runner stdout per job
-  dce/            # DCE enrichment job output
-  traces/         # per-run subdirs of per-question JSON traces
-  vllm_endpoint.txt   # written by serve_vllm.slurm; read by benchmark
-results/          # scored CSVs from each run
-```
-
-## Key Files in databao-agent
-
-- `databao/agent/executors/lighthouse/system_prompt.jinja` — agent system prompt (DuckDB hints, pre-submit checklist, doom-loop rules, stuck-loop rule)
-- `databao/agent/executors/base.py` — `GraphExecutor`, history cleaning, partial state persistence on failure
-- `databao/agent/configs/llm.py` — `LLMConfig` dataclass including `max_tokens_before_cleaning`
-- `databao/agent/configs/agent.py` — `AgentConfig` dataclass including `min_retrievals`, `recursion_limit`
-- `documents/MODIFICATIONS.md` — changelog of all improvements made for this benchmark
-
-## Common Failure Modes
-
-| Score detail | Cause | Fix direction |
-|---|---|---|
-| `result_mismatch` | Wrong SQL logic (wrong JOIN, wrong aggregation) | Improve prompt hints |
-| `agent_error` / Connection error | vLLM crashed or never started | Check vLLM logs for SIGBUS |
-| `no_sql` | Agent hit recursion limit without submitting | Increase `recursion_limit`, check doom-loop |
-| SIGBUS (exit 7) on vLLM | Wrong transformers version (needs 5.5.3 + regex>=2025.10.22) | Check `serve_vllm.slurm` install step |
-| `glm4_moe_lite` not recognized | transformers < 5.x installed | `uv pip install "transformers==5.5.3"` |
+Greedy agentic 43/135 (31.9%) · single-shot 15.6% · pass@4 51.1% · v1 (GLM) was 20.2%.
+Generation is the measured bottleneck (oracle ablation); selection is the open gap (pass@K).
+Details and never-solved core: `documents/spider2_attack_plan.md`.
