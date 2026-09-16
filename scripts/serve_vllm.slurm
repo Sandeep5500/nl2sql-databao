@@ -77,7 +77,7 @@ echo "Started: $(date)" >> "$CAPSTONE_DIR/logs/vllm_endpoint.txt"
 
 module load cuda-12.1 2>/dev/null || true
 
-cd "$CAPSTONE_DIR/databao-agent"
+cd "$CAPSTONE_DIR"
 VENV_PYTHON="$CAPSTONE_DIR/.vllm-venv/bin/python"
 
 if [ ! -f "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "import torch.types" 2>/dev/null; then
