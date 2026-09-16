@@ -4,6 +4,148 @@
 
 ---
 
+## Phase 0 — Harness, baseline, and bottleneck analysis (first)
+
+Before any training: find out whether the bottleneck is **retrieval** (getting the right schema context to the model) or **SQL generation** (writing correct SQL once context is known).
+
+**Model for all Phase 0 work: Qwen3.5-9B** (fits L40S/A6000 in BF16, agentic-focused, matches the shakeout role below).
+
+### Harness rewrite (decided)
+
+Replace the databao-agent execution path with a lean, purpose-built tool-call loop (plain Python + OpenAI SDK against vLLM). The current path fights the library: monkey-patched `chat` for think-stripping, private-field overrides, symlinked temp DCE projects, prompt-only `min_retrievals`. We keep **databao-context-engine as a library** (search_context backend), the eval code, the trace format, and the prompt content. A lean harness is also the episode runner P2 needs for agentic RL. Not OpenHands — it's a sandboxed dev-agent runtime, wrong shape for a programmatic RL loop.
+
+### Tool set v2 (ranked, from DivSkill/Spider-Agent/CHESS/SOMA survey)
+
+1. `describe_table(table)` + `list_tables()` — deterministic schema browsing (PRAGMA + sample values). Decided: in.
+2. `find_value(term, table?, column?)` — fuzzy cell-value search (CHESS/Tool-SQL pattern, +3–5% measured); fixes filter-literal mismatches ('CA' vs 'California').
+3. `get_column_values(table, column)` — distinct values + counts for filter/ambiguity probing (SOMA-style, +9 over majority vote).
+4. `read_documentation()` — the question's external_knowledge doc as a tool instead of 20K-char prompt-stuffing (13/135 locals need it).
+5. `run_sql_query(sql, limit=N)` — keep, but make the preview row count an agent-settable parameter (capped) instead of fixed 12.
+6. Later / after ablation: `run_python` (biggest single-tool ablation in FlexSQL, −11.85% when removed, but needs sandboxing), `validate_sql` dry-run, LLM critic, query-expansion search (deferred — deterministic tools should reduce reliance on vector search).
+
+### Bottleneck ablation (after baseline run)
+
+| Arm | Context given | Questions | Isolates |
+|---|---|---|---|
+| A — baseline | tools as-is, retrieval via search_context | all 135 | end-to-end |
+| B — full schema | complete DDL + column samples in prompt, retrieval disabled | all 135 | is *finding* context the problem? |
+| C — oracle linking | gold tables+columns (parsed from gold SQL via sqlglot) injected up front | 24 locals with gold SQL (compare against same-24 baseline slice) | can the model write correct SQL given perfect context? |
+
+Read: C ≫ B ≈ A → generation is fine, retrieval/linking is the bottleneck. C ≈ B ≈ A (all low) → generation is the bottleneck. Gold SQL exists for only 24/135 locals; gold result CSVs exist for all (scoring unaffected). Alongside: categorize every failure in the baseline traces (wrong table / wrong column / wrong filter literal / wrong aggregation / doc-dependent / doom-loop).
+
+### Results (Sept 13, 2026 — Qwen3.5-9B, v2 harness)
+
+| Run | Score | Note |
+|---|---|---|
+| v1 harness (GLM-4.7-Flash), reference | 20.2% | 17% of questions had silently dead retrieval |
+| A+ baseline (retrieval + schema overview + tools) | **43/135 (31.9%)** | zero infra failures; all misses are real SQL errors |
+| A+ restricted to the 24 gold-SQL questions | 9/24 | |
+| C oracle (gold tables+columns injected, no search) | **8/24** | |
+
+**Verdict: SQL generation is the bottleneck, not retrieval.** Handing the model the exact
+tables and columns of the correct answer changed nothing (9/24 → 8/24; overlap analysis:
+5 solved in both arms, 3 only-with-oracle vs 4 only-baseline — symmetric noise). 12/24
+questions fail in BOTH arms with perfect context — pure generation failures (window
+functions, aggregation grain, identifier semantics like customer_id vs customer_unique_id,
+doc-defined metrics). This validates the plan's core bet: the Arctic SFT+RL recipe on SQL
+generation (P1) is the right lever; further retrieval investment is not.
+
+Supporting evidence — enriching the never-enriched oracle_sql DB and enabling search moved
+its 8 questions only 2/8 → 3/8.
+
+**Failure taxonomy** (92 A+ misses, automated by re-executing predicted SQL vs gold):
+
+| Category | Count | Reading |
+|---|---|---|
+| Wrong values (scorer tolerates extra columns) | 79 | wrong numbers/rows — aggregation grain, filters, window logic, wrong metric |
+| True output-contract error (fewer cols than gold) | 10 | question intent misread |
+| SQL no longer executes | 3 | nondeterministic edge (env) |
+
+(Earlier draft split by raw column count; corrected after noting the scorer matches gold
+columns anywhere in the prediction, so "extra columns" misses are value errors.)
+
+Arm C step-budget check: with gold columns provided the agent's behavior barely changed —
+14.9 vs 15.7 avg steps, 266 vs 265 SQL executions on the same 24. It already spends
+~75-80% of tool calls iterating SQL in both arms (~11 executions/question) and still
+converges on wrong logic: **iteration without a correctness signal**. Execution feedback
+alone can't distinguish plausible from correct — the motivation for critic/selection
+(P4) and execution-match RL (P1).
+
+Cross-cuts: 22/92 hit the 30-step cap (fallback); 10/92 are doc-dependent questions.
+On the gold-SQL subset: 8/15 misses used exactly the right tables and still wrote wrong
+SQL; 7/15 missed a gold table (incomplete joins — e.g. local019 missed 4 of its tables).
+Every category points at generation quality; none at retrieval.
+
+**Caveat on arm C:** the hint listed all columns the gold SQL *touches* (join keys,
+filters), not the output columns — and shape mismatches went UP under C (7→12).
+The biggest failure bucket is the **output contract** (which columns the final answer
+should return), a question-comprehension failure orthogonal to retrieval.
+
+### Phase 0 follow-up experiments (queued)
+
+1. Gold-SQL-through-DuckDB sanity check (24) — calibrates dialect-artifact ceiling.
+2. Retrieval recall@8 measured directly (gold tables in top-8 chunks?) — exonerates
+   retrieval without episode confounds.
+3. C+ — inject exact output columns (gold CSV headers, available for ALL 135) — does
+   the 43-question shape-mismatch bucket collapse?
+4. Single-shot mode (schema + question, one call, no tools): Qwen3.5-9B vs
+   **Arctic-Text2SQL-R1-7B/14B** (open weights, BIRD SOTA lineage, single-shot
+   specialist — do NOT run it as the agent; it has no tool training). Arctic's
+   number is the bar P1's fine-tuned model must beat; also Option-2 `draft_sql` backend.
+5. Pass@K (K=4, temp 0.7, stratified subset) — if pass@K ≫ pass@1, selection is the gap
+   (favors ensemble/critic + guarantees GRPO positive rollouts); if ≈, capability ceiling
+   (favors distillation).
+
+### Results: single-shot lane + two-model design (Sept 14, 2026)
+
+| Run | Score | |
+|---|---|---|
+| Qwen3.5-9B single-shot (schema+question, 1 call, SQLite exec) | 21/135 (15.6%) | |
+| Arctic-Text2SQL-R1-7B single-shot (identical prompt) | 22/135 (16.3%) | 18 misses don't even execute |
+| Qwen3.5-9B agentic (A+) | 43/135 (31.9%) | |
+| Agentic + draft_sql(Arctic) | 46/135 (34.1%) | within noise of A+ |
+
+Findings:
+- **Specialist ≈ generalist single-shot** (22 vs 21, only 13 shared wins). The BIRD-SOTA
+  fine-tune transfers nothing to Spider2-lite → P1 must train on Spider2-style
+  multi-step analytics, not BIRD data.
+- **The agentic loop DOUBLES the same model** (21 → 43). Biggest measured lever so far.
+- **Two-model design with this specialist: no effect.** Where draft_sql was actually
+  called (61/135 episodes) the draft run scored 15 vs A+'s 17; the +3 net is variance
+  (17 flips each way). Revisit once P1 produces a specialist whose single-shot beats
+  the actor's own SQL.
+- **Arctic as the agent actor: non-functional.** Zero tool calls in a 2-question smoke
+  (60 steps); it answers in its trained prose+SQL style regardless of protocol.
+  Full run skipped. Implication for P1: if we fine-tune hard on single-shot SQL, we
+  should expect tool-calling degradation — check for it, or train with agentic traces
+  mixed in. (A `--text-sql-fallback` shim exists in the harness if we ever want to
+  iterate with a non-tool model.)
+- **Selection headroom: union of the 4 runs = 67/135 (50%).** Perfect cross-run
+  selection would gain +18 points over the best single run — strong motivation for
+  pass@K + critic/selection (P4) and confirmation GRPO will have positive rollouts.
+- 68/135 solved by no run yet — the hard core for training to attack.
+
+### Results: pass@4 (Sept 15, 2026 — 4× full-135 agentic runs, temp 0.7)
+
+| K | pass@K |
+|---|---|
+| 1 (avg) | 29.3% |
+| 2 | 39.9% |
+| 3 | 46.1% |
+| 4 | **51.1% (69/135)** |
+
+Greedy A+ on same set: 31.9%. Pass@4 + greedy union: 73/135 (54.1%). Curve still rising
++5 pts at K=3→4 (K=8 likely >55-60%). **Verdict: selection is the gap** — one extra
+sample is worth +10 pts; the model generates correct SQL for half the benchmark within
+4 tries. GRPO rollouts will be positive-rich; best-of-K + selector (exec-consistency
+vote / critic / DivSkill) is the cheapest accuracy win before any training.
+Never-solved core across all 5 runs: 62 questions, concentrated in bank_sales_trading (8),
+f1 (8), IPL (5), oracle_sql (4), complex_oracle (4) — mine these for training targets.
+Ops note: two runaway-query hangs cost wall-clock this phase; both DuckDB (agentic) and
+SQLite (single-shot) executors now have interrupt guards.
+
+---
+
 ## Plan
 
 The [Arctic-Text2SQL-R1](https://arxiv.org/abs/2505.20315) paper shows that SFT + RL can improve a single model's SQL generation by ~18 points on BIRD (most of it from SFT, the rest from GRPO with a simple execution reward). We try the same on a newer open model — **Qwen3.6-27B is the pick** — to see how far a current-generation model gets with the same training data and recipe.
