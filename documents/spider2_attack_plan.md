@@ -144,6 +144,14 @@ f1 (8), IPL (5), oracle_sql (4), complex_oracle (4) — mine these for training 
 Ops note: two runaway-query hangs cost wall-clock this phase; both DuckDB (agentic) and
 SQLite (single-shot) executors now have interrupt guards.
 
+**Correction (Sept 17): 100-row result cap invalidated 8 questions.** The harness stored
+at most 100 rows of the submitted result while 8/135 gold answers have 236-2000 rows —
+those questions were unwinnable in every run (v1 included). Cap raised to 5000; stored
+final SQL re-executed uncapped and re-scored:
+- **A+ corrected: 46/135 (34.1%)** (local074, local194, local354 had correct SQL, truncated)
+- pass@4 corrected: 71/135 (52.6%); pass@4 + greedy union: 76/135 (56.3%)
+- 5 of the 8 remain genuinely unsolved (now winnable going forward).
+
 ---
 
 ## Plan

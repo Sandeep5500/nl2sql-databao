@@ -87,7 +87,7 @@ def extract_sql(text: str) -> str | None:
     return text[m.start():].strip().rstrip(";") if m else None
 
 
-def run_sql_sqlite(db_path: Path, sql: str, row_cap: int = 200,
+def run_sql_sqlite(db_path: Path, sql: str, row_cap: int = 5000,
                    timeout_s: float = 60.0) -> pd.DataFrame:
     import threading
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,

@@ -48,7 +48,7 @@ class AgentConfig:
     max_steps: int = 30                 # LLM turns per episode
     preview_rows_default: int = 12
     preview_rows_max: int = 50
-    result_rows_max: int = 100          # full stored result cap (submission df)
+    result_rows_max: int = 5000     # full stored result cap (max gold is 2000 rows)
     cell_char_limit: int = 1024
     search_limit: int = 8               # chunks returned per search_context call
     expansion_queries: int = 3          # 0 disables query expansion
