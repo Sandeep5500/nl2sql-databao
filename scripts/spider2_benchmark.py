@@ -41,6 +41,33 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.outputs import LLMResult
+
+
+class _TokenCounter(BaseCallbackHandler):
+    """Lightweight callback that accumulates token usage across all LLM calls in a thread."""
+
+    def __init__(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+
+    def on_llm_end(self, response: LLMResult, **kwargs) -> None:
+        for generations in response.generations:
+            for gen in generations:
+                usage = getattr(gen.message, "usage_metadata", None) or {}
+                self.prompt_tokens += usage.get("input_tokens", 0)
+                self.completion_tokens += usage.get("output_tokens", 0)
+                self.total_tokens += usage.get("total_tokens", 0)
+
+    def reset(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+
+
+_token_counter = _TokenCounter()
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 CAPSTONE_DIR = Path(__file__).parent.parent
@@ -167,7 +194,9 @@ def setup_agent(db_path: Path, model_name: str, api_base_url: str | None = None,
     llm_config = LLMConfig(
         name=model_name,
         temperature=0.0,
+        use_responses_api=False,
         **({"api_base_url": api_base_url} if api_base_url else {}),
+        model_kwargs={"callbacks": [_token_counter]},
     )
 
     agent_config = AgentConfig()
@@ -409,6 +438,7 @@ def main():
     fieldnames = [
         "instance_id", "db", "question", "external_knowledge",
         "predicted_sql", "execution_result", "score", "score_detail", "error", "time_s",
+        "input_tokens", "output_tokens", "total_tokens",
     ]
 
     correct = 0
@@ -450,12 +480,20 @@ def main():
             score_detail = ""
             error = ""
             thread = None
+            input_tokens = 0
+            output_tokens = 0
+            total_tokens = 0
 
             tmp_dce = None
             try:
                 agent, tmp_dce = setup_agent(db_path, model_name, api_base_url, ext_doc)
                 thread = agent.thread()
                 thread.ask(question)
+                input_tokens = _token_counter.prompt_tokens
+                output_tokens = _token_counter.completion_tokens
+                total_tokens = _token_counter.total_tokens
+                _token_counter.reset()
+                print(f"  TOKENS: {input_tokens} in / {output_tokens} out / {total_tokens} total")
 
                 predicted_sql = thread.code() or ""
                 if predicted_sql:
@@ -517,6 +555,9 @@ def main():
                 "score_detail": score_detail,
                 "error": error,
                 "time_s": elapsed,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
             })
             csvf.flush()
 
