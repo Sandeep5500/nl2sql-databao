@@ -206,7 +206,7 @@ def main():
                              "score_detail": detail, "prompt_chars": len(prompt),
                              "completion_chars": len(completion),
                              "wall_seconds": round(wall, 1),
-                             "sql": (sql or "").replace("\n", " ")})
+                             "sql": (sql or "").replace("\n", "\\n")})
             f.flush()
             print(f"{'✓' if score else '✗'} {detail} ({wall:.0f}s)")
             if trace_dir:

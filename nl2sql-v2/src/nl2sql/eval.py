@@ -60,7 +60,23 @@ def compare_dataframes(pred, gold, condition_cols=None, ignore_order=False) -> b
     return True
 
 
+def _csv_roundtrip(df):
+    """Serialize through CSV exactly like the official Spider2 scorer, so the
+    prediction gets the same pandas type coercion as the gold (string '2018'
+    -> int, timestamps -> date strings, '' -> NaN). Comparing the in-memory
+    frame directly produces false negatives on type-equal values."""
+    import io
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    buf.seek(0)
+    try:
+        return pd.read_csv(buf)
+    except Exception:
+        return df  # e.g. zero-column frame; compare as-is
+
+
 def score_against_gold(pred_df, instance_id: str, standards: dict) -> tuple[int, str]:
+    pred_df = _csv_roundtrip(pred_df)
     pattern = re.compile(rf"^{re.escape(instance_id)}(_[a-z])?\.csv$")
     gold_files = sorted(GOLD_EXEC_DIR / f for f in os.listdir(GOLD_EXEC_DIR)
                         if pattern.match(f))

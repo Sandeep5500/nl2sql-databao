@@ -152,6 +152,27 @@ final SQL re-executed uncapped and re-scored:
 - pass@4 corrected: 71/135 (52.6%); pass@4 + greedy union: 76/135 (56.3%)
 - 5 of the 8 remain genuinely unsolved (now winnable going forward).
 
+**Correction 2 (Sept 17): CSV round-trip type coercion** (credit: teammate's review).
+The official Spider2 scorer writes the *prediction* to CSV and reads it back with
+pandas, so both sides get identical type coercion; our scorer compared the in-memory
+DuckDB frame directly — string '2018' vs number 2018, timestamps vs date strings,
+'' vs NaN all scored as false negatives. Fixed: `eval.py` now round-trips the
+prediction through CSV before comparison. Re-scored from stored SQL (flips only —
+regressions in re-execution were artifacts of comment-swallowing newline flattening
+in the CSVs, itself now fixed by escaping newlines):
+
+| Run | before | corrected |
+|---|---|---|
+| A+ greedy | 43 | **46/135 (34.1%)** |
+| pass@4 lanes | 39/37/38/44 | 40/38/40/46 (avg pass@1 30.4%) |
+| pass@4 union | 69 | **72/135 (53.3%)** |
+| pass@4 + greedy union | 73 | **77/135 (57.0%)** |
+| draft (Arctic) | 46 | 47 (34.8%) |
+| single-shot Arctic | 22 | 23 (17.0%) |
+
+Cross-checked cases from both corrections: local156 (SUBSTR year as text),
+local074/194/354 (row cap), local017 (type coercion).
+
 ---
 
 ## Plan
