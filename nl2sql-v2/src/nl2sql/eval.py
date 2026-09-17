@@ -66,6 +66,12 @@ def _csv_roundtrip(df):
     -> int, timestamps -> date strings, '' -> NaN). Comparing the in-memory
     frame directly produces false negatives on type-equal values."""
     import io
+    for c in df.columns:
+        if df[c].dtype == object and df[c].map(
+                lambda v: isinstance(v, (bytes, bytearray))).any():
+            df[c] = df[c].map(
+                lambda v: bytes(v).decode("utf-8", "replace")
+                if isinstance(v, (bytes, bytearray)) else v)
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     buf.seek(0)

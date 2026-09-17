@@ -173,6 +173,18 @@ in the CSVs, itself now fixed by escaping newlines):
 Cross-checked cases from both corrections: local156 (SUBSTR year as text),
 local074/194/354 (row cap), local017 (type coercion).
 
+**Correction 3 (Sept 17): byte decoding for typeless SQLite columns** (teammate review
+again). SQLite columns with no declared type (e.g. WWE Wrestlers.name) come back from
+DuckDB's scanner as bytearray objects; str() of those never matches gold text, and the
+MODEL saw `bytearray(b'...')` in every preview on affected DBs. Fixed at the Database
+layer (previews, stored results, get_column_values, find_value) and in the scorer
+round-trip. Recovers local019 (WWE) in A+, k3 and arm C — correct SQL all along.
+
+**Final corrected ledger:** A+ **47/135 (34.8%)** · pass@4 lanes 40/38/41/46
+(avg pass@1 30.6%) · pass@4 union **73/135 (54.1%)** · with greedy **78/135 (57.8%)** ·
+arm C 9/24 vs A+ 10/24 on the same slice (bottleneck verdict unchanged) · draft 47 ·
+single-shot Qwen 21 / Arctic 23.
+
 ---
 
 ## Plan

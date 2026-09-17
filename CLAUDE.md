@@ -80,7 +80,7 @@ a search-mode run is reading `dce.duckdb`.
 
 ## Known result baselines (Sept 2026, Qwen3.5-9B)
 
-Greedy agentic 46/135 (34.1%) · single-shot 15.6% · pass@4 53.3% (with greedy: 57.0%) · v1 (GLM) was 20.2%.
-(Two scoring corrections Sept 17: 100-row result cap; CSV round-trip type coercion — see plan doc.)
+Greedy agentic 47/135 (34.8%) · single-shot 15.6% · pass@4 54.1% (with greedy: 57.8%) · v1 (GLM) was 20.2%.
+(Three scoring corrections Sept 17: 100-row result cap; CSV round-trip type coercion; bytearray decoding for typeless SQLite columns — see plan doc.)
 Generation is the measured bottleneck (oracle ablation); selection is the open gap (pass@K).
 Details and never-solved core: `documents/spider2_attack_plan.md`.
