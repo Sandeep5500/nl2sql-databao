@@ -25,7 +25,9 @@ trace files predate the three Sept 17 scoring fixes and were not used.
   (`constructor_standings`), or the one table that holds the right identity key (`customers` for
   `customer_unique_id`).
 - **Even with retrieval handed over, the 9B mostly fails the hard tail:** 9% pass rate on the 11 unflagged
-  questions, and about a third of episodes run out of steps.
+  questions. Of its 46 failed runs, a third ignored the tables or columns it was explicitly given, 13%
+  missed a join key (composite keys, semantic links), and 39% ran out of steps without ever producing the
+  answer.
 - **Selection is the gap on the reachable questions:** the model solves 77 of 135 on some run but greedy
   gets 47, and agreement voting recovers only 3 of those 30 points. A verifier is the lever.
 - **The benchmark's own artifacts need care:** 8 of the 24 shipped gold SQLs answer a different question
@@ -364,7 +366,57 @@ The flagged failures are near-misses:
   `customer_unique_id`, which separates a person from an order. The plan already names this confusion.
 - **`local311`** (f1): missed `results` in 2 of 5 runs.
 
-### 7.5 Caveats
+### 7.5 Why the 9B still fails with the correct linkage
+
+46 of the 56 oracle runs failed. `oracle_failures.py` diffs each failed query against the teacher's
+verified query and assigns the first cause that applies. Examples in every category were read by hand;
+two artifacts found that way were fixed (below).
+
+| Cause | Runs | Share |
+|---|---|---|
+| **1) Ignored what it was given** | **15** | **33%** |
+| &nbsp;&nbsp;left out a table the prompt named | 8 | |
+| &nbsp;&nbsp;left out a column the prompt listed | 7 | |
+| **2) Joins**: used the tables, missed a join key the correct query uses | **6** | **13%** |
+| **3) Anything else** | **25** | **54%** |
+| &nbsp;&nbsp;ran out of its 30 steps | 18 | |
+| &nbsp;&nbsp;right columns, wrong row count (grouping or filtering) | 4 | |
+| &nbsp;&nbsp;too few output columns | 2 | |
+| &nbsp;&nbsp;right shape, wrong values | 1 | |
+
+**1) Ignoring explicit hints is common.**
+- `local004`: in all 3 failed runs the final query skips `customers` and groups by the per-order
+  `customer_id`. Two of those runs never mention `customers` in any tool call; the third describes it once
+  and moves on. The one successful run uses `customers` in 8 of its 11 tool calls.
+- `local133`: skipped `musical_styles`, returned style IDs instead of names, and hardcoded an average (4.05).
+- `local130`: identified English classes by `CategoryID`, which was not listed, instead of the listed
+  `SubjectCode`.
+- `local131`: ignored `PreferenceSeq`, so it never split counts into 1st, 2nd and 3rd choice.
+
+**2) Join failures are semantic, not foreign-key discovery.**
+- `local062`: joined `costs` on 2 of its 4 key columns (`prod_id`, `time_id`; missing `promo_id`,
+  `channel_id`), so rows fan out and every sum is inflated.
+- `local075`: never linked purchase events back to products through `visit_id`.
+
+**3) Running out of steps is non-convergence, not error loops.** The 18 step-cap episodes run 27 queries
+each on average; 78% execute fine, there are about 2 exact repeats per episode, and the history never
+overflowed. Only 2 of the 18 ever ran a query that scores correct without submitting it (`local201` at SQL
+call 12, `local360` at call 24). In the other 16 it never produced the answer at all, so an in-episode
+verifier would rescue little here.
+
+**Artifacts fixed during the check.**
+- *Extra tables are not counted as a cause.* The given list is what the teacher needed to pass the scorer,
+  which can be less than the question asks: `local286`'s gold answer has review-score and packing-time
+  columns, but only 5 of its 7 columns are graded, so the teacher skipped `order_reviews` and `orders` and
+  the 9B was right to use them. 4 runs used tables beyond the list.
+- *Join keys count only real schema columns.* Otherwise a comparison between two computed values
+  (`pre_count = min_pre_count` in `local360`) reads as a join.
+
+Caveats: one cause per run, although a run can have several faults (`local062` also buckets by `NTILE`
+where the question implies equal-width ranges); and the classification is structural, so treat counts as
+approximate.
+
+### 7.6 Caveats
 
 - **Small n.** 14 questions, 3 flagged, and `local335` supplies 4 of the 6 gained runs. The split in 7.4
   was chosen after noticing `local335`, although the flags themselves predate the arm results. Confirm on
@@ -451,6 +503,7 @@ uv run python scripts/analysis/harvest_teacher.py --runs 'teacher_p1_*'         
 uv run python scripts/analysis/paired_failures.py --bucket C --by-question \
     --runs 'v2_armAplus,v2_pass4_k1,v2_pass4_k2,v2_pass4_k3,v2_pass4_k4,teacher_p1_*,teacher_p1b_*'  # 7.2
 uv run python scripts/analysis/ablation_arms.py                                           # Section 7.3
+uv run python scripts/analysis/oracle_failures.py --examples 2                           # Section 7.5
 uv run python scripts/analysis/determinism.py                                             # Section 8
 ```
 
