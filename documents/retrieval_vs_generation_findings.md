@@ -1,10 +1,36 @@
 # Retrieval vs generation: findings
 
-**Date:** 2026-09-18 · **Model:** Qwen3.5-9B, v2 harness · **Scope:** Spider 2.0-Lite local split, 135 SQLite questions
+**Date:** 2026-09-18 (updated 05:30 with the overnight runs) · **Model:** Qwen3.5-9B, v2 harness; Qwen3.6-27B as teacher · **Scope:** Spider 2.0-Lite local split, 135 SQLite questions
 
 **Data:** the five published runs in `logs/traces/` (greedy `v2_armAplus` plus the four sampled lanes
 `v2_pass4_k1`–`k4`), re-executed and re-scored with the current `nl2sql/eval.py`. Stored scores in the
 trace files predate the three Sept 17 scoring fixes and were not used.
+
+---
+
+## Summary
+
+- **Retrieval is a real but narrow bottleneck; generation dominates everywhere.** Two independent
+  methods now agree, on the questions the 9B can reach and on the ones it never solves.
+- **Questions within the 9B's reach** (62 it both solved and failed across runs): when it fails, it is
+  2% never finding a needed table, 25% picking the wrong column, 74% wrong logic with everything right.
+- **Never-solved questions** (57, or 58 on one machine, see Section 8): a Qwen3.6-27B teacher produced
+  verified gold SQL for 14 of them.
+- **Handing the 9B the correct tables and columns on those 14** lifts its mean pass rate from 7.1% (decoy)
+  to 17.9% (oracle): +10.7 points, 95% CI [-3.6, +28.6]. Inconclusive on its own at n=14.
+- **But the whole gain sits on 3 questions** that an analysis computed *before* the arms ran had flagged as
+  genuine retrieval failures: 6/12 runs vs 0/12. On the other 11, where the 9B already found every table,
+  correct linkage changed nothing: 4/44 vs 4/44.
+- **Those retrieval failures are near-misses**, not lost schema: a sibling table in a 29-table database
+  (`constructor_standings`), or the one table that holds the right identity key (`customers` for
+  `customer_unique_id`).
+- **Even with retrieval handed over, the 9B mostly fails the hard tail:** 9% pass rate on the 11 unflagged
+  questions, and about a third of episodes run out of steps.
+- **Selection is the gap on the reachable questions:** the model solves 77 of 135 on some run but greedy
+  gets 47, and agreement voting recovers only 3 of those 30 points. A verifier is the lever.
+- **The benchmark's own artifacts need care:** 8 of the 24 shipped gold SQLs answer a different question
+  than the graded CSV; the scorer ignores row pairing on all 135; 52 of 675 stored queries return
+  different results run to run.
 
 ---
 
@@ -20,8 +46,8 @@ table and column correct.
 | Right table, wrong column (column linking) | 30 | 25% |
 | Right tables and columns, wrong logic (generation) | 90 | 74% |
 
-Scope limit: this covers the 62 questions the model solves on at least one run. It says nothing about the
-58 questions no run has ever solved. See "Open questions".
+Scope limit: this covers the 62 questions the model solves on at least one run. Section 7 extends the
+analysis to the questions no run had ever solved, using a larger model to supply correct answers.
 
 ---
 
@@ -251,7 +277,133 @@ Given Section 1, the sweep's weakness matters less than it appeared: the model a
 
 ---
 
-## 7. Mistakes made during this analysis — do not repeat
+## 7. The never-solved questions: teacher run and oracle ablation
+
+The paired method in Section 1 needs a correct run to compare against, so it could not reach bucket C.
+The overnight runs on 2026-09-18 supplied one, then tested the question directly on the 9B.
+
+### 7.1 A 27B teacher supplies verified gold SQL
+
+Qwen3.6-27B (the model the plan picks for fine-tuning) ran the same harness on the never-solved
+questions, with the output contract in its prompt to maximise yield. It is a data generator here, so its
+solve rate is not comparable to the 9B's. A query became gold SQL only if it scored correct on every one
+of three repeated executions, had an answer larger than one number, and touched the table the value sweep
+found (where one exists).
+
+| Pass | Mode | Attempted | Scored correct | Verified gold SQL |
+|---|---|---|---|---|
+| 1 | swept tables + output contract | 29 | 13 | **12** |
+| 1b | full schema + output contract | 15 | 2 | **2** |
+| 1c | single-number answers | 12 | 7 | 0 (not eligible) |
+
+14 verified packages, all in bucket C, in `nl2sql-v2/teacher_context.json`. Re-harvesting the pulled traces
+on a second machine gives the identical 14.
+
+### 7.2 Cross-model paired analysis
+
+Same method as Section 1, but the winning query is the 27B's and the failing ones are the 9B's.
+
+| | Pairs | Share |
+|---|---|---|
+| Never found a table the 27B's query needs | 7 | 16% |
+| Right tables, wrong column | 13 | 29% |
+| Right tables and columns, wrong logic | 25 | 56% |
+
+45 clean pairs from 13 questions, after removing 30 unfinished (step-cap) episodes: 40% of raw pairs,
+against 29% on the reachable questions. Pairs cluster by question, so per question: **3 of 13** had at
+least one run that never found a needed table, **10 of 13** had every needed table in every failing run.
+One question, `local335`, supplies 4 of the 7 retrieval pairs.
+
+### 7.3 Oracle vs decoy on the 9B
+
+The 9B (vLLM 0.19, 4 runs per arm: greedy plus 3 at temperature 0.7) on the 14 verified questions.
+
+- **Oracle:** the verified query's tables described up front, plus the columns it touches.
+- **Decoy:** the same kind of block, never shorter (median 1.14x the oracle's length), naming tables the
+  query does not use, and framed neutrally so it does not assert they are correct.
+
+Search is off in both arms and neither gets the output contract, so the only difference is whether the
+named tables are right.
+
+| | Oracle | Decoy |
+|---|---|---|
+| Greedy run solves | 2 / 14 | 0 / 14 |
+| Solved in at least one of 4 runs | 7 / 14 | 3 / 14 |
+| Mean pass rate per question | 17.9% | 7.1% |
+| Episodes that hit the 30-step cap | 19 / 56 | 20 / 56 |
+
+Effect of correct linkage: **+10.7 points, 95% CI [-3.6, +28.6]**. Oracle beats decoy on 6 questions, the
+decoy wins on 3, 5 tie.
+
+| Question | Oracle | Decoy | | Question | Oracle | Decoy |
+|---|---|---|---|---|---|---|
+| local004 | 1/4 | 0/4 | | local133 | 1/4 | 0/4 |
+| local062 | 0/4 | 0/4 | | local170 | 1/4 | 2/4 |
+| local073 | 0/4 | 0/4 | | local201 | 1/4 | 0/4 |
+| local075 | 0/4 | 1/4 | | local286 | 0/4 | 0/4 |
+| local096 | 1/4 | 0/4 | | local311 | 1/4 | 0/4 |
+| local130 | 0/4 | 1/4 | | **local335** | **4/4** | **0/4** |
+| local131 | 0/4 | 0/4 | | local360 | 0/4 | 0/4 |
+
+### 7.4 The two methods agree
+
+Split the ablation by the retrieval flags from 7.2, which were computed before either arm finished:
+
+| Questions | Count | Oracle | Decoy | Gap |
+|---|---|---|---|---|
+| Flagged: in its own runs the 9B never found a needed table | 3 | 6/12 (50%) | 0/12 (0%) | **+6** |
+| Not flagged: the 9B already had every needed table | 11 | 4/44 (9%) | 4/44 (9%) | **0** |
+
+Correct linkage helps exactly where the 9B failed to find a table, and there it helps a lot. Where the 9B
+already had the tables, handing them over gains nothing, and the 9B still fails 91% of runs.
+
+The flagged failures are near-misses:
+
+- **`local335`** (f1, 29 tables): missed `constructor_standings` in 4 of 5 runs. Oracle 4/4, decoy 0/4.
+- **`local004`** (E_commerce): missed `customers` in 2 of 5 runs, the only table holding
+  `customer_unique_id`, which separates a person from an order. The plan already names this confusion.
+- **`local311`** (f1): missed `results` in 2 of 5 runs.
+
+### 7.5 Caveats
+
+- **Small n.** 14 questions, 3 flagged, and `local335` supplies 4 of the 6 gained runs. The split in 7.4
+  was chosen after noticing `local335`, although the flags themselves predate the arm results. Confirm on
+  more questions before relying on it.
+- **Selection.** The 14 are the never-solved questions a 27B could solve with the output contract in hand:
+  the easier end of the hard tail. 43 bucket-C questions have no verified answer yet.
+- **Cross-model reference.** The flags and linkage use the 27B's query as ground truth; another valid query
+  might use different tables.
+- **Search was off** in both arms because Ollama and the vector index are not set up on Babel. The enriched
+  column descriptions it returns could help the oracle arm, so its effect may be understated.
+- **Stack.** Both arms ran on vLLM 0.19, so the oracle/decoy comparison is internal. Absolute rates are not
+  directly comparable to Phase-0, which used 0.18.1. Preemptions moved the arms across GPU types
+  (A100, L40S and others), and greedy decoding can differ slightly across hardware.
+
+---
+
+## 8. Reproducibility: nondeterminism and running on Babel
+
+**Nondeterminism.** 52 of the 675 stored Phase-0 queries return different results across 5 executions
+(`determinism.py`). None flipped its score in 5 executions, but rare flips exist: `local003`'s greedy query
+returns 9, 10 or 11 rows and matches gold only on the 9-row result, about 1 run in 15. That is why bucket
+counts are 47/30/58 on one machine and 48/30/57 on another, with byte-identical databases (checked by
+MD5) and the same DuckDB version. `local219`'s official gold SQL passes about 2 runs in 20.
+
+**Running on Babel — what bit us overnight:**
+- The `preempt` partition requeues preempted jobs. With `--resume` and per-question traces, 10 preemptions
+  across 5 jobs lost no finished work. Jobs were also preempted *after* finishing, during model-server
+  shutdown; the requeued copy found nothing left to do and exited.
+- `--resume` crashed when a preemption left a lane's CSV empty and the next restart appended rows with no
+  header. Fixed: the header is flushed at once and empty or headerless files are handled.
+- Two vLLM servers on one node must use different ports, or the second fails to start.
+- Qwen3.6-27B needs vLLM 0.19 **and** transformers 5.5.3. vLLM 0.19 pulls transformers 4.57.6, which does
+  not know the `qwen3_5` model type. It lives in its own `.vllm-venv-0.19` so the 9B setup is untouched.
+- `sbatch` reads job scripts on the login node, which cannot see `/data/user_data`. Keep job scripts in the
+  home directory and point jobs at the repo with `--chdir`.
+
+---
+
+## 9. Mistakes made during this analysis — do not repeat
 
 1. **Counting unfinished episodes as retrieval failures.** `fallback` episodes submit the last exploratory
    query, which usually touches one table. Exclude them.
@@ -266,7 +418,7 @@ Given Section 1, the sweep's weakness matters less than it appeared: the model a
 
 ---
 
-## 8. What was built
+## 10. What was built
 
 | File | Purpose |
 |---|---|
@@ -276,11 +428,15 @@ Given Section 1, the sweep's weakness matters less than it appeared: the model a
 | `nl2sql-v2/scripts/run_benchmark.py` | New `--context-mode contract / sweep / sweep_contract`; new `--shard I/N` |
 | `nl2sql-v2/src/nl2sql/agent.py` | Contract keeps retrieval on; linkage arms turn it off |
 | `nl2sql-v2/slurm/serve_vllm_qwen35.slurm` | Removed hardcoded user paths; portable across users |
-| `nl2sql-v2/scripts/analysis/` | The six scripts that reproduce every number in this document |
+| `nl2sql-v2/scripts/analysis/` | Scripts that reproduce every number in this document (see Section 11) |
+| `nl2sql-v2/scripts/run_benchmark.py` (overnight) | `--context-mode full_contract / oracle_decoy`, `--oracle-file`, `--thinking`; `--resume` fix |
+| `nl2sql-v2/slurm/teacher_run.slurm` | One self-contained job: serve, smoke-test, lanes, optional repeats, harvest |
+| `nl2sql-v2/teacher_context.json` | The 14 verified gold SQL packages from the 27B teacher |
+| `logs/traces/teacher_*`, `logs/traces/ablation_*` | Every overnight episode, published |
 
 ---
 
-## 9. Reproducing these numbers
+## 11. Reproducing these numbers
 
 Every number above is produced by a script in `nl2sql-v2/scripts/analysis/`. Run from `nl2sql-v2/`:
 
@@ -291,7 +447,15 @@ uv run python scripts/analysis/gold_sql_check.py     # Section 2  — add --repe
 uv run python scripts/analysis/scorer_audit.py       # Section 3  — needs no stored runs
 uv run python scripts/analysis/vote.py               # Section 5
 uv run python scripts/analysis/linkage_funnel.py     # Section 6
+uv run python scripts/analysis/harvest_teacher.py --runs 'teacher_p1_*'                  # Section 7.1
+uv run python scripts/analysis/paired_failures.py --bucket C --by-question \
+    --runs 'v2_armAplus,v2_pass4_k1,v2_pass4_k2,v2_pass4_k3,v2_pass4_k4,teacher_p1_*,teacher_p1b_*'  # 7.2
+uv run python scripts/analysis/ablation_arms.py                                           # Section 7.3
+uv run python scripts/analysis/determinism.py                                             # Section 8
 ```
+
+`teacher_targets.py` picks the questions to send to a teacher; `teacher_run.slurm` runs a teacher pass or
+a 9B arm end to end (see its header for the exact `sbatch` lines).
 
 The first run re-executes all 675 stored queries (a few minutes) and caches the scores in
 `logs/analysis/rescore_cache.json`. The cache discards itself whenever `eval.py` or `db.py` change.
@@ -305,16 +469,21 @@ uv run python scripts/analysis/paired_failures.py --runs 'v2_armAplus,arm_contra
 
 ---
 
-## 10. Open questions and next steps
+## 12. Open questions and next steps
 
-- **Arm 1 (output contract), 135 questions — still worth running.** Two of the three logic-failure
-  examples were correct computations with the wrong final shape, which is what the contract supplies.
-  Baseline to beat: 47. Read it on bucket C.
-- **Arm 2 (value sweep), 72 questions — now close to a foregone conclusion.** It supplies tables the model
-  already finds 98% of the time. Optional; run only as independent confirmation.
-- **Placebo arm on bucket C.** Inject an uninformative block of similar length to measure how much a
-  changed prompt flips outcomes on its own. About 1,050 calls, ~2 h at 4 lanes.
-- **The 58 never-solved questions are the unresolved part.** The paired method cannot reach them. They
-  may fail for different reasons than the questions within reach.
+- **Confirm Section 7.4 on more questions.** Run a second teacher pass with reasoning on
+  (`--thinking --temperature 0.7`) over the 43 bucket-C questions still without verified gold SQL, then
+  re-run both 9B arms on the larger set. The claim to test: correct linkage helps only where the 9B
+  failed to find a table.
+- **Re-run the arms with search on** once Ollama and the vector index are set up on Babel, to remove the
+  caveat that the oracle arm lacked the enriched column descriptions.
+- **Targeted retrieval, not more retrieval.** The retrieval failures are near-misses between sibling tables
+  and identity keys. Cheap candidates: surface all tables sharing a name stem when one is described, and
+  flag entity/identity tables (`customers` for `customer_unique_id`) in the schema overview.
+- **Arm 1 (output contract), 135 questions — still worth running.** Several logic failures are correct
+  computations with the wrong final shape, which is what the contract supplies. Read it on bucket C.
+- **Arm 2 (value sweep) — low priority.** It supplies tables the model already finds almost every time.
 - **A verifier is the highest-return next build.** Labels are free (execution against gold CSV), it is a
-  ranking problem, and it targets the 30-point gap sampling already exposes.
+  ranking problem, and it targets the 30-point gap between greedy and the sampling ceiling.
+- **Generation is the lever for training (P1).** Even with retrieval handed over, the 9B passes 9% of runs
+  on the unflagged hard questions and a third of its episodes exhaust the step budget.
