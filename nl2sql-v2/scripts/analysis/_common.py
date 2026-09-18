@@ -136,7 +136,11 @@ def rescore(traces: dict, qdb: dict) -> dict:
                 except Exception:
                     cache[key] = False
             db.close()
-        path.write_text(json.dumps({"fingerprint": fp, "scores": cache}))
+        # atomic replace: concurrent jobs may harvest at the same moment, and a
+        # reader must never see a half-written file
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"fingerprint": fp, "scores": cache}))
+        tmp.replace(path)
 
     return {(spec, iid): cache[_sql_key(iid, t["sql"])]
             for spec, by_iid in traces.items() for iid, t in by_iid.items()}
