@@ -20,28 +20,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from openai import OpenAI
 
 from nl2sql.agent import run_episode
-from nl2sql.config import (AgentConfig, CriticConfig, DCE_PROJECT_DIR, DOCS_DIR,
-                           LLMConfig, QUESTIONS_FILE, SQLITE_DIR,
-                           VLLM_ENDPOINT_FILE)
+from nl2sql.config import (AgentConfig, CriticConfig, DATA_SOURCES, DCE_PROJECT_DIR,
+                           LLMConfig, VLLM_ENDPOINT_FILE)
 from nl2sql.context import SearchContext
 from nl2sql.db import Database
 from nl2sql.eval import load_eval_standards, score_against_gold
 from nl2sql.tools import ToolSession
 
 
-def load_questions(instances=None, skip=None, limit=None):
+def load_questions(sources, instances=None, skip=None, limit=None):
+    """Load questions from one or more DATA_SOURCES entries.
+
+    Each returned question dict carries '_db_dir'/'_docs_dir' (that source's
+    paths) so callers don't need to re-derive them per instance.
+    """
     out = []
-    with open(QUESTIONS_FILE) as f:
-        for line in f:
-            q = json.loads(line)
-            iid = q["instance_id"]
-            if not iid.startswith("local"):
-                continue
-            if instances and iid not in instances:
-                continue
-            if skip and iid in skip:
-                continue
-            out.append(q)
+    for src in sources:
+        if not src.questions_file.exists():
+            raise SystemExit(f"source '{src.name}': questions file not found "
+                             f"({src.questions_file})")
+        with open(src.questions_file) as f:
+            for line in f:
+                q = json.loads(line)
+                iid = q["instance_id"]
+                if src.id_prefix and not iid.startswith(src.id_prefix):
+                    continue
+                if instances and iid not in instances:
+                    continue
+                if skip and iid in skip:
+                    continue
+                q["_db_dir"] = src.db_dir
+                q["_docs_dir"] = src.docs_dir
+                out.append(q)
     return out[:limit] if limit else out
 
 
@@ -151,7 +161,20 @@ def main():
                          "tool training (e.g. Arctic as actor)")
     ap.add_argument("--resume", action="store_true",
                     help="skip instances already in --output and append to it")
+    ap.add_argument("--source", default="spider2",
+                    help="comma-separated source(s) to load questions from: "
+                         f"{', '.join(sorted(DATA_SOURCES))}, or 'all'")
     args = ap.parse_args()
+
+    if args.source == "all":
+        sources = list(DATA_SOURCES.values())
+    else:
+        names = args.source.split(",")
+        unknown = [n for n in names if n not in DATA_SOURCES]
+        if unknown:
+            raise SystemExit(f"unknown --source value(s): {unknown}; "
+                             f"choose from {sorted(DATA_SOURCES)} or 'all'")
+        sources = [DATA_SOURCES[n] for n in names]
 
     base_url = read_endpoint(args.endpoint)
     client = OpenAI(base_url=base_url, api_key="EMPTY")
@@ -172,6 +195,7 @@ def main():
                           else {})
 
     questions = load_questions(
+        sources,
         set(args.instances.split(",")) if args.instances else None,
         set(args.skip_instances.split(",")) if args.skip_instances else None,
         args.limit)
@@ -213,7 +237,7 @@ def main():
             iid, db_name = q["instance_id"], q["db"]
             print(f"[{i + 1}/{len(questions)}] {iid} ({db_name}) ... ",
                   end="", flush=True)
-            db_path = SQLITE_DIR / f"{db_name}.sqlite"
+            db_path = q["_db_dir"] / f"{db_name}.sqlite"
             if not db_path.exists():
                 writer.writerow({"instance_id": iid, "db": db_name, "score": 0,
                                  "score_detail": "db_not_found"})
@@ -222,8 +246,8 @@ def main():
 
             db = Database(db_path)
             doc = None
-            if q.get("external_knowledge"):
-                p = DOCS_DIR / q["external_knowledge"]
+            if q.get("external_knowledge") and q["_docs_dir"]:
+                p = q["_docs_dir"] / q["external_knowledge"]
                 doc = p.read_text() if p.exists() else None
             search = None
             extra = ""

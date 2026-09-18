@@ -19,6 +19,36 @@ EVAL_JSONL = SPIDER2_LITE / "evaluation_suite/gold/spider2lite_eval.jsonl"
 DCE_PROJECT_DIR = REPO_ROOT / "spider2-dce"
 VLLM_ENDPOINT_FILE = REPO_ROOT / "logs/vllm_endpoint.txt"
 
+# Augmentation sources staged under dataset-augmentation/ (see that dir's README).
+# Each has its own instances.jsonl + databases/ dir; no id-prefix filtering needed
+# since those files are pure (unlike spider2-lite.jsonl, which mixes local/bigquery/
+# snowflake ids and needs the "local" prefix filter below).
+DATASET_AUGMENTATION_DIR = REPO_ROOT / "dataset-augmentation"
+
+
+@dataclass
+class DataSource:
+    name: str
+    questions_file: Path
+    db_dir: Path
+    docs_dir: Path | None = None
+    id_prefix: str | None = None  # only include instance_ids with this prefix
+
+
+DATA_SOURCES: dict[str, DataSource] = {
+    "spider2": DataSource("spider2", QUESTIONS_FILE, SQLITE_DIR, DOCS_DIR,
+                          id_prefix="local"),
+    "bird_minidev": DataSource(
+        "bird_minidev", DATASET_AUGMENTATION_DIR / "bird_minidev/instances.jsonl",
+        DATASET_AUGMENTATION_DIR / "bird_minidev/databases"),
+    "kaggledbqa": DataSource(
+        "kaggledbqa", DATASET_AUGMENTATION_DIR / "kaggledbqa/instances.jsonl",
+        DATASET_AUGMENTATION_DIR / "kaggledbqa/databases"),
+    "spider_syn": DataSource(
+        "spider_syn", DATASET_AUGMENTATION_DIR / "spider_syn/instances.jsonl",
+        DATASET_AUGMENTATION_DIR / "spider_syn/databases"),
+}
+
 
 @dataclass
 class LLMConfig:
