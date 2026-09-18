@@ -163,7 +163,7 @@ def main():
     ap.add_argument("--trace-dir")
     ap.add_argument("--context-mode",
                     choices=["search", "full", "oracle", "contract", "sweep",
-                             "sweep_contract"],
+                             "sweep_contract", "full_contract"],
                     default="search")
     ap.add_argument("--oracle-file", default="oracle_context.json",
                     help="linkage file for --context-mode oracle, relative to nl2sql-v2/ "
@@ -237,11 +237,11 @@ def main():
         oracle = load_context(args.oracle_file, "build_oracle_context.py")
         questions = [q for q in questions if q["instance_id"] in oracle]
         print(f"oracle mode: restricted to {len(questions)} instances with gold SQL")
-    if mode in ("contract", "sweep_contract"):
+    if mode in ("contract", "sweep_contract", "full_contract"):
         contract = load_context("contract_context.json", "build_free_context.py")
     if mode in ("sweep", "sweep_contract"):
         sweep = load_context("sweep_context.json", "build_free_context.py")
-    if mode in ("contract", "sweep", "sweep_contract"):
+    if mode in ("contract", "sweep", "sweep_contract", "full_contract"):
         have = set(contract) if contract else set(sweep)
         if contract and sweep:
             have &= set(sweep)          # sweep_contract needs both hints
@@ -315,6 +315,10 @@ def main():
             elif args.context_mode == "sweep_contract":
                 extra = (sweep_context(db, sweep[iid])
                          + contract_context(contract[iid]))
+            elif args.context_mode == "full_contract":
+                # for questions with no sweep coverage: whole schema + contract,
+                # retrieval off, so no Ollama/vector index is needed
+                extra = full_schema_dump(db) + contract_context(contract[iid])
             if args.schema_overview and args.context_mode in ("search", "contract"):
                 extra += schema_overview(db)
 

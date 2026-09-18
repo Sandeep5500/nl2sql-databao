@@ -30,6 +30,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--drop-scalars", action="store_true")
     ap.add_argument("--require-sweep", action="store_true")
+    ap.add_argument("--without-sweep", action="store_true",
+                    help="the complement: questions with NO sweep coverage "
+                         "(run these with --context-mode full_contract)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--quiet", action="store_true", help="print only the id list")
     args = ap.parse_args()
@@ -44,6 +47,10 @@ def main():
         swept = set(json.loads(SWEEP.read_text())) if SWEEP.exists() else set()
         ids &= swept
         log.append(f"after requiring sweep coverage : {len(ids)}")
+    if args.without_sweep:
+        swept = set(json.loads(SWEEP.read_text())) if SWEEP.exists() else set()
+        ids -= swept
+        log.append(f"without sweep coverage         : {len(ids)}")
 
     by_db = defaultdict(list)
     for i in sorted(ids):

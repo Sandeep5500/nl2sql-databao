@@ -59,7 +59,7 @@ echo "server healthy $(date +%T)"
 
 cd nl2sql-v2
 EP="http://localhost:$PORT/v1"
-TARGETS="${INSTANCES:-$(uv run python scripts/analysis/teacher_targets.py --drop-scalars --require-sweep --quiet)}"
+TARGETS="${INSTANCES:-$(uv run python scripts/analysis/teacher_targets.py --drop-scalars ${TARGET_FLAGS:---require-sweep} --quiet)}"
 echo "targets ($(echo "$TARGETS" | tr ',' '\n' | wc -l)): $TARGETS"
 
 # 3. smoke one question; abort before the full run if the harness errors
