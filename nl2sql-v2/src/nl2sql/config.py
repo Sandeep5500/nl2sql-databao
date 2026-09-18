@@ -60,5 +60,7 @@ class AgentConfig:
     keep_recent_turns: int = 5           # turns kept verbatim by memory compaction
     summary_max_tokens: int = 700        # [MEMORY] note budget
     find_value_max_columns: int = 200
-    context_mode: str = "search"        # search | full | oracle  (ablation arms A/B/C)
+    # search | full | oracle | contract | sweep | sweep_contract
+    # (arms A/B/C, then the two gold-SQL-free arms and their combination)
+    context_mode: str = "search"
     text_sql_fallback: bool = False     # execute ```sql blocks from non-tool models

@@ -94,6 +94,35 @@ def oracle_context(db: Database, info: dict) -> str:
     return "\n".join(parts)
 
 
+def contract_context(info: dict) -> str:
+    """Output-contract arm: the exact columns the graded answer must contain,
+    read off the gold exec CSV header. No gold SQL involved."""
+    cols = ", ".join(info["columns"])
+    rows = info.get("rows")
+    out = [f"\nThe answer must return exactly these columns: {cols}."]
+    if rows is not None:
+        out.append(f"The correct answer has {rows} row(s).")
+    out.append("Return no extra columns, and match this shape exactly.")
+    return " ".join(out)
+
+
+def sweep_context(db: Database, info: dict) -> str:
+    """Value-sweep arm: tables recovered by matching the gold answer's literal
+    values back to the column that stores them. Ground truth, no gold SQL."""
+    parts = ["\nThe correct answer is known to draw on these tables: "
+             + ", ".join(info["tables"]) + "."]
+    if info.get("columns"):
+        parts.append("Values in the answer were found in these columns: "
+                     + ", ".join(info["columns"]) + ".")
+    parts.append("Details of those tables:\n")
+    for t in info["tables"]:
+        try:
+            parts.append(db.describe_table(t))
+        except Exception as e:
+            parts.append(f"table {t}: describe failed ({e})")
+    return "\n".join(parts)
+
+
 def schema_overview(db: Database, char_cap: int = 8_000) -> str:
     """Databao-style compressed schema in the system prompt: table -> column names."""
     lines = []
@@ -132,8 +161,13 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--output", default="../results/v2_run.csv")
     ap.add_argument("--trace-dir")
-    ap.add_argument("--context-mode", choices=["search", "full", "oracle"],
+    ap.add_argument("--context-mode",
+                    choices=["search", "full", "oracle", "contract", "sweep",
+                             "sweep_contract"],
                     default="search")
+    ap.add_argument("--oracle-file", default="oracle_context.json",
+                    help="linkage file for --context-mode oracle, relative to nl2sql-v2/ "
+                         "(e.g. teacher_context.json from harvest_teacher.py)")
     ap.add_argument("--schema-overview", action="store_true",
                     help="inject compressed table->columns overview into the "
                          "system prompt (databao v1 style)")
@@ -146,11 +180,19 @@ def main():
     ap.add_argument("--draft-model")
     ap.add_argument("--max-steps", type=int, default=30)
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--thinking", action="store_true",
+                    help="leave the model's reasoning mode on (Qwen defaults to off). "
+                         "Slower, but lets a teacher model work harder on hard questions.")
     ap.add_argument("--text-sql-fallback", action="store_true",
                     help="execute ```sql blocks from replies of models without "
                          "tool training (e.g. Arctic as actor)")
     ap.add_argument("--resume", action="store_true",
                     help="skip instances already in --output and append to it")
+    ap.add_argument("--shard", metavar="I/N",
+                    help="run only shard I of N (0-indexed), e.g. 0/4. Each shard "
+                         "needs its own --output and --trace-dir; one vLLM server "
+                         "serves them all concurrently. Round-robin, so every shard "
+                         "gets a similar mix of easy and hard questions.")
     args = ap.parse_args()
 
     base_url = read_endpoint(args.endpoint)
@@ -161,7 +203,7 @@ def main():
     llm = LLMConfig(base_url=base_url, model=model,
                     temperature=args.temperature,
                     chat_template_kwargs={"enable_thinking": False}
-                    if "qwen" in model.lower() else {})
+                    if "qwen" in model.lower() and not args.thinking else {})
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
                       text_sql_fallback=args.text_sql_fallback)
@@ -176,14 +218,35 @@ def main():
         set(args.skip_instances.split(",")) if args.skip_instances else None,
         args.limit)
 
-    oracle = {}
-    if args.context_mode == "oracle":
-        oracle_path = Path(__file__).resolve().parents[1] / "oracle_context.json"
-        if not oracle_path.exists():
-            raise SystemExit("run scripts/build_oracle_context.py first")
-        oracle = json.loads(oracle_path.read_text())
+    def load_context(filename: str, builder: str) -> dict:
+        path = Path(__file__).resolve().parents[1] / filename
+        if not path.exists():
+            raise SystemExit(f"{filename} missing — run scripts/{builder} first")
+        return json.loads(path.read_text())
+
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        if not 0 <= i < n:
+            raise SystemExit(f"--shard {args.shard}: need 0 <= I < N")
+        questions = [q for k, q in enumerate(questions) if k % n == i]
+        print(f"shard {i}/{n}: {len(questions)} questions")
+
+    oracle, contract, sweep = {}, {}, {}
+    mode = args.context_mode
+    if mode == "oracle":
+        oracle = load_context(args.oracle_file, "build_oracle_context.py")
         questions = [q for q in questions if q["instance_id"] in oracle]
         print(f"oracle mode: restricted to {len(questions)} instances with gold SQL")
+    if mode in ("contract", "sweep_contract"):
+        contract = load_context("contract_context.json", "build_free_context.py")
+    if mode in ("sweep", "sweep_contract"):
+        sweep = load_context("sweep_context.json", "build_free_context.py")
+    if mode in ("contract", "sweep", "sweep_contract"):
+        have = set(contract) if contract else set(sweep)
+        if contract and sweep:
+            have &= set(sweep)          # sweep_contract needs both hints
+        questions = [q for q in questions if q["instance_id"] in have]
+        print(f"{mode} mode: restricted to {len(questions)} instances with context")
     standards = load_eval_standards()
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
     if trace_dir:
@@ -240,7 +303,19 @@ def main():
                 extra = full_schema_dump(db)
             elif args.context_mode == "oracle":
                 extra = oracle_context(db, oracle[iid])
-            if args.schema_overview and args.context_mode == "search":
+            elif args.context_mode == "contract":
+                ds = resolve_datasource(db_name)   # contract keeps retrieval on
+                if ds:
+                    search = SearchContext(DCE_PROJECT_DIR, ds,
+                                           expansion_client=client,
+                                           expansion_model=model)
+                extra = contract_context(contract[iid])
+            elif args.context_mode == "sweep":
+                extra = sweep_context(db, sweep[iid])
+            elif args.context_mode == "sweep_contract":
+                extra = (sweep_context(db, sweep[iid])
+                         + contract_context(contract[iid]))
+            if args.schema_overview and args.context_mode in ("search", "contract"):
                 extra += schema_overview(db)
 
             draft = None

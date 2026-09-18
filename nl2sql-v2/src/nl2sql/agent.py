@@ -117,7 +117,10 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
         critic_client = OpenAI(base_url=critic_cfg.base_url or llm.base_url,
                                api_key=llm.api_key, timeout=llm.timeout)
 
-    has_search = session.search is not None and cfg.context_mode == "search"
+    # contract only tells the model what to RETURN, so retrieval stays on;
+    # the linkage arms (full/oracle/sweep) replace retrieval and turn it off
+    has_search = (session.search is not None
+                  and cfg.context_mode in ("search", "contract"))
     tools = build_tool_schemas(cfg, has_docs=session.doc_text is not None,
                                has_search=has_search,
                                has_draft=session.draft is not None)
