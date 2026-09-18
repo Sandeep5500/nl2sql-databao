@@ -29,7 +29,7 @@ import re
 import textwrap
 from collections import defaultdict
 
-from _common import (PHASE0_RUNS, SQLITE_DIR, Database, linkage,
+from _common import (PHASE0_RUNS, SQLITE_DIR, Database, buckets, linkage,
                      load_traces, local_questions, rescore, schema_of)
 
 KINDS = [("retrieval", "never found a table the answer needs"),
@@ -51,6 +51,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", default=",".join(PHASE0_RUNS),
                     help="comma-separated run specs (dir names or globs under logs/traces)")
+    ap.add_argument("--bucket", choices=["A", "B", "C"],
+                    help="only questions in this Phase-0 bucket. With teacher runs "
+                         "added and --bucket C, every pair is a teacher's correct "
+                         "query against a 9B failure on a question the 9B never "
+                         "solved -- note that is a cross-model comparison")
     ap.add_argument("--examples", type=int, default=0,
                     help="print this many examples per failure kind")
     args = ap.parse_args()
@@ -81,6 +86,11 @@ def main():
                 continue
             rec[iid][spec] = {"ok": ok[(spec, iid)], "status": t.get("status"),
                               "link": linkage(t["sql"], real), "trace": t, "sql": t["sql"]}
+
+    if args.bucket:
+        keep = buckets(qdb)[args.bucket]
+        rec = {i: r for i, r in rec.items() if i in keep}
+        print(f"restricted to bucket {args.bucket}: {len(keep)} questions\n")
 
     raw_pairs = fallback = unparsed = 0
     both_q = set()
@@ -124,6 +134,9 @@ def main():
     print(f"  removed, fallback (unfinished episode)        : {fallback}")
     print(f"  removed, query touches no real table          : {unparsed}")
     print(f"clean pairs                                     : {n}\n")
+    if not n:
+        print("no clean pairs: no question here was both solved and failed by the given runs")
+        return
     for key, label in KINDS:
         k = sum(1 for p in pairs if p["kind"] == key)
         print(f"  {label:42s} {k:4d}  ({100 * k / n:3.0f}%)")

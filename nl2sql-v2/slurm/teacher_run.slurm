@@ -31,6 +31,9 @@ LANES="${LANES:-4}"
 TAG="${TAG:-teacher_p1}"
 MODE="${MODE:-sweep_contract}"
 EXTRA="${EXTRA:-}"
+REPEATS="${REPEATS:-1}"          # >1: repeat 0 is greedy, the rest sample at SAMPLE_TEMP
+SAMPLE_TEMP="${SAMPLE_TEMP:-0.7}"
+SKIP_HARVEST="${SKIP_HARVEST:-0}"  # set 1 when the model under test is not a teacher
 export HF_HOME="${HF_HOME:-/data/user_data/$USER/.cache/huggingface}"
 LOG="$REPO/logs/teacher"; mkdir -p "$LOG"
 cd "$REPO"
@@ -72,19 +75,25 @@ if grep -q ",error," "../results/${TAG}_smoke.csv"; then
 fi
 echo "smoke ok $(date +%T): $(tail -1 ../results/${TAG}_smoke.csv | cut -c1-120)"
 
-# 4. lanes, round-robin sharded, one server serving them all
-PIDS=()
-for i in $(seq 0 $((LANES - 1))); do
-    uv run python scripts/run_benchmark.py --endpoint "$EP" --model "$MODEL" \
-        --context-mode "$MODE" --instances "$TARGETS" --shard "$i/$LANES" --resume $EXTRA \
-        --output "../results/${TAG}_$i.csv" --trace-dir "../logs/traces/${TAG}_$i" \
-        > "$LOG/${TAG}_lane$i.log" 2>&1 &
-    PIDS+=($!)
+# 4. lanes, round-robin sharded, one server serving them all; optionally repeated
+for r in $(seq 0 $((REPEATS - 1))); do
+    if [ "$REPEATS" -gt 1 ]; then RT="${TAG}_r$r"; else RT="$TAG"; fi
+    TEMP=""; [ "$r" -ge 1 ] && TEMP="--temperature $SAMPLE_TEMP"
+    PIDS=()
+    for i in $(seq 0 $((LANES - 1))); do
+        uv run python scripts/run_benchmark.py --endpoint "$EP" --model "$MODEL" \
+            --context-mode "$MODE" --instances "$TARGETS" --shard "$i/$LANES" --resume $EXTRA $TEMP \
+            --output "../results/${RT}_$i.csv" --trace-dir "../logs/traces/${RT}_$i" \
+            > "$LOG/${RT}_lane$i.log" 2>&1 &
+        PIDS+=($!)
+    done
+    for p in "${PIDS[@]}"; do wait "$p" || echo "a lane exited non-zero (resumable)"; done
+    echo "lanes done for $RT $(date +%T)"
 done
-for p in "${PIDS[@]}"; do wait "$p" || echo "a lane exited non-zero (resumable)"; done
-echo "lanes done $(date +%T)"
 
-# 5. harvest verified gold SQL
-uv run python scripts/analysis/harvest_teacher.py --runs "${TAG}_*" \
-    --out "teacher_context_${TAG}.json" | tee "$LOG/${TAG}_harvest.txt"
+# 5. harvest verified gold SQL (teacher runs only)
+if [ "$SKIP_HARVEST" != 1 ]; then
+    uv run python scripts/analysis/harvest_teacher.py --runs "${TAG}_*" \
+        --out "teacher_context_${TAG}.json" | tee "$LOG/${TAG}_harvest.txt"
+fi
 echo "finished $(date)"

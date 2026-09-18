@@ -94,6 +94,52 @@ def oracle_context(db: Database, info: dict) -> str:
     return "\n".join(parts)
 
 
+def decoy_context(db: Database, info: dict, iid: str) -> str:
+    """Placebo for the oracle arm: the same kind of block, described in the
+    same format and at least as long, but naming tables the gold query does NOT
+    use (never SQLite internals), chosen deterministically per question.
+
+    Framed neutrally on purpose: claiming 'the answer uses these' about wrong
+    tables would actively mislead, so the decoy would score below a mere prompt
+    change and inflate the oracle arm's apparent benefit. Matched on LENGTH, not
+    just table count, for the same reason: a shorter block is a weaker prompt
+    change. Databases with few spare tables can still fall short; the returned
+    text is what the model saw, so the trace records any shortfall."""
+    import random
+    gold = {t.lower() for t in info["tables"]}
+    pool = [t for t in db.list_tables()
+            if t.lower() not in gold and not t.lower().startswith("sqlite_")]
+    rng = random.Random(iid)
+    rng.shuffle(pool)
+    target = len(oracle_context(db, info))
+    desc, tables, size = {}, [], 0
+    for t in pool:
+        if len(tables) >= len(info["tables"]) and size >= target:
+            break
+        try:
+            desc[t] = db.describe_table(t)
+        except Exception as e:
+            desc[t] = f"table {t}: describe failed ({e})"
+        tables.append(t)
+        size += len(desc[t])
+    cols = []
+    for t in tables:
+        try:
+            cols += [c for c, _, _ in db._columns(t)]
+        except ValueError:
+            pass
+    cols = list(dict.fromkeys(cols))
+    rng.shuffle(cols)
+    cols = cols[: len(info.get("columns", []))]
+    parts = ["\nFor reference, here are details of some tables in this database: "
+             + ", ".join(tables) + "."]
+    if cols:
+        parts.append("Columns in these tables include: " + ", ".join(cols) + ".")
+    parts.append("Details of those tables:\n")
+    parts += [desc[t] for t in tables]
+    return "\n".join(parts)
+
+
 def contract_context(info: dict) -> str:
     """Output-contract arm: the exact columns the graded answer must contain,
     read off the gold exec CSV header. No gold SQL involved."""
@@ -162,8 +208,8 @@ def main():
     ap.add_argument("--output", default="../results/v2_run.csv")
     ap.add_argument("--trace-dir")
     ap.add_argument("--context-mode",
-                    choices=["search", "full", "oracle", "contract", "sweep",
-                             "sweep_contract", "full_contract"],
+                    choices=["search", "full", "oracle", "oracle_decoy", "contract",
+                             "sweep", "sweep_contract", "full_contract"],
                     default="search")
     ap.add_argument("--oracle-file", default="oracle_context.json",
                     help="linkage file for --context-mode oracle, relative to nl2sql-v2/ "
@@ -233,7 +279,7 @@ def main():
 
     oracle, contract, sweep = {}, {}, {}
     mode = args.context_mode
-    if mode == "oracle":
+    if mode in ("oracle", "oracle_decoy"):
         oracle = load_context(args.oracle_file, "build_oracle_context.py")
         questions = [q for q in questions if q["instance_id"] in oracle]
         print(f"oracle mode: restricted to {len(questions)} instances with gold SQL")
@@ -303,6 +349,8 @@ def main():
                 extra = full_schema_dump(db)
             elif args.context_mode == "oracle":
                 extra = oracle_context(db, oracle[iid])
+            elif args.context_mode == "oracle_decoy":
+                extra = decoy_context(db, oracle[iid], iid)
             elif args.context_mode == "contract":
                 ds = resolve_datasource(db_name)   # contract keeps retrieval on
                 if ds:
