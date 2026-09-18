@@ -144,6 +144,47 @@ f1 (8), IPL (5), oracle_sql (4), complex_oracle (4) — mine these for training 
 Ops note: two runaway-query hangs cost wall-clock this phase; both DuckDB (agentic) and
 SQLite (single-shot) executors now have interrupt guards.
 
+**Correction (Sept 17): 100-row result cap invalidated 8 questions.** The harness stored
+at most 100 rows of the submitted result while 8/135 gold answers have 236-2000 rows —
+those questions were unwinnable in every run (v1 included). Cap raised to 5000; stored
+final SQL re-executed uncapped and re-scored:
+- **A+ corrected: 46/135 (34.1%)** (local074, local194, local354 had correct SQL, truncated)
+- pass@4 corrected: 71/135 (52.6%); pass@4 + greedy union: 76/135 (56.3%)
+- 5 of the 8 remain genuinely unsolved (now winnable going forward).
+
+**Correction 2 (Sept 17): CSV round-trip type coercion** (credit: teammate's review).
+The official Spider2 scorer writes the *prediction* to CSV and reads it back with
+pandas, so both sides get identical type coercion; our scorer compared the in-memory
+DuckDB frame directly — string '2018' vs number 2018, timestamps vs date strings,
+'' vs NaN all scored as false negatives. Fixed: `eval.py` now round-trips the
+prediction through CSV before comparison. Re-scored from stored SQL (flips only —
+regressions in re-execution were artifacts of comment-swallowing newline flattening
+in the CSVs, itself now fixed by escaping newlines):
+
+| Run | before | corrected |
+|---|---|---|
+| A+ greedy | 43 | **46/135 (34.1%)** |
+| pass@4 lanes | 39/37/38/44 | 40/38/40/46 (avg pass@1 30.4%) |
+| pass@4 union | 69 | **72/135 (53.3%)** |
+| pass@4 + greedy union | 73 | **77/135 (57.0%)** |
+| draft (Arctic) | 46 | 47 (34.8%) |
+| single-shot Arctic | 22 | 23 (17.0%) |
+
+Cross-checked cases from both corrections: local156 (SUBSTR year as text),
+local074/194/354 (row cap), local017 (type coercion).
+
+**Correction 3 (Sept 17): byte decoding for typeless SQLite columns** (teammate review
+again). SQLite columns with no declared type (e.g. WWE Wrestlers.name) come back from
+DuckDB's scanner as bytearray objects; str() of those never matches gold text, and the
+MODEL saw `bytearray(b'...')` in every preview on affected DBs. Fixed at the Database
+layer (previews, stored results, get_column_values, find_value) and in the scorer
+round-trip. Recovers local019 (WWE) in A+, k3 and arm C — correct SQL all along.
+
+**Final corrected ledger:** A+ **47/135 (34.8%)** · pass@4 lanes 40/38/41/46
+(avg pass@1 30.6%) · pass@4 union **73/135 (54.1%)** · with greedy **78/135 (57.8%)** ·
+arm C 9/24 vs A+ 10/24 on the same slice (bottleneck verdict unchanged) · draft 47 ·
+single-shot Qwen 21 / Arctic 23.
+
 ---
 
 ## Plan

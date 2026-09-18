@@ -87,7 +87,7 @@ def extract_sql(text: str) -> str | None:
     return text[m.start():].strip().rstrip(";") if m else None
 
 
-def run_sql_sqlite(db_path: Path, sql: str, row_cap: int = 200,
+def run_sql_sqlite(db_path: Path, sql: str, row_cap: int = 5000,
                    timeout_s: float = 60.0) -> pd.DataFrame:
     import threading
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
@@ -206,7 +206,7 @@ def main():
                              "score_detail": detail, "prompt_chars": len(prompt),
                              "completion_chars": len(completion),
                              "wall_seconds": round(wall, 1),
-                             "sql": (sql or "").replace("\n", " ")})
+                             "sql": (sql or "").replace("\n", "\\n")})
             f.flush()
             print(f"{'✓' if score else '✗'} {detail} ({wall:.0f}s)")
             if trace_dir:

@@ -7,6 +7,19 @@ import duckdb
 import pandas as pd
 
 
+def _decode_bytes(df: pd.DataFrame) -> pd.DataFrame:
+    """SQLite columns with no declared type come back from DuckDB's scanner as
+    bytes/bytearray objects; decode them so the model and the scorer both see
+    text (official eval runs on SQLite, which returns plain str)."""
+    for c in df.columns:
+        if df[c].dtype == object and df[c].map(
+                lambda v: isinstance(v, (bytes, bytearray))).any():
+            df[c] = df[c].map(
+                lambda v: bytes(v).decode("utf-8", "replace")
+                if isinstance(v, (bytes, bytearray)) else v)
+    return df
+
+
 def _trim_cell(value, limit: int):
     s = str(value)
     if len(s) <= limit:
@@ -29,7 +42,7 @@ class Database:
 
     # ── raw query ─────────────────────────────────────────────────────────
     def query(self, sql: str, max_rows: int = 100) -> pd.DataFrame:
-        return self.con.execute(sql).df().head(max_rows)
+        return _decode_bytes(self.con.execute(sql).df().head(max_rows))
 
     def query_preview(self, sql: str, preview_rows: int, max_rows: int,
                       cell_char_limit: int = 1024,
@@ -42,7 +55,7 @@ class Database:
         timer = threading.Timer(timeout_s, self.con.interrupt)
         timer.start()
         try:
-            df = self.con.execute(sql).df()
+            df = _decode_bytes(self.con.execute(sql).df())
         finally:
             timer.cancel()
         total = len(df)
@@ -131,6 +144,7 @@ class Database:
             f"SELECT {qc} AS value, COUNT(*) AS count FROM {qt} "
             f"GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT {int(limit)}"
         ).df()
+        df = _decode_bytes(df)
         total = self.con.execute(f"SELECT COUNT(DISTINCT {qc}) FROM {qt}").fetchone()[0]
         out = df.to_csv(index=False)
         if total > limit:
@@ -163,6 +177,8 @@ class Database:
                     [f"%{term}%"],
                 ).fetchall()
                 for value, count in rows:
+                    if isinstance(value, (bytes, bytearray)):
+                        value = bytes(value).decode("utf-8", "replace")
                     hits.append(f"{t}.{c} = {value!r}  ({count} rows)")
                 if len(hits) >= limit:
                     return "\n".join(hits[:limit]) + "\n[hit limit; refine the term]"
