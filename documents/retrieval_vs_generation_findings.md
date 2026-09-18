@@ -394,8 +394,23 @@ two artifacts found that way were fixed (below).
 - `local131`: ignored `PreferenceSeq`, so it never split counts into 1st, 2nd and 3rd choice.
 
 **2) Join failures are semantic, not foreign-key discovery.**
-- `local062`: joined `costs` on 2 of its 4 key columns (`prod_id`, `time_id`; missing `promo_id`,
-  `channel_id`), so rows fan out and every sum is inflated.
+- `local062`: every run joins `costs` exactly once. Three of four join it on 2 of its 4 key columns
+  (`prod_id`, `time_id`, without `promo_id`, `channel_id`). `costs` holds one row per product, day,
+  promotion and channel, so the two-column key matches up to 7 rows (2.27 on average) and each sale is
+  counted several times:
+
+  | Italian customers, Dec 2021 | Rows after join | Total profit |
+  |---|---|---|
+  | joined on all 4 columns (correct) | 689, one per sale | 11,423.84 |
+  | joined on 2 columns (9B) | 1,999 | 36,375.39 (3.2x) |
+
+  `promo_id` and `channel_id` **were in the prompt's column list.** The 9B had them; nothing said they form
+  the join key, and per-column distinct counts cannot show that `(prod_id, time_id)` is not unique. So
+  this overlaps with category 1 as much as it is a join problem.
+
+  All four runs also bucket with `NTILE(10)` (equal numbers of customers) where the question asks for
+  "ten equal intervals" of the profit range. That is why run 2 failed with the correct join, and why
+  fixing the join alone would rescue none of the four.
 - `local075`: never linked purchase events back to products through `visit_id`.
 
 **3) Running out of steps is non-convergence, not error loops.** The 18 step-cap episodes run 27 queries
@@ -425,6 +440,12 @@ approximate.
   the easier end of the hard tail. 43 bucket-C questions have no verified answer yet.
 - **Cross-model reference.** The flags and linkage use the 27B's query as ground truth; another valid query
   might use different tables.
+- **The oracle misses lookup tables.** Its table list is parsed from the teacher's *final* query, so a
+  table used only to look up a constant drops out. `local062` filters on `country_id = 52770` (Italy),
+  found in `countries` during exploration and then hardcoded; `countries` is not in the list. Harmless there
+  (all four 9B runs found it themselves) but it can make the oracle look more complete than it is.
+- **The oracle conveys which columns, not how they are used.** The column list is flat: join keys, filters
+  and outputs are not distinguished (see `local062`).
 - **Search was off** in both arms because Ollama and the vector index are not set up on Babel. The enriched
   column descriptions it returns could help the oracle arm, so its effect may be understated.
 - **Stack.** Both arms ran on vLLM 0.19, so the oracle/decoy comparison is internal. Absolute rates are not
@@ -523,6 +544,13 @@ uv run python scripts/analysis/paired_failures.py --runs 'v2_armAplus,arm_contra
 ---
 
 ## 12. Open questions and next steps
+
+- **Running: forced-use prompt** (`--context-mode oracle_forced`). The oracle block word for word plus
+  "your final query must use each of these tables; check before submitting" (columns stay hints). Same 14
+  questions, 4 runs, same stack as the oracle arm. It measures whether an explicit instruction removes
+  category-1 failures, and whether that raises the pass rate. Compare with
+  `ablation_arms.py --oracle-prefix ablation_forced --decoy-prefix ablation_oracle` and
+  `oracle_failures.py --prefix ablation_forced`.
 
 - **Confirm Section 7.4 on more questions.** Run a second teacher pass with reasoning on
   (`--thinking --temperature 0.7`) over the 43 bucket-C questions still without verified gold SQL, then
