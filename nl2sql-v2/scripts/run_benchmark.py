@@ -94,6 +94,19 @@ def oracle_context(db: Database, info: dict) -> str:
     return "\n".join(parts)
 
 
+def forced_context(db: Database, info: dict) -> str:
+    """The oracle block, word for word, plus an explicit instruction to use the
+    named tables. Tables are required; columns stay hints, because the column list
+    mixes join keys, filters and outputs and forcing every one in would push the
+    model to shoehorn them. Only valid when the tables are known to be correct."""
+    tables = ", ".join(info["tables"])
+    return (oracle_context(db, info)
+            + f"\n\nRequirement: your final query must use each of these tables: {tables}. "
+            "Before you call submit_result, check that your SQL references every one of "
+            "them, and revise it if any is missing. The listed columns are hints, not a "
+            "requirement.")
+
+
 def decoy_context(db: Database, info: dict, iid: str) -> str:
     """Placebo for the oracle arm: the same kind of block, described in the
     same format and at least as long, but naming tables the gold query does NOT
@@ -208,7 +221,7 @@ def main():
     ap.add_argument("--output", default="../results/v2_run.csv")
     ap.add_argument("--trace-dir")
     ap.add_argument("--context-mode",
-                    choices=["search", "full", "oracle", "oracle_decoy", "contract",
+                    choices=["search", "full", "oracle", "oracle_decoy", "oracle_forced", "contract",
                              "sweep", "sweep_contract", "full_contract"],
                     default="search")
     ap.add_argument("--oracle-file", default="oracle_context.json",
@@ -279,7 +292,7 @@ def main():
 
     oracle, contract, sweep = {}, {}, {}
     mode = args.context_mode
-    if mode in ("oracle", "oracle_decoy"):
+    if mode in ("oracle", "oracle_decoy", "oracle_forced"):
         oracle = load_context(args.oracle_file, "build_oracle_context.py")
         questions = [q for q in questions if q["instance_id"] in oracle]
         print(f"oracle mode: restricted to {len(questions)} instances with gold SQL")
@@ -356,6 +369,8 @@ def main():
                 extra = full_schema_dump(db)
             elif args.context_mode == "oracle":
                 extra = oracle_context(db, oracle[iid])
+            elif args.context_mode == "oracle_forced":
+                extra = forced_context(db, oracle[iid])
             elif args.context_mode == "oracle_decoy":
                 extra = decoy_context(db, oracle[iid], iid)
             elif args.context_mode == "contract":
