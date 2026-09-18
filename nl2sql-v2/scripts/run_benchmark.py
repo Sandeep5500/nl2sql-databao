@@ -304,8 +304,14 @@ def main():
                   "critic_rounds", "search_calls", "draft_calls", "wall_seconds",
                   "sql"]
     correct = 0
-    if args.resume and out_path.exists():
-        prior = list(csv.DictReader(open(out_path)))
+    # A preemption can leave the CSV empty (header still buffered) or, after a
+    # restart that appended to that empty file, headerless. Treat an empty file
+    # as fresh, and read a headerless one with the known field names.
+    if args.resume and out_path.exists() and out_path.stat().st_size > 0:
+        with open(out_path) as fh:
+            has_header = fh.readline().startswith("instance_id,")
+        prior = list(csv.DictReader(open(out_path),
+                                    fieldnames=None if has_header else fieldnames))
         done_ids = {r["instance_id"] for r in prior}
         correct = sum(1 for r in prior if r.get("score") == "1")
         questions = [q for q in questions if q["instance_id"] not in done_ids]
@@ -318,6 +324,7 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
+            f.flush()   # never leave an empty file behind if killed early
         for i, q in enumerate(questions):
             iid, db_name = q["instance_id"], q["db"]
             print(f"[{i + 1}/{len(questions)}] {iid} ({db_name}) ... ",
