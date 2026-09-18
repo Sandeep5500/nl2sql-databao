@@ -28,6 +28,10 @@ trace files predate the three Sept 17 scoring fixes and were not used.
   questions. Of its 46 failed runs, a third ignored the tables or columns it was explicitly given, 13%
   missed a join key (composite keys, semantic links), and 39% ran out of steps without ever producing the
   answer.
+- **Telling it to use the given tables does not fix this.** An explicit instruction cut runs that skipped a
+  named table from 8 to 0 but added only 2 correct runs of 56 (+3.6 points, CI [-7.1, +14.3]). It used
+  the tables without understanding why: `local004` now joins `customers` every time and still groups by
+  the per-order ID.
 - **Selection is the gap on the reachable questions:** the model solves 77 of 135 on some run but greedy
   gets 47, and agreement voting recovers only 3 of those 30 points. A verifier is the lever.
 - **The benchmark's own artifacts need care:** 8 of the 24 shipped gold SQLs answer a different question
@@ -431,7 +435,36 @@ Caveats: one cause per run, although a run can have several faults (`local062` a
 where the question implies equal-width ranges); and the classification is structural, so treat counts as
 approximate.
 
-### 7.6 Caveats
+### 7.6 Telling it to use the tables fixes compliance, not correctness
+
+Category 1 above suggests a cheap fix: tell the model to use the tables. `oracle_forced` is the oracle
+block word for word plus "your final query must use each of these tables; check before submitting"
+(columns stay hints). Same 14 questions, 4 runs, same stack, run 2026-09-18.
+
+| | Oracle | Forced | Decoy |
+|---|---|---|---|
+| Runs that left out a table the prompt named | 8 | **0** | - |
+| Runs that left out a listed column | 7 | 12 | - |
+| Join failures | 6 | 3 | - |
+| Ran out of steps | 18 | 19 | - |
+| Correct runs (of 56) | 10 | **12** | 4 |
+| Mean pass rate | 17.9% | 21.4% | 7.1% |
+
+Forced vs oracle: **+3.6 points, 95% CI [-7.1, +14.3]**. Forced vs decoy: +14.3, CI [+0.0, +32.1].
+
+The instruction removes table non-use entirely, yet adds only 2 correct runs. The per-question view shows
+why:
+
+- **Where skipping a table was the only obstacle, forcing it works.** `local133`: 1/4 -> 3/4. Made to use
+  `musical_styles`, it returns style names instead of IDs.
+- **Where the model does not understand why a table matters, forcing it does nothing.** `local004`: all 4
+  forced runs now use `customers` (1 of 4 before) but still group by the per-order `customer_id` instead of
+  the person-level `customer_unique_id`. 1/4 -> 0/4. This is where the rise in unused columns comes from.
+
+So most category-1 failures were a symptom of not understanding the question and schema, not of ignoring
+instructions. Prompting is not a large lever; the bottleneck remains generation.
+
+### 7.7 Caveats
 
 - **Small n.** 14 questions, 3 flagged, and `local335` supplies 4 of the 6 gained runs. The split in 7.4
   was chosen after noticing `local335`, although the flags themselves predate the arm results. Confirm on
@@ -525,6 +558,8 @@ uv run python scripts/analysis/paired_failures.py --bucket C --by-question \
     --runs 'v2_armAplus,v2_pass4_k1,v2_pass4_k2,v2_pass4_k3,v2_pass4_k4,teacher_p1_*,teacher_p1b_*'  # 7.2
 uv run python scripts/analysis/ablation_arms.py                                           # Section 7.3
 uv run python scripts/analysis/oracle_failures.py --examples 2                           # Section 7.5
+uv run python scripts/analysis/ablation_arms.py --oracle-prefix ablation_forced --decoy-prefix ablation_oracle  # 7.6
+uv run python scripts/analysis/oracle_failures.py --prefix ablation_forced               # Section 7.6
 uv run python scripts/analysis/determinism.py                                             # Section 8
 ```
 
@@ -545,12 +580,10 @@ uv run python scripts/analysis/paired_failures.py --runs 'v2_armAplus,arm_contra
 
 ## 12. Open questions and next steps
 
-- **Running: forced-use prompt** (`--context-mode oracle_forced`). The oracle block word for word plus
-  "your final query must use each of these tables; check before submitting" (columns stay hints). Same 14
-  questions, 4 runs, same stack as the oracle arm. It measures whether an explicit instruction removes
-  category-1 failures, and whether that raises the pass rate. Compare with
-  `ablation_arms.py --oracle-prefix ablation_forced --decoy-prefix ablation_oracle` and
-  `oracle_failures.py --prefix ablation_forced`.
+- **Optional: state column roles.** The forced prompt moved failures from tables to columns (7.6), and
+  `local062` had its join-key columns without knowing they were keys. A variant that says which columns
+  are join or identity keys would show how much of the rest is comprehension. It moves toward handing over
+  part of the query, so it tests something different from retrieval.
 
 - **Confirm Section 7.4 on more questions.** Run a second teacher pass with reasoning on
   (`--thinking --temperature 0.7`) over the 43 bucket-C questions still without verified gold SQL, then
