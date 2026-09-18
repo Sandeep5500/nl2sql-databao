@@ -274,7 +274,7 @@ def main():
                 "search_calls": result.search_calls,
                 "draft_calls": session.draft_calls,
                 "wall_seconds": round(result.wall_seconds, 1),
-                "sql": (result.sql or "").replace("\n", " ")})
+                "sql": (result.sql or "").replace("\n", "\\n")})
             f.flush()
             print(f"{'✓' if score else '✗'} {detail} "
                   f"({result.steps} steps, {result.wall_seconds:.0f}s)")
