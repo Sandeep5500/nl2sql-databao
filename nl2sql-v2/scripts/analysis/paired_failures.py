@@ -27,7 +27,7 @@ import argparse
 import json
 import re
 import textwrap
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from _common import (PHASE0_RUNS, SQLITE_DIR, Database, buckets, linkage,
                      load_traces, local_questions, rescore, schema_of)
@@ -56,6 +56,9 @@ def main():
                          "added and --bucket C, every pair is a teacher's correct "
                          "query against a 9B failure on a question the 9B never "
                          "solved -- note that is a cross-model comparison")
+    ap.add_argument("--by-question", action="store_true",
+                    help="also classify each question by its failing runs, since "
+                         "pairs cluster by question")
     ap.add_argument("--examples", type=int, default=0,
                     help="print this many examples per failure kind")
     args = ap.parse_args()
@@ -143,6 +146,18 @@ def main():
     fu = sum(1 for p in pairs if p["found_unused"] and p["kind"] == "generation")
     print(f"\n  of the generation pairs, {fu} had a table the final SQL omitted but the "
           f"episode had already found")
+
+    if args.by_question:
+        per = defaultdict(Counter)
+        for p in pairs:
+            per[p["iid"]][p["kind"]] += 1
+        print(f"\nper question ({len(per)} questions with a clean pair):")
+        any_retr = sum(1 for c in per.values() if c["retrieval"])
+        print(f"  at least one failing run never found a needed table : {any_retr}")
+        print(f"  every failing run had all the needed tables         : {len(per) - any_retr}")
+        for iid in sorted(per):
+            c = per[iid]
+            print(f"    {iid}: " + ", ".join(f"{k} {c[k]}" for k, _ in KINDS if c[k]))
 
     for key, label in KINDS:
         ex = sorted((p for p in pairs if p["kind"] == key),
