@@ -597,6 +597,7 @@ uv run python scripts/analysis/oracle_failures.py --examples 2                  
 uv run python scripts/analysis/ablation_arms.py --oracle-prefix ablation_forced --decoy-prefix ablation_oracle  # 7.6
 uv run python scripts/analysis/oracle_failures.py --prefix ablation_forced               # Section 7.6
 uv run python scripts/analysis/determinism.py                                             # Section 8
+uv run python scripts/analysis/validator_report.py --tags 9b,27b                          # Section 5.1
 ```
 
 `teacher_targets.py` picks the questions to send to a teacher; `teacher_run.slurm` runs a teacher pass or
