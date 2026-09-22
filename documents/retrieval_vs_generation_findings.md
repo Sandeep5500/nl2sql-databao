@@ -32,8 +32,10 @@ trace files predate the three Sept 17 scoring fixes and were not used.
   named table from 8 to 0 but added only 2 correct runs of 56 (+3.6 points, CI [-7.1, +14.3]). It used
   the tables without understanding why: `local004` now joins `customers` every time and still groups by
   the per-order ID.
-- **Selection is the gap on the reachable questions:** the model solves 77 of 135 on some run but greedy
-  gets 47, and agreement voting recovers only 3 of those 30 points. A verifier is the lever.
+- **Selection is the gap on the reachable questions, and a validator captures much of it:** greedy gets 47
+  of 135 while perfect selection over 4 samples would give 72. Agreement voting recovers 3 points, but a
+  prompted validator that judges the four candidates gets **55 (9B) or 59 (27B)**, with no training. On
+  the 29 questions where only one candidate is right, it finds it 45-59% of the time against 25% by chance.
 - **The benchmark's own artifacts need care:** 8 of the 24 shipped gold SQLs answer a different question
   than the graded CSV; the scorer ignores row pairing on all 135; 52 of 675 stored queries return
   different results run to run.
@@ -251,6 +253,40 @@ Voting recovers **3 of the 30** available points. On **61 of 135** questions all
 different results; only 5 had all five agree. (These agreement counts can shift by one between
 executions, because some predicted queries are themselves nondeterministic.) The model is not confidently wrong, it is unstable, so
 there is no majority to vote for.
+
+### 5.1 A validator agent recovers about half the gap
+
+Voting fails because it counts agreement. A validator *judges*: show a model the question, its
+documentation, and the four candidates (SQL + result shape + first rows), and have it pick one. Candidate
+order is shuffled per question, and which candidate is correct is never shown. One model call per
+question, no training, nothing re-executed (`validator_select.py` over `validator_inputs.json`).
+
+| Strategy | Correct |
+|---|---|
+| Pick one run at random | 41 / 135 |
+| Greedy (what we ship) | 47 |
+| Execution-consistency vote | 50 |
+| **Validator, Qwen3.5-9B** | **55** (45% of the headroom) |
+| **Validator, Qwen3.6-27B** | **59** (58% of the headroom) |
+| Perfect selection | 72 |
+
+The 9B judging its own four outputs beats its own greedy run, 55 to 47.
+
+| Questions where | Count | 9B | 27B | random |
+|---|---|---|---|---|
+| only 1 of 4 candidates correct | 29 | 13 | 17 | 7.2 |
+| 2 of 4 correct | 9 | 9 | 9 | 4.5 |
+| 3 of 4 correct | 19 | 18 | 18 | 14.2 |
+| none correct | 63 | 0 | 0 | 0 |
+
+The first row carries the result: where voting cannot help by construction, the judge finds the single
+correct answer 45% (9B) and 59% (27B) of the time against 25% by chance.
+
+Not an artifact: it picks the longest SQL 29-30% of the time (25% by chance), candidate order is shuffled
+per question so position skew cannot inflate accuracy, and the two judges agree on 83 of 135 questions.
+Unparsed replies fall back to the first candidate (1 for the 9B, 3 for the 27B).
+
+Caveat: "correct" is the scorer's verdict, so a candidate that matched by luck counts as correct here too.
 
 Implications:
 - High-K sampling is an excellent **offline** data generator (the gold CSV verifies each sample for free).
@@ -597,7 +633,9 @@ uv run python scripts/analysis/paired_failures.py --runs 'v2_armAplus,arm_contra
 - **Arm 1 (output contract), 135 questions — still worth running.** Several logic failures are correct
   computations with the wrong final shape, which is what the contract supplies. Read it on bucket C.
 - **Arm 2 (value sweep) — low priority.** It supplies tables the model already finds almost every time.
-- **A verifier is the highest-return next build.** Labels are free (execution against gold CSV), it is a
-  ranking problem, and it targets the 30-point gap between greedy and the sampling ceiling.
+- **A verifier is the highest-return next build, and a prompted one already works** (5.1): +8 questions
+  with the 9B, +12 with the 27B, one extra call per question. Next steps: add the greedy run as a fifth
+  candidate (ceiling 77), try more samples, and compare a trained ranker against the prompted judge on the
+  13 questions the 27B judge still misses.
 - **Generation is the lever for training (P1).** Even with retrieval handed over, the 9B passes 9% of runs
   on the unflagged hard questions and a third of its episodes exhaust the step budget.
