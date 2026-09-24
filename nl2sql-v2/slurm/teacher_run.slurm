@@ -25,6 +25,7 @@ set -eo pipefail
 REPO="${REPO:-$(pwd)}"
 MODEL="${MODEL:-Qwen/Qwen3.6-27B}"
 VENV="${VENV:-$REPO/.vllm-venv-0.19}"
+OLLAMA="${OLLAMA:-0}"            # 1 = also serve embeddings, needed by --context-mode search
 PORT="${PORT:-8766}"
 TP="${TP:-2}"
 LANES="${LANES:-4}"
@@ -40,6 +41,18 @@ cd "$REPO"
 echo "node $(hostname) | $MODEL | TP=$TP | lanes=$LANES | tag=$TAG | $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+# 0. embeddings for search_context, on this same node
+if [ "$OLLAMA" = 1 ]; then
+    export OLLAMA_MODELS="/data/user_data/$USER/.ollama/models"
+    OLLAMA_HOST=127.0.0.1:11434 "$HOME/.dce/ollama/bin/ollama" serve \
+        > "$LOG/ollama_${SLURM_JOB_ID}.log" 2>&1 &
+    OLLAMA_PID=$!
+    for _ in $(seq 1 30); do curl -sf 127.0.0.1:11434/api/tags >/dev/null && break; sleep 2; done
+    curl -sf 127.0.0.1:11434/api/tags >/dev/null || { echo "ollama did not start"; exit 1; }
+    export DCE_OLLAMA_HOST=127.0.0.1
+    echo "ollama ready $(date +%T)"
+fi
+
 # 1. serve in the background; stop it on any exit so the GPUs are released
 "$VENV/bin/python" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --port "$PORT" --host 0.0.0.0 \
@@ -49,7 +62,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
     --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     > "$LOG/vllm_${SLURM_JOB_ID}.log" 2>&1 &
 VLLM_PID=$!
-trap 'kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null' EXIT
+trap 'kill $VLLM_PID ${OLLAMA_PID:-} 2>/dev/null; wait $VLLM_PID 2>/dev/null' EXIT
 
 # 2. wait for health (up to 30 min), failing fast if the server dies
 for _ in $(seq 1 120); do
