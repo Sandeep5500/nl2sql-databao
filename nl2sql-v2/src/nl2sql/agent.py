@@ -169,7 +169,13 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                               "arguments": tc.function.arguments}}
                 for tc in tool_calls]
         messages.append(assistant)
-        result.trace.append({"step": step, "assistant": assistant})
+        # vLLM's reasoning parser returns thinking in its own field; keep it in the
+        # trace for later analysis but never send it back, so history cannot grow.
+        entry = {"step": step, "assistant": assistant}
+        reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+        if reasoning:
+            entry["reasoning"] = reasoning
+        result.trace.append(entry)
 
         if not tool_calls:
             if cfg.text_sql_fallback:

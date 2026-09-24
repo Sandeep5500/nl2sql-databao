@@ -52,8 +52,12 @@ def reasoning_block(c, mode, chars):
         if r.get("last_messages"):
             bits.append("Its last words before finishing: " + " ".join(r["last_messages"]))
         text = "\n".join(bits)
-    else:
-        text = "Its reasoning while working:\n" + (r.get("narration") or "")
+    elif mode == "full":
+        text = "Its narration while working:\n" + (r.get("narration") or "")
+    elif mode == "thinking":
+        text = "Its reasoning while working:\n" + (r.get("thinking") or "")
+    else:   # thinking_last
+        text = "Its reasoning on its final steps:\n" + (r.get("thinking_last") or "")
     return ("\n" + text[:chars] + "\n") if text else ""
 
 
@@ -85,7 +89,9 @@ def main():
     ap.add_argument("--sql-chars", type=int, default=1500)
     ap.add_argument("--preview-chars", type=int, default=1200)
     ap.add_argument("--doc-chars", type=int, default=3000)
-    ap.add_argument("--reasoning", choices=["none", "short", "full"], default="none",
+    ap.add_argument("--reasoning",
+                    choices=["none", "short", "full", "thinking", "thinking_last"],
+                    default="none",
                     help="also show what each agent said while producing its candidate: "
                          "short = its own summary plus its last words; full = its whole narration. "
                          "Self-reported and sometimes confidently wrong.")

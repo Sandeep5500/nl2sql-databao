@@ -34,8 +34,10 @@ def reasoning_of(trace: dict) -> dict:
     from the submit_result call (absent when it ran out of steps); the narration
     is its visible message at each step. Recorded verbatim: it can be confidently
     wrong, which is part of what a validator has to see through."""
-    summary, msgs = None, []
+    summary, msgs, thinking = None, [], []
     for e in trace.get("trace", []):
+        if (e.get("reasoning") or "").strip():
+            thinking.append(e["reasoning"].strip())
         a = e.get("assistant") or {}
         if (a.get("content") or "").strip():
             msgs.append(a["content"].strip())
@@ -45,7 +47,8 @@ def reasoning_of(trace: dict) -> dict:
                     summary = _json.loads(tc["function"]["arguments"]).get("result_description")
                 except Exception:
                     pass
-    return {"summary": summary, "last_messages": msgs[-2:], "narration": "\n".join(msgs)}
+    return {"summary": summary, "last_messages": msgs[-2:], "narration": "\n".join(msgs),
+            "thinking": "\n---\n".join(thinking), "thinking_last": "\n---\n".join(thinking[-2:])}
 
 
 def main():

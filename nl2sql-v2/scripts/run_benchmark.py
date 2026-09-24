@@ -239,6 +239,9 @@ def main():
     ap.add_argument("--draft-model")
     ap.add_argument("--max-steps", type=int, default=30)
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--max-tokens", type=int, default=4096,
+                    help="per-call output budget. Reasoning shares it with the answer and "
+                         "the tool call, so raise it when --thinking is on.")
     ap.add_argument("--thinking", action="store_true",
                     help="leave the model's reasoning mode on (Qwen defaults to off). "
                          "Slower, but lets a teacher model work harder on hard questions.")
@@ -260,7 +263,7 @@ def main():
     print(f"endpoint={base_url} model={model} context_mode={args.context_mode}")
 
     llm = LLMConfig(base_url=base_url, model=model,
-                    temperature=args.temperature,
+                    temperature=args.temperature, max_tokens=args.max_tokens,
                     chat_template_kwargs={"enable_thinking": False}
                     if "qwen" in model.lower() and not args.thinking else {})
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
