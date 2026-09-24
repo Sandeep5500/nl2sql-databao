@@ -40,7 +40,24 @@ CHOICE: <letter>
 WHY: <one sentence>"""
 
 
-def build(item, sql_chars, prev_chars, doc_chars):
+def reasoning_block(c, mode, chars):
+    """Optional: what the agent said while producing this candidate."""
+    r = c.get("reasoning") or {}
+    if mode == "none" or not r:
+        return ""
+    if mode == "short":
+        bits = []
+        if r.get("summary"):
+            bits.append(f"Its own summary of the answer: {r['summary']}")
+        if r.get("last_messages"):
+            bits.append("Its last words before finishing: " + " ".join(r["last_messages"]))
+        text = "\n".join(bits)
+    else:
+        text = "Its reasoning while working:\n" + (r.get("narration") or "")
+    return ("\n" + text[:chars] + "\n") if text else ""
+
+
+def build(item, sql_chars, prev_chars, doc_chars, reasoning="none", reasoning_chars=2500):
     parts = []
     for c in item["candidates"]:
         if c["error"]:
@@ -48,7 +65,8 @@ def build(item, sql_chars, prev_chars, doc_chars):
         else:
             body = (f"Result: {c['shape'][0]} rows x {c['shape'][1]} columns\n"
                     f"{c['preview'][:prev_chars]}")
-        parts.append(f"[{c['label']}]\nSQL:\n{c['sql'][:sql_chars]}\n{body}\n")
+        parts.append(f"[{c['label']}]\nSQL:\n{c['sql'][:sql_chars]}\n{body}\n"
+                     + reasoning_block(c, reasoning, reasoning_chars))
     doc = f"\nDocumentation provided with the question:\n{item['doc'][:doc_chars]}\n" if item["doc"] else ""
     return PROMPT.format(question=item["question"], doc=doc,
                          n=len(item["candidates"]), candidates="\n".join(parts))
@@ -67,6 +85,11 @@ def main():
     ap.add_argument("--sql-chars", type=int, default=1500)
     ap.add_argument("--preview-chars", type=int, default=1200)
     ap.add_argument("--doc-chars", type=int, default=3000)
+    ap.add_argument("--reasoning", choices=["none", "short", "full"], default="none",
+                    help="also show what each agent said while producing its candidate: "
+                         "short = its own summary plus its last words; full = its whole narration. "
+                         "Self-reported and sometimes confidently wrong.")
+    ap.add_argument("--reasoning-chars", type=int, default=2500)
     ap.add_argument("--thinking", action="store_true")
     args = ap.parse_args()
 
@@ -80,7 +103,8 @@ def main():
 
     def one(iid):
         item = data[iid]
-        prompt = build(item, args.sql_chars, args.preview_chars, args.doc_chars)
+        prompt = build(item, args.sql_chars, args.preview_chars, args.doc_chars,
+                       args.reasoning, args.reasoning_chars)
         try:
             r = client.chat.completions.create(
                 model=args.model, messages=[{"role": "user", "content": prompt}],

@@ -19,12 +19,33 @@ import json
 import random
 from pathlib import Path
 
+import json as _json
+
 from _common import (LANES, SQLITE_DIR, Database, load_traces, local_questions,
                      rescore)
 from nl2sql.config import DOCS_DIR
 
 OUT = Path(__file__).resolve().parents[2] / "validator_inputs.json"
 LETTERS = "ABCDEFGH"
+
+
+def reasoning_of(trace: dict) -> dict:
+    """What the agent said while producing this candidate. Its own summary comes
+    from the submit_result call (absent when it ran out of steps); the narration
+    is its visible message at each step. Recorded verbatim: it can be confidently
+    wrong, which is part of what a validator has to see through."""
+    summary, msgs = None, []
+    for e in trace.get("trace", []):
+        a = e.get("assistant") or {}
+        if (a.get("content") or "").strip():
+            msgs.append(a["content"].strip())
+        for tc in a.get("tool_calls", []):
+            if tc["function"]["name"] == "submit_result":
+                try:
+                    summary = _json.loads(tc["function"]["arguments"]).get("result_description")
+                except Exception:
+                    pass
+    return {"summary": summary, "last_messages": msgs[-2:], "narration": "\n".join(msgs)}
 
 
 def main():
@@ -60,6 +81,8 @@ def main():
                     shape, preview, err = None, None, f"{type(e).__name__}: {str(e)[:150]}"
                 cands.append({"run": spec, "sql": sql, "shape": shape,
                               "preview": preview, "error": err,
+                              "status": t.get("status"),
+                              "reasoning": reasoning_of(t),
                               "correct": bool(ok.get((spec, iid)))})
             if len(cands) < 2:
                 continue
