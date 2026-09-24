@@ -288,6 +288,43 @@ Unparsed replies fall back to the first candidate (1 for the 9B, 3 for the 27B).
 
 Caveat: "correct" is the scorer's verdict, so a candidate that matched by luck counts as correct here too.
 
+### 5.2 Thinking on: neither better candidates nor better selection
+
+Run 2026-09-24. The original environment was rebuilt on Babel first (vector index copied over, Ollama
+installed for query-time embeddings, `--context-mode search` with the schema overview, temperature 0.7,
+Qwen3.5-9B), because the earlier runs used semantic retrieval in 79-88 of 135 episodes. Then 4 runs with
+thinking on, reasoning stored per step and the per-call output budget raised to 8192, plus 1 control with
+thinking off to detect stack drift.
+
+| Runs | Accuracy per run (of 135) | pass@4 |
+|---|---|---|
+| Original lanes (thinking off, earlier stack) | 39, 38, 41, 46 | 72 |
+| **Control (thinking off, this stack)** | **37** | - |
+| **Thinking on (this stack)** | **44, 37, 32, 40** (mean 38.3) | **67** |
+
+Read this within-stack: thinking averages 38.3 against the control's 37, so **no gain**, with wide spread
+(32 to 44). The control also lands 1-4 points below the original lanes, so the 67-versus-72 comparison
+mixes the change with stack drift and should not be read as thinking hurting.
+
+Thinking was real and substantial: every step carried reasoning, 9,000-16,000 characters per episode,
+about 2,700 reasoning-bearing steps per run. It cost step budget, though: episodes ending at the 30-step
+cap rose from 34/135 (control) and 38/135 (original) to **44-48 per run**.
+
+Validator over this thinking-on pool (ceiling 67, random pick 38.3):
+
+| Prompt | Correct | Headroom captured |
+|---|---|---|
+| Results only | **51** | 44% |
+| + reasoning from its final steps | 49 | 37% |
+| + full reasoning, 6k chars per candidate | 48 | 34% |
+
+Paired: none to final-step gains 6 and loses 8 (p=0.79); none to full gains 3 and loses 6 (p=0.51). The
+judge's pick changed on 53-60 of 135 questions, so the reasoning is being read, it just does not help.
+
+**Conclusion.** Chain-of-thought is not the missing ingredient for selection, the same direction as the
+narration result in 5.1. And thinking did not make the student more accurate in this harness. Judging the
+*result* remains the thing that works; a trained verifier is still the open lever.
+
 Implications:
 - High-K sampling is an excellent **offline** data generator (the gold CSV verifies each sample for free).
 - It is not an **online** strategy: on a new question nothing points at the correct sample.
