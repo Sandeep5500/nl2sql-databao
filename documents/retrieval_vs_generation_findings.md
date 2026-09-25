@@ -36,6 +36,12 @@ trace files predate the three Sept 17 scoring fixes and were not used.
   of 135 while perfect selection over 4 samples would give 72. Agreement voting recovers 3 points, but a
   prompted validator that judges the four candidates gets **55 (9B) or 59 (27B)**, with no training. On
   the 29 questions where only one candidate is right, it finds it 45-59% of the time against 25% by chance.
+- **Showing the validator the candidate's reasoning consistently hurts.** Narration, raw chain-of-thought
+  and a faithful 6-bullet summary of *why* each choice was made all land at or below judging the result
+  alone (49, 48, 49 vs 51). A same-session control reproduced results-only exactly with 98% identical
+  picks, so the ~40% of picks that move under reasoning are the reasoning's doing, and the moves are a coin
+  toss (5 fixed, 7 broken). Self-reported CHECKED-vs-ASSUMED provenance does not discriminate either
+  (within-question AUC 0.562, CI 0.473-0.652). Selection must be grounded in the executed result.
 - **The benchmark's own artifacts need care:** 8 of the 24 shipped gold SQLs answer a different question
   than the graded CSV; the scorer ignores row pairing on all 135; 52 of 675 stored queries return
   different results run to run.
@@ -331,6 +337,68 @@ Implications:
 - Closing the gap needs a **verifier** that judges correctness, not a vote that counts recurrence.
 - The wide pass@K spread confirms GRPO will have positive rollouts to learn from.
 
+### 5.3 Summarised "why" reasoning: the judge is deterministic, the reasoning is noise
+
+Run 2026-09-25, job 10564590. Section 5.2 left two escape hatches: the 6k cut might have been
+truncating the reasoning mid-thought, and dumping raw chain-of-thought shows *what* the candidate
+decided rather than *why*. Both were closed in one job.
+
+Each of the 534 candidate reasonings was condensed by the same 9B (`scripts/summarize_reasoning.py`),
+reading the **last 30,000 characters** and asked for at most 6 bullets under 150 words covering, for each
+important choice, what in the data or the question led to it, whether the candidate **verified** that or
+**assumed** it, which reading it settled on where the question was ambiguous, what it tried and abandoned
+and why, and what it stayed unsure about. Output: median 1,194 characters, max 1,704, from raw reasonings
+of 9,000-79,000. Nothing is truncated at judge time any more, and the summaries are on-target — they read
+as genuine accounts of reasoning, not lists of decisions.
+
+The same job then ran two validator passes back to back on one server: the summaries, and results-only as
+an **in-session control**.
+
+| Prompt | Correct (of 135) | Headroom | Picks identical to the 5.2 results-only run |
+|---|---|---|---|
+| **Results only (control, same session)** | **51** | 44% | 133/135 (98%) |
+| + summarised "why" reasoning | 49 | 37% | 82/135 (61%) |
+| + reasoning from final steps (5.2) | 49 | 37% | 77/135 (57%) |
+| + full reasoning, 6k cut (5.2) | 48 | 34% | 80/135 (59%) |
+
+**The control is the important number.** Results-only reproduced 51/135 exactly, with **98%** of picks
+identical to the earlier run. The judge is effectively deterministic. So the 39-43% of picks that move
+under *every* reasoning mode are caused by the reasoning, not by sampling noise — and those moves are a
+coin toss: summarised reasoning fixes 5 questions and breaks 7 (sign test p=0.77), final-steps fixes 6 and
+breaks 8, 6k-cut fixes 3 and breaks 6. Reasoning is not weak signal. It is noise with a cost.
+
+The broken questions are the same ones every time. Four break under **all three** reasoning modes —
+`local007`, `local019`, `local193`, `local196` — and `local031` breaks under two. `local007` and `local196`
+are the same two worked examples written up in 5.1 under narration — the judge grades the more thorough-sounding story over the correct result, and it does this
+whether the story is narration, raw chain-of-thought, or a faithful summary of the reasoning.
+
+#### Did CHECKED-versus-ASSUMED separate the candidates?
+
+This was the part worth salvaging regardless of the totals: if a candidate's own account of what it
+verified predicts correctness, a trained verifier could use it as a feature. It does not.
+
+| Signal | Correct candidates (n=153) | Wrong candidates (n=381) |
+|---|---|---|
+| Literal `CHECKED` marks per summary | 0.71 | 0.64 |
+| Literal `ASSUMED` marks per summary | 0.54 | 0.74 |
+| Verification words (verified/confirmed/sampled/tested) | 1.51 | 1.28 |
+| Assumption words (assum*) | 2.49 | 2.93 |
+
+The direction is right — correct candidates claim more checks and fewer assumptions — but the effect is
+too small to use. Ranking a question's candidates by (checks minus assumptions) gives a **within-question
+AUC of 0.562, 95% CI 0.473-0.652** (2,000 question-level bootstraps, 184 correct/wrong pairs), which does
+not exclude chance; the literal markers are flat at 0.489, CI 0.434-0.546. As a standalone selector the
+score picks 40/135 on the prose count and 34/135 on the literal marks, against 38.3 for picking at random
+and 51 for the judge. Marker compliance was also poor: only 155 of 534 summaries used a literal marker at
+all (`CHECKED` 117, `ASSUMED` 139), the rest expressing provenance in prose.
+
+**Conclusion.** Three independent attempts to feed the candidate's reasoning to the judge — narration,
+raw chain-of-thought, and a faithful summary of its *reasoning* rather than its decisions — all land at or
+below results-only, and the deterministic control proves the difference is real rather than run-to-run
+drift. Self-reported provenance does not discriminate either. Selection has to be grounded in the
+**executed result**; a verifier trained on result-level supervision remains the open lever, and it should
+not be given the candidate's own reasoning as a feature.
+
 ---
 
 ## 6. Linkage coverage
@@ -611,7 +679,13 @@ MD5) and the same DuckDB version. `local219`'s official gold SQL passes about 2 
 | `nl2sql-v2/scripts/run_benchmark.py` (overnight) | `--context-mode full_contract / oracle_decoy`, `--oracle-file`, `--thinking`; `--resume` fix |
 | `nl2sql-v2/slurm/teacher_run.slurm` | One self-contained job: serve, smoke-test, lanes, optional repeats, harvest |
 | `nl2sql-v2/teacher_context.json` | The 14 verified gold SQL packages from the 27B teacher |
-| `logs/traces/teacher_*`, `logs/traces/ablation_*` | Every overnight episode, published |
+| `nl2sql-v2/scripts/analysis/build_validator_inputs.py` | Freezes the pass@4 candidates (SQL, shape, preview, reasoning) into one JSON |
+| `nl2sql-v2/scripts/validator_select.py` | The judge: picks 1 of 4 candidates; `--reasoning none/short/full/thinking/thinking_last/thinking_summary` |
+| `nl2sql-v2/scripts/summarize_reasoning.py` | Condenses each candidate's chain-of-thought into 6 bullets on *why* each choice was made, marked CHECKED or ASSUMED |
+| `nl2sql-v2/reasoning_summaries_think.json` | Those 534 summaries, published (the 19MB merged pool is not; `validator_inputs_think.json` plus this file is equivalent) |
+| `nl2sql-v2/scripts/analysis/provenance_signal.py` | Tests whether self-reported CHECKED/ASSUMED predicts correctness (Section 5.3) |
+| `nl2sql-v2/slurm/validator_run.slurm` | Serve, optionally summarise, then one validator pass per `--reasoning` mode in one job |
+| `logs/traces/teacher_*`, `logs/traces/ablation_*`, `logs/traces/validator_*` | Every overnight episode and every judge reply, published |
 
 ---
 
@@ -635,7 +709,26 @@ uv run python scripts/analysis/ablation_arms.py --oracle-prefix ablation_forced 
 uv run python scripts/analysis/oracle_failures.py --prefix ablation_forced               # Section 7.6
 uv run python scripts/analysis/determinism.py                                             # Section 8
 uv run python scripts/analysis/validator_report.py --tags 9b,27b                          # Section 5.1
+uv run python scripts/analysis/validator_report.py --inputs validator_inputs_think.json \
+    --tags think9b_sum_none,think9b_sum_thinking_summary,think9b_thinking_last,think9b_thinking,think9b_none  # 5.2, 5.3
+uv run python scripts/analysis/provenance_signal.py   # Section 5.3 — CHECKED vs ASSUMED
 ```
+
+`validator_report.py` reports each tag on its own and then every tag paired against the **first** one, with
+both halves of each flip, because a mode that fixes 5 and breaks 7 looks like a 2-point loss in the totals
+and like noise in the pairing.
+
+The reasoning-mode passes need `validator_inputs_think.json` (built from the thinking-on lanes by
+`build_validator_inputs.py`) and, for 5.3, `validator_inputs_think_sum.json` on top of it:
+
+```
+uv run python scripts/summarize_reasoning.py --inputs validator_inputs_think.json \
+    --out validator_inputs_think_sum.json --endpoint http://localhost:PORT/v1 --model Qwen/Qwen3.5-9B
+uv run python scripts/validator_select.py --inputs validator_inputs_think_sum.json --reasoning thinking_summary
+```
+
+`validator_run.slurm` does the whole chain in one job (`SUMMARIZE_FROM=`, `INPUTS=`, `PASSES=`); always run
+the `none` pass in the **same** job as the control, since that is what makes the comparison paired.
 
 `teacher_targets.py` picks the questions to send to a teacher; `teacher_run.slurm` runs a teacher pass or
 a 9B arm end to end (see its header for the exact `sbatch` lines).
@@ -674,6 +767,17 @@ uv run python scripts/analysis/paired_failures.py --runs 'v2_armAplus,arm_contra
 - **A verifier is the highest-return next build, and a prompted one already works** (5.1): +8 questions
   with the 9B, +12 with the 27B, one extra call per question. Next steps: add the greedy run as a fifth
   candidate (ceiling 77), try more samples, and compare a trained ranker against the prompted judge on the
-  13 questions the 27B judge still misses.
+  13 questions the 27B judge still misses. **Do not feed it the candidate's reasoning** — three variants of
+  that all hurt (5.2, 5.3). Train on result-level supervision instead: the executed rows, the shape, and
+  the question.
+- **The reasoning question is closed for prompting, not for training.** A summary of *why* each choice was
+  made is exactly the input a human reviewer would want, and the 9B judge still cannot use it. Two things
+  worth testing before writing reasoning off entirely: a judge that itself reasons with thinking on (~10
+  min) so the failure is not just a weak reader, and a larger judge on the summaries, since the 27B was the
+  stronger judge on results alone.
+- **Fix the empty-turn waste before any rerun of thinking-on accuracy.** With thinking on, 8.81 steps per
+  episode emit no tool call and empty content (1,190 occurrences) — a reasoning-parser/tool-parser
+  interaction, not truncation — costing ~40% of the 30-step action budget. Every thinking-on accuracy
+  number in 5.2 is depressed by this.
 - **Generation is the lever for training (P1).** Even with retrieval handed over, the 9B passes 9% of runs
   on the unflagged hard questions and a third of its episodes exhaust the step budget.
