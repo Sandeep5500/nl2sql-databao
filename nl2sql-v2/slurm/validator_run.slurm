@@ -16,6 +16,7 @@ TP="${TP:-1}"; WORKERS="${WORKERS:-8}"; EXTRA="${EXTRA:-}"
 INPUTS="${INPUTS:-validator_inputs.json}"
 BUILD_RUNS="${BUILD_RUNS:-}"      # if set, build INPUTS from these candidate runs first
 PASSES="${PASSES:-none}"          # one validator pass per --reasoning mode listed
+MAXLEN="${MAXLEN:-60000}"         # raise for uncut reasoning prompts (~100k tokens)
 VENV="${VENV:-$REPO/.vllm-venv-0.19}"
 export HF_HOME="${HF_HOME:-/data/user_data/$USER/.cache/huggingface}"
 LOG="$REPO/logs/teacher"; mkdir -p "$LOG"
@@ -27,7 +28,7 @@ if [ -n "$BUILD_RUNS" ]; then
 fi
 
 "$VENV/bin/python" -m vllm.entrypoints.openai.api_server --model "$MODEL" --port "$PORT" \
-    --host 0.0.0.0 --max-model-len 60000 --gpu-memory-utilization 0.92 \
+    --host 0.0.0.0 --max-model-len "$MAXLEN" --gpu-memory-utilization 0.92 \
     --tensor-parallel-size "$TP" --dtype bfloat16 --trust-remote-code --enforce-eager \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     > "$LOG/vllm_validator_${SLURM_JOB_ID}.log" 2>&1 &
