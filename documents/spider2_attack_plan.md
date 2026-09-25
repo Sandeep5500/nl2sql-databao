@@ -242,3 +242,37 @@ Everything LoRA; shakeout runs happen on Qwen3.5-9B first.
 - [DivSkill-SQL](https://arxiv.org/html/2605.21792v1) — skills, ensemble, selection
 - [ktx](https://github.com/Kaelio/ktx) — context-layer design
 - [SQL-Zero](https://arxiv.org/html/2609.04697) — challenger/solver self-play
+
+
+---
+
+## Phase 1 — Training plan (Sept 25, 2026; lit survey + local assets)
+
+**Assets:** 258 exec-verified winning traces / 79 unique questions (57 with multiple wins
+→ DPO pairs); median 13 steps; 0/201 winners hit memory compaction (each trace = one
+clean conversation).
+
+**Collection:** (1) pass@K harvest at K=8-16 temp 0.7-1.0 over all 135; (2) frontier-teacher
+traces through OUR harness on the ~57 never-solved questions (highest-leverage add —
+cf. SWE-agent-LM: ~5K teacher traces + SFT only); (3) synthetic SQL-first questions for
+volume; (4) hindsight relabeling only if thin. Dedupe near-identical solutions per question.
+
+**Method (evidence-ranked):** rejection-sampled LoRA SFT first (arXiv:2609.17848: SFT beats
+GRPO in 15/18 in-distribution settings) → divergence-point DPO from same-question
+success/failure pass@4 pairs → multi-turn GRPO only as week-7 go/no-go (~2-5 pts for
+~3-4 person-weeks; FIRST verify verl/SkyRL/ms-swift can train Qwen3.5's GDN-hybrid layers).
+
+**Mixture:** ~40% agentic traces / ~30% single-shot NL2SQL (our lane + BIRD-style) /
+~30% general tool-use + reasoning — the last slice prevents the Arctic-style tool-calling
+regression we measured. Keep error-recovery segments; mask malformed-call turns.
+Hold out a question split; gate checkpoints on greedy AND pass@4 (watch diversity collapse).
+
+**Format:** one sample per trajectory (per compaction segment in general), native chat
+template, loss on assistant tokens only (reasoning + tool calls), system/user/tool-results
+masked. PIN a community-fixed Qwen3.5 chat template (shipped one has tool-call bugs) and
+use the identical template for collection, training, serving.
+
+**Stack:** ms-swift (official Qwen3.5 recipe, GRPO support) or Unsloth (9B LoRA ~22GB,
+fits one A6000); LoRA all-linear r=8-16 bf16; no QLoRA on the hybrid arch; training venv
+separate from serving venv. Timeline: wk1-3 data pipeline + SFT; wk3-5 teacher traces +
+mixture ablations; wk5-7 DPO; wk7-8 RL go/no-go.
