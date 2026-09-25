@@ -21,6 +21,7 @@ VENV="${VENV:-$REPO/.vllm-venv-0.19}"
 export HF_HOME="${HF_HOME:-/data/user_data/$USER/.cache/huggingface}"
 LOG="$REPO/logs/teacher"; mkdir -p "$LOG"
 echo "node $(hostname) | $MODEL | TP=$TP | tag=$TAG | $(date)"
+SUMMARIZE_FROM="${SUMMARIZE_FROM:-}"   # if set, condense its reasoning into $INPUTS first
 if [ -n "$BUILD_RUNS" ]; then
     echo "building $INPUTS from runs: $BUILD_RUNS"
     (cd nl2sql-v2 && uv run python scripts/analysis/build_validator_inputs.py \
@@ -43,6 +44,11 @@ curl -sf "localhost:$PORT/health" >/dev/null || { echo "vLLM never became health
 echo "server healthy $(date +%T)"
 
 cd nl2sql-v2
+if [ -n "$SUMMARIZE_FROM" ]; then
+    echo "=== condensing reasoning: $SUMMARIZE_FROM -> $INPUTS  $(date +%T)"
+    uv run python scripts/summarize_reasoning.py --endpoint "http://localhost:$PORT/v1" \
+        --model "$MODEL" --inputs "$SUMMARIZE_FROM" --out "$INPUTS" --workers "$WORKERS"
+fi
 for r in $PASSES; do
     echo "=== validator pass: reasoning=$r $(date +%T)"
     uv run python scripts/validator_select.py --endpoint "http://localhost:$PORT/v1" --model "$MODEL" \

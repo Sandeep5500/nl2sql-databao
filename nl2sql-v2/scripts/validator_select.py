@@ -54,6 +54,9 @@ def reasoning_block(c, mode, chars):
         text = "\n".join(bits)
     elif mode == "full":
         text = "Its narration while working:\n" + (r.get("narration") or "")
+    elif mode == "thinking_summary":
+        text = ("Why it made its choices, and what it checked versus assumed:\n"
+                + (r.get("summary_of_thinking") or ""))
     elif mode == "thinking":
         text = "Its reasoning while working:\n" + (r.get("thinking") or "")
     else:   # thinking_last
@@ -90,7 +93,8 @@ def main():
     ap.add_argument("--preview-chars", type=int, default=1200)
     ap.add_argument("--doc-chars", type=int, default=3000)
     ap.add_argument("--reasoning",
-                    choices=["none", "short", "full", "thinking", "thinking_last"],
+                    choices=["none", "short", "full", "thinking", "thinking_last",
+                             "thinking_summary"],
                     default="none",
                     help="also show what each agent said while producing its candidate: "
                          "short = its own summary plus its last words; full = its whole narration. "
