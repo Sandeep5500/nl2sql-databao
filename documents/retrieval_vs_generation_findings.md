@@ -684,6 +684,7 @@ MD5) and the same DuckDB version. `local219`'s official gold SQL passes about 2 
 | `nl2sql-v2/scripts/summarize_reasoning.py` | Condenses each candidate's chain-of-thought into 6 bullets on *why* each choice was made, marked CHECKED or ASSUMED |
 | `nl2sql-v2/reasoning_summaries_think.json` | Those 534 summaries, published (the 19MB merged pool is not; `validator_inputs_think.json` plus this file is equivalent) |
 | `nl2sql-v2/scripts/analysis/provenance_signal.py` | Tests whether self-reported CHECKED/ASSUMED predicts correctness (Section 5.3) |
+| `nl2sql-v2/scripts/analysis/retrieval_cases.py` | Lists the 5 genuinely retrieval-driven questions, per-run, with the path of every trace |
 | `nl2sql-v2/slurm/validator_run.slurm` | Serve, optionally summarise, then one validator pass per `--reasoning` mode in one job |
 | `logs/traces/teacher_*`, `logs/traces/ablation_*`, `logs/traces/validator_*` | Every overnight episode and every judge reply, published |
 
@@ -704,6 +705,7 @@ uv run python scripts/analysis/harvest_teacher.py --runs 'teacher_p1_*'         
 uv run python scripts/analysis/paired_failures.py --bucket C --by-question \
     --runs 'v2_armAplus,v2_pass4_k1,v2_pass4_k2,v2_pass4_k3,v2_pass4_k4,teacher_p1_*,teacher_p1b_*'  # 7.2
 uv run python scripts/analysis/ablation_arms.py                                           # Section 7.3
+uv run python scripts/analysis/retrieval_cases.py --sql                    # the 5 retrieval questions + traces
 uv run python scripts/analysis/oracle_failures.py --examples 2                           # Section 7.5
 uv run python scripts/analysis/ablation_arms.py --oracle-prefix ablation_forced --decoy-prefix ablation_oracle  # 7.6
 uv run python scripts/analysis/oracle_failures.py --prefix ablation_forced               # Section 7.6
