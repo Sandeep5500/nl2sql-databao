@@ -10,6 +10,7 @@ oracle minus decoy, with a bootstrap 95% interval over questions.
 
 Usage (from nl2sql-v2/):
     uv run python scripts/analysis/ablation_arms.py            # ablation_oracle_r* vs ablation_decoy_r*
+    uv run python scripts/analysis/ablation_arms.py --by-question   # which questions, and their traces
     uv run python scripts/analysis/ablation_arms.py --oracle-runs 'a_*,b_*' --decoy-runs 'c_*,d_*'
 """
 
@@ -47,6 +48,8 @@ def main():
     ap.add_argument("--decoy-runs")
     ap.add_argument("--questions", default=str(HERE.parents[2] / "teacher_context.json"),
                     help="JSON whose keys are the question ids both arms ran on, or 'all'")
+    ap.add_argument("--by-question", action="store_true",
+                    help="per-question pass counts, and the trace path of every solving run")
     args = ap.parse_args()
 
     qdb = {k: v["db"] for k, v in local_questions().items()}
@@ -82,6 +85,21 @@ def main():
     print(f"\neffect of correct linkage (oracle - decoy): {mean:+.1%}   95% CI [{lo:+.1%}, {hi:+.1%}]")
     print(f"questions where oracle > decoy: {sum(x > 0 for x in diff)}, "
           f"decoy > oracle: {sum(x < 0 for x in diff)}, tied: {sum(x == 0 for x in diff)}")
+
+    if args.by_question:
+        # Which questions the handed-over linkage actually rescued, and where to read them.
+        print(f"\n{'question':10s} {'oracle':>7s} {'decoy':>7s}   solved by")
+        for i in ids:
+            if not any(o[i]) and not any(d[i]):
+                continue
+            won = [(f"oracle {s}", s) for s, k in zip(o_specs, o[i]) if k] + \
+                  [(f"decoy  {s}", s) for s, k in zip(d_specs, d[i]) if k]
+            print(f"{i:10s} {sum(o[i])}/{len(o[i]):5d} {sum(d[i])}/{len(d[i]):5d}")
+            for label, spec in won:
+                hits = glob.glob(str(TRACES_DIR / spec / f"{i}.json"))
+                print(f"           {label:28s} {hits[0] if hits else spec}")
+        never = [i for i in ids if not any(o[i]) and not any(d[i])]
+        print(f"\nnever solved in either arm ({len(never)}): {', '.join(never)}")
 
     # decoy must be at least as big a prompt change as the oracle
     ratios = []
