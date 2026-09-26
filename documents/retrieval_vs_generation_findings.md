@@ -641,6 +641,63 @@ instructions. Prompting is not a large lever; the bottleneck remains generation.
   directly comparable to Phase-0, which used 0.18.1. Preemptions moved the arms across GPU types
   (A100, L40S and others), and greedy decoding can differ slightly across hardware.
 
+### 7.8 The bigger model is better at *using the tools*, not only at writing SQL
+
+The teacher runs answer a question the accuracy numbers cannot: when a larger model does better in an
+agentic harness, is that better SQL, or better operation of the loop? Same agent loop, same six tools, same
+30-step cap, on the 44 questions both models attempted (`tool_use.py`).
+
+| | Qwen3.5-9B | Qwen3.6-27B |
+|---|---|---|
+| Scored correct | 0/220 | 15/44 |
+| **Finished (did not hit the 30-step cap)** | **122/220 (55%)** | **34/44 (77%)** |
+| Tool calls per episode (median) | 26 | 15 |
+| **Errored tool calls** | **825/5138 (16.1%)** | **39/743 (5.2%)** |
+| Next call succeeds after an error | 64% | 72% |
+| Distinct tables inspected (median) | 3.0 | 2.5 |
+
+The 27B reaches an answer in 77% of episodes against 55%, using **fewer** calls to do it, and one call in
+20 errors against one in 6. It also leans less on `run_sql_query` (69% of calls vs 76%) and more on
+`describe_table` and `get_column_values` — it looks at the schema before querying it, where the 9B probes
+by executing and failing.
+
+**This is the model, not the prompt.** The teacher ran with swept tables plus the output contract, richer
+than the 9B's search mode, so the comparison needs a control. Giving the *9B* the tables and columns
+outright (the oracle arm, on the 14 questions) does not improve its tool mechanics at all:
+
+| Same model, 14 questions | 9B with search | 9B handed tables + columns |
+|---|---|---|
+| Finished | 63% | 66% |
+| Errored tool calls | 10.5% | 14.1% |
+| Tool calls per episode (median) | 21 | 21 |
+
+Prompt richness buys ~3 points of finishing and no reduction in errors, so it cannot account for the 27B's
+22-point finishing gap and 11-point error gap. Scale does.
+
+Two caveats. The 44 questions are bucket C, which is why the 9B scores 0 there — that biases the *accuracy*
+row, not the tool-mechanics rows, since both models face the same questions. And the 14-question oracle
+comparison must not be read for accuracy either: those are exactly the questions the teacher was verified
+correct on.
+
+**The same instrument shows what thinking-on costs** (5.2), which is how it was validated:
+
+| 9B, 135 questions | Thinking off | Thinking on |
+|---|---|---|
+| Finished | 75% | 66% |
+| **Steps spent without any tool call** | **0.00** | **8.46** |
+| Tool calls per episode (median) | 19 | 13 |
+| Errored tool calls | 14.6% | 16.4% |
+
+With thinking on the model burns 8.5 of its 30 steps on turns that produce text and no tool call. That is a
+reasoning-parser/tool-parser interaction, not truncation, and it is why the thinking-on accuracy numbers in
+5.2 should not be read as a verdict on reasoning.
+
+**Implication for the plan.** "Agentic skill" and "SQL skill" come apart, and they can be measured apart.
+The 9B's ceiling here is partly that it cannot drive a 30-step loop: 45% of its episodes never reach an
+answer, and a sixth of its tool calls are errors it then has to recover from. That is trainable signal
+which is invisible to execution accuracy alone, and it argues for rewarding episode-level behaviour
+(finishing, not erroring, inspecting before querying) alongside final correctness.
+
 ---
 
 ## 8. Reproducibility: nondeterminism and running on Babel
@@ -700,6 +757,7 @@ MD5) and the same DuckDB version. `local219`'s official gold SQL passes about 2 
 | `nl2sql-v2/reasoning_summaries_think.json` | Those 534 summaries, published (the 19MB merged pool is not; `validator_inputs_think.json` plus this file is equivalent) |
 | `nl2sql-v2/scripts/analysis/provenance_signal.py` | Tests whether self-reported CHECKED/ASSUMED predicts correctness (Section 5.3) |
 | `nl2sql-v2/scripts/analysis/retrieval_cases.py` | Lists the 5 genuinely retrieval-driven questions, per-run, with the path of every trace |
+| `nl2sql-v2/scripts/analysis/tool_use.py` | Tool-calling mechanics for any two run sets: finishing, calls spent, error and recovery rates (Section 7.8) |
 | `nl2sql-v2/slurm/validator_run.slurm` | Serve, optionally summarise, then one validator pass per `--reasoning` mode in one job |
 | `logs/traces/teacher_*`, `logs/traces/ablation_*`, `logs/traces/validator_*` | Every overnight episode and every judge reply, published |
 
@@ -721,6 +779,8 @@ uv run python scripts/analysis/paired_failures.py --bucket C --by-question \
     --runs 'v2_armAplus,v2_pass4_k1,v2_pass4_k2,v2_pass4_k3,v2_pass4_k4,teacher_p1_*,teacher_p1b_*'  # 7.2
 uv run python scripts/analysis/ablation_arms.py                                           # Section 7.3
 uv run python scripts/analysis/retrieval_cases.py --sql                    # the 5 retrieval questions + traces
+uv run python scripts/analysis/ablation_arms.py --by-question             # which questions each arm solved
+uv run python scripts/analysis/tool_use.py                                               # Section 7.8
 uv run python scripts/analysis/oracle_failures.py --examples 2                           # Section 7.5
 uv run python scripts/analysis/ablation_arms.py --oracle-prefix ablation_forced --decoy-prefix ablation_oracle  # 7.6
 uv run python scripts/analysis/oracle_failures.py --prefix ablation_forced               # Section 7.6
@@ -798,3 +858,8 @@ uv run python scripts/analysis/paired_failures.py --runs 'v2_armAplus,arm_contra
   number in 5.2 is depressed by this.
 - **Generation is the lever for training (P1).** Even with retrieval handed over, the 9B passes 9% of runs
   on the unflagged hard questions and a third of its episodes exhaust the step budget.
+- **Reward episode-level behaviour, not only final correctness (7.8).** Agentic skill and SQL skill come
+  apart and can be measured apart: the 27B finishes 77% of episodes against the 9B's 55% with fewer calls,
+  and errors on 5.2% of tool calls against 16.1%, and handing the 9B the linkage does not close either gap.
+  Finishing, not erroring, and inspecting a table before querying it are all trainable and all invisible to
+  execution accuracy.
