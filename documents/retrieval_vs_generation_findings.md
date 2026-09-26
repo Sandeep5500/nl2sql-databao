@@ -36,11 +36,12 @@ trace files predate the three Sept 17 scoring fixes and were not used.
   of 135 while perfect selection over 4 samples would give 72. Agreement voting recovers 3 points, but a
   prompted validator that judges the four candidates gets **55 (9B) or 59 (27B)**, with no training. On
   the 29 questions where only one candidate is right, it finds it 45-59% of the time against 25% by chance.
-- **Showing the validator the candidate's reasoning consistently hurts.** Narration, raw chain-of-thought
-  and a faithful 6-bullet summary of *why* each choice was made all land at or below judging the result
-  alone (49, 48, 49 vs 51). A same-session control reproduced results-only exactly with 98% identical
-  picks, so the ~40% of picks that move under reasoning are the reasoning's doing, and the moves are a coin
-  toss (5 fixed, 7 broken). Self-reported CHECKED-vs-ASSUMED provenance does not discriminate either
+- **Showing the validator the candidate's reasoning consistently hurts.** Three variants all land at or
+  below judging the result alone: narration (9B 55 and 53 against 55; 27B 58 and 55 against 59), raw
+  chain-of-thought (48 against 51), and a faithful 6-bullet summary of *why* each choice was made (49
+  against 51). A same-session control reproduced results-only exactly with 98% identical picks, so the
+  ~40% of picks that move under reasoning are the reasoning's doing, and the moves are a coin toss (5
+  fixed, 7 broken). Self-reported CHECKED-vs-ASSUMED provenance does not discriminate either
   (within-question AUC 0.562, CI 0.473-0.652). Selection must be grounded in the executed result.
 - **The benchmark's own artifacts need care:** 8 of the 24 shipped gold SQLs answer a different question
   than the graded CSV; the scorer ignores row pairing on all 135; 52 of 675 stored queries return
@@ -291,6 +292,20 @@ correct answer 45% (9B) and 59% (27B) of the time against 25% by chance.
 Not an artifact: it picks the longest SQL 29-30% of the time (25% by chance), candidate order is shuffled
 per question so position skew cannot inflate accuracy, and the two judges agree on 83 of 135 questions.
 Unparsed replies fall back to the first candidate (1 for the 9B, 3 for the 27B).
+
+**Showing the judge each candidate's narration does not help.** Same pool, same prompt, plus the
+candidate's own account of what it did (`--reasoning short` is its closing summary, `full` is the whole
+narration):
+
+| Judge | Results only | + narration (short) | + narration (full) |
+|---|---|---|---|
+| Qwen3.5-9B | **55** | 55 | 53 |
+| Qwen3.6-27B | **59** | 58 | 55 |
+
+Never better, and the fuller the account the worse it gets. Three worked examples — `local007`,
+`local070`, `local196` — show why: the judge grades the story rather than the result, preferring a
+candidate that narrates a careful-sounding process over one whose rows are right. Sections 5.2 and 5.3
+repeat this with real chain-of-thought and with a summary of it, and reach the same place.
 
 Caveat: "correct" is the scorer's verdict, so a candidate that matched by luck counts as correct here too.
 
@@ -710,7 +725,7 @@ uv run python scripts/analysis/oracle_failures.py --examples 2                  
 uv run python scripts/analysis/ablation_arms.py --oracle-prefix ablation_forced --decoy-prefix ablation_oracle  # 7.6
 uv run python scripts/analysis/oracle_failures.py --prefix ablation_forced               # Section 7.6
 uv run python scripts/analysis/determinism.py                                             # Section 8
-uv run python scripts/analysis/validator_report.py --tags 9b,27b                          # Section 5.1
+uv run python scripts/analysis/validator_report.py --tags 9b,9b_short,9b_full,27b,27b_short,27b_full  # 5.1
 uv run python scripts/analysis/validator_report.py --inputs validator_inputs_think.json \
     --tags think9b_sum_none,think9b_sum_thinking_summary,think9b_thinking_last,think9b_thinking,think9b_none  # 5.2, 5.3
 uv run python scripts/analysis/provenance_signal.py   # Section 5.3 — CHECKED vs ASSUMED
