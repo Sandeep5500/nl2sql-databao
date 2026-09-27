@@ -276,3 +276,20 @@ use the identical template for collection, training, serving.
 fits one A6000); LoRA all-linear r=8-16 bf16; no QLoRA on the hybrid arch; training venv
 separate from serving venv. Timeline: wk1-3 data pipeline + SFT; wk3-5 teacher traces +
 mixture ablations; wk5-7 DPO; wk7-8 RL go/no-go.
+
+
+### Results: Qwen3.6-35B-A3B pass@4 + DivSkill judge selection (Sept 27, 2026)
+
+35B-A3B (AWQ, same harness/config as 9B): pass@1 45.9% / @2 55.9% / @3 60.4% /
+**@4 63.0% (85/135)**. Lanes 61-63 correct each. Never-solved core: 62 -> **49**
+(35B cracked 13 immediately, incl. local002).
+
+Selection over the 4 lanes (dedup by exec-result equality, DivSkill pairwise
+round-robin judge = same 35B, temp 0.2, both presentation orders):
+avg single lane 45.9% -> majority vote 49.6% -> **judge 70/135 (51.9%)** -> oracle 63.0%.
+Judge beats majority (+2.3) but harvests only ~35% of the selection gap — self-judging
+shares the generator's blind spots. Next levers: cross-family judge, judge-time probes,
+trained judge. Best project number to date: **51.9%**.
+
+Teacher takeaway: ~46% pass@1 makes the 35B a productive trace generator — this run
+added ~248 winning traces; corpus now ~500 traces / 92 unique questions.
