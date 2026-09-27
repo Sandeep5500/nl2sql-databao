@@ -281,8 +281,10 @@ mixture ablations; wk5-7 DPO; wk7-8 RL go/no-go.
 ### Results: Qwen3.6-35B-A3B pass@4 + DivSkill judge selection (Sept 27, 2026)
 
 35B-A3B (AWQ, same harness/config as 9B): pass@1 45.9% / @2 55.9% / @3 60.4% /
-**@4 63.0% (85/135)**. Lanes 61-63 correct each. Never-solved core: 62 -> **49**
-(35B cracked 13 immediately, incl. local002).
+**@4 63.0% (85/135)**. Lanes 61-63 correct each. Never-solved core (vs ALL runs, both models): **39/135**; 96 unique questions solved
+by at least one run (506 winning traces). 35B solved 17 questions no 9B run ever did;
+the 9B family solved 11 the 35B missed — capabilities don't nest (ensemble/teacher
+diversity argument).
 
 Selection over the 4 lanes (dedup by exec-result equality, DivSkill pairwise
 round-robin judge = same 35B, temp 0.2, both presentation orders):
@@ -292,4 +294,4 @@ shares the generator's blind spots. Next levers: cross-family judge, judge-time 
 trained judge. Best project number to date: **51.9%**.
 
 Teacher takeaway: ~46% pass@1 makes the 35B a productive trace generator — this run
-added ~248 winning traces; corpus now ~500 traces / 92 unique questions.
+added 248 winning traces; corpus now 506 traces / 96 unique questions.
