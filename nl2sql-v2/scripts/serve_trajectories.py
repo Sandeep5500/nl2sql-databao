@@ -3,6 +3,10 @@
 them by URL (?fileUrl=...). Python's http.server sends no CORS header, and the
 visualizer runs on a different port, so a plain static server fails the fetch.
 
+The "gold" column says what comparison material each episode carries: "diff" for the
+expected-vs-submitted diff, "+ SQL" when the benchmark also ships official gold SQL
+for that question (only 24 of the 135 locals do).
+
 Also serves a clickable index at / listing every converted episode, so you can
 jump straight to a question instead of hunting for filenames.
 
@@ -45,10 +49,11 @@ class Handler(SimpleHTTPRequestHandler):
             "border-bottom:1px solid #ddd;text-align:left;vertical-align:top}"
             "tr:hover{background:#f6f6f6}.f{color:#b00}.p{color:#070}"
             "code{font:12px ui-monospace}</style>",
-            f"<h2>{len(rows)} trajectories</h2>",
+            f"<h2>{len(rows)} trajectories"
+            f" &middot; {sum(1 for r in rows if r.get('score') != 1)} failed</h2>",
             "<p>Viewer must be running: <code>npm start</code> in trajectory-visualizer "
             f"(<a href='{VIEWER}'>{VIEWER}</a>).</p>",
-            "<table><tr><th>run<th>question<th>outcome<th>detail<th>text",
+            "<table><tr><th>run<th>question<th>outcome<th>detail<th>gold<th>text",
         ]
         for r in rows:
             url = f"http://{host}/{r['path']}"
@@ -59,6 +64,8 @@ class Handler(SimpleHTTPRequestHandler):
                 f"<td class={'p' if ok else 'f'}>{'correct' if ok else 'FAILED'}"
                 f" {html.escape(str(r.get('status') or ''))}"
                 f"<td>{html.escape(str(r.get('detail') or ''))}"
+                f"<td>{'diff' if r.get('has_gold_diff') else ''}"
+                f"{' + SQL' if r.get('has_gold_sql') else ''}"
                 f"<td>{html.escape(r.get('question') or '')}")
         body = "\n".join(parts).encode()
         self.send_response(200)

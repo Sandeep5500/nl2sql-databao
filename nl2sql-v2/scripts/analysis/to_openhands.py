@@ -14,6 +14,8 @@ tools is mapped onto a handler that actually exists:
   the question           -> user message
   assistant prose        -> assistant message
   reasoning, if present  -> assistant message prefixed "[reasoning]"
+  gold vs submitted      -> edit observation, which renders a real diff viewer
+  official gold SQL      -> read observation (only 24 locals ship one)
   final SQL + score      -> finish action
 
 Two notes on that mapping. `think` actions are defined in the visualizer's types
@@ -21,6 +23,10 @@ and have a component, but trajectory-list.tsx never dispatches them, so real
 reasoning would render as raw JSON -- hence folding it into assistant messages.
 And our traces carry no timestamps, so monotonic synthetic ones are generated
 (1 second apart) to keep the timeline ordering meaningful.
+
+The gold comparison re-executes each submitted query through the agent's own DuckDB
+path, so the "submitted" side is the table that was actually graded rather than the
+truncated preview the tool printed. Pass --no-gold to skip that and convert faster.
 
 Usage (from nl2sql-v2/):
     uv run python scripts/analysis/to_openhands.py --runs q36_pass4_k4 --out ../logs/openhands
@@ -31,12 +37,74 @@ Usage (from nl2sql-v2/):
 import argparse
 import glob
 import json
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from _common import TRACES_DIR
+import pandas as pd
+
+from _common import (GOLD_SQL_DIR, SQLITE_DIR, TRACES_DIR, Database, gold_files,
+                     load_eval_standards, local_questions, score_against_gold)
 
 SQL_TOOLS = {"run_sql_query"}
+MAX_ROWS = 100          # rows shown per side of the diff
+
+
+def _csv_text(df: pd.DataFrame) -> str:
+    body = df.head(MAX_ROWS).to_csv(index=False)
+    if len(df) > MAX_ROWS:
+        body += f"... {len(df) - MAX_ROWS} more rows\n"
+    return body
+
+
+def gold_comparison(iid: str, sql: str, db: "Database | None", std: dict) -> dict | None:
+    """The graded gold table beside what the submitted query really returned.
+
+    The scorer is looser than a text diff: it matches each gold column against
+    some predicted column, tolerates EXTRA predicted columns, ignores row order
+    on every local question, and allows 0.01 of numeric slack. So a query the
+    scorer calls correct can still show textual differences here, and the card
+    says so rather than letting the diff imply a verdict.
+    """
+    golds = gold_files(iid)
+    if not golds:
+        return None
+    try:
+        if db is None:
+            raise RuntimeError("database file is missing")
+        pred, _ = db.query_preview(sql, preview_rows=1, max_rows=5000)
+    except Exception as exc:
+        pred, verdict = None, f"the submitted query does not execute: {exc}"
+    if pred is not None:
+        ok, detail = score_against_gold(pred, iid, std)
+        verdict = f"scorer says {'CORRECT' if ok == 1 else 'WRONG'} ({detail})"
+
+    # With several accepted variants, diff against the one closest in shape.
+    frames = []
+    for f in golds:
+        try:
+            frames.append((f.name, pd.read_csv(f)))
+        except Exception:
+            pass
+    if not frames:
+        return None
+    if pred is not None and len(frames) > 1:
+        frames.sort(key=lambda nf: (abs(nf[1].shape[1] - pred.shape[1]),
+                                    abs(nf[1].shape[0] - pred.shape[0])))
+    name, gold = frames[0]
+    note = [verdict,
+            f"gold {gold.shape[0]} rows x {gold.shape[1]} cols ({name})"]
+    if len(frames) > 1:
+        note.append(f"{len(frames)} accepted gold variants; showing the closest in shape")
+    if pred is not None:
+        note.append(f"submitted {pred.shape[0]} rows x {pred.shape[1]} cols")
+    note.append("The scorer tolerates extra predicted columns, different column "
+                "names and any row order, so textual differences below do not by "
+                "themselves mean the answer is wrong.")
+    return {"path": f"{iid}: expected (left) vs submitted (right)",
+            "old_content": _csv_text(gold),
+            "new_content": _csv_text(pred) if pred is not None else "<did not execute>",
+            "content": "\n".join(note)}
 
 
 def _clock():
@@ -58,7 +126,7 @@ def _fmt_args(args) -> str:
                      for k, v in args.items())
 
 
-def convert(trace: dict) -> list[dict]:
+def convert(trace: dict, cmp: dict | None = None, gold_sql: str = "") -> list[dict]:
     clock = _clock()
     nid = iter(range(1, 100_000))
     ev: list[dict] = []
@@ -119,6 +187,31 @@ def convert(trace: dict) -> list[dict]:
                            "args": {"content": content, "images_urls": None,
                                     "wait_for_response": False}})
 
+    # The graded comparison, as an edit observation: the viewer renders those with a
+    # real side-by-side diff viewer, which is exactly the shape of this question.
+    if cmp:
+        aid = next(nid)
+        ev.append({"id": aid, "timestamp": next(clock), "source": "agent",
+                   "action": "edit", "message": "expected vs submitted output",
+                   "args": {"path": cmp["path"], "old_content": cmp["old_content"],
+                            "new_content": cmp["new_content"],
+                            "thought": "compare the submitted result with the gold answer"}})
+        ev.append({"id": next(nid), "timestamp": next(clock), "source": "agent",
+                   "cause": aid, "observation": "edit",
+                   "message": "expected vs submitted output",
+                   "content": cmp["content"],
+                   "extras": {"path": cmp["path"], "old_content": cmp["old_content"],
+                              "new_content": cmp["new_content"]}})
+
+    if gold_sql:
+        aid = next(nid)
+        ev.append({"id": aid, "timestamp": next(clock), "source": "agent",
+                   "action": "read", "message": "official gold SQL",
+                   "args": {"path": "gold.sql"}})
+        ev.append({"id": next(nid), "timestamp": next(clock), "source": "agent",
+                   "cause": aid, "observation": "read", "message": "official gold SQL",
+                   "content": gold_sql, "extras": {"path": "gold.sql"}})
+
     ev.append({"id": next(nid), "timestamp": next(clock), "source": "agent",
                "action": "finish",
                "message": f"{'CORRECT' if ok else 'FAILED'} — {trace.get('detail', '')}",
@@ -139,11 +232,15 @@ def main():
     ap.add_argument("--out", default=str(TRACES_DIR.parent / "openhands"))
     ap.add_argument("--instances", help="comma-separated ids; default all")
     ap.add_argument("--failures-only", action="store_true")
+    ap.add_argument("--no-gold", action="store_true",
+                    help="skip the expected-vs-submitted diff (no query execution)")
     args = ap.parse_args()
 
     keep = set(args.instances.split(",")) if args.instances else None
     out_root = Path(args.out)
-    index, n = [], 0
+    Q = local_questions()
+
+    jobs = []           # (run_dir_name, trace)
     for spec in args.runs.split(","):
         for d in sorted(glob.glob(str(TRACES_DIR / spec))):
             d = Path(d)
@@ -151,22 +248,54 @@ def main():
                 continue
             for f in sorted(d.glob("local*.json")):
                 t = json.loads(f.read_text())
-                iid = t["instance_id"]
-                if keep and iid not in keep:
+                if keep and t["instance_id"] not in keep:
                     continue
                 if args.failures_only and t.get("score") == 1:
                     continue
-                dest = out_root / d.name / f"{iid}.json"
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(json.dumps(convert(t), indent=1))
-                index.append({"run": d.name, "instance": iid,
-                              "score": t.get("score"), "status": t.get("status"),
-                              "detail": t.get("detail"),
-                              "question": t.get("question", "")[:160],
-                              "path": f"{d.name}/{iid}.json"})
-                n += 1
+                jobs.append((d.name, t))
+    if not jobs:
+        raise SystemExit(f"no traces matched --runs {args.runs}")
+
+    # Group by database so each SQLite file is attached once, not once per episode.
+    comparisons = {}
+    if not args.no_gold:
+        std = load_eval_standards()
+        by_db = defaultdict(list)
+        for run, t in jobs:
+            by_db[Q[t["instance_id"]]["db"]].append((run, t))
+        print(f"executing {len(jobs)} submitted queries across {len(by_db)} databases "
+              f"for the gold diff ...")
+        for db_name, items in sorted(by_db.items()):
+            path = SQLITE_DIR / f"{db_name}.sqlite"
+            db = Database(path) if path.exists() else None
+            for run, t in items:
+                comparisons[(run, t["instance_id"])] = gold_comparison(
+                    t["instance_id"], t.get("sql") or "", db, std)
+            if db is not None:
+                db.close()
+
+    index, n = [], 0
+    for run, t in jobs:
+        iid = t["instance_id"]
+        gold_sql_file = GOLD_SQL_DIR / f"{iid}.sql"
+        dest = out_root / run / f"{iid}.json"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(convert(
+            t, comparisons.get((run, iid)),
+            gold_sql_file.read_text() if gold_sql_file.exists() else ""), indent=1))
+        index.append({"run": run, "instance": iid,
+                      "score": t.get("score"), "status": t.get("status"),
+                      "detail": t.get("detail"),
+                      "has_gold_diff": comparisons.get((run, iid)) is not None,
+                      "has_gold_sql": gold_sql_file.exists(),
+                      "question": t.get("question", "")[:160],
+                      "path": f"{run}/{iid}.json"})
+        n += 1
     (out_root / "index.json").write_text(json.dumps(index, indent=1))
+    with_diff = sum(1 for r in index if r["has_gold_diff"])
     print(f"wrote {n} trajectories to {out_root}")
+    print(f"  with an expected-vs-submitted diff: {with_diff}")
+    print(f"  with the official gold SQL too    : {sum(1 for r in index if r['has_gold_sql'])}")
     print(f"index: {out_root / 'index.json'}")
 
 

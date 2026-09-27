@@ -75,10 +75,44 @@ So each of our tools is mapped onto a handler that exists:
 | a result starting `ERROR` | `observation: "error"` | red error card |
 | assistant prose | assistant message | speech bubble |
 | `reasoning`, when present | assistant message prefixed `[reasoning]` | speech bubble |
+| **gold vs submitted output** | `edit` observation | **side-by-side diff viewer** |
+| official gold SQL, when it exists | `read` observation | file card |
 | final SQL + score | `finish` action | outcome card |
 
-Verified against the app's own type guards: of 2,853 events across 60 episodes, the
-only ones that fall back to a raw-JSON card are the 60 system prompts (one each).
+Verified against the app's own type guards: of 26,224 events across all 540 episodes,
+the only ones that fall back to a raw-JSON card are the 540 system prompts (one each).
+
+## Comparing against the correct output
+
+Every episode gets an **expected vs submitted** card near the end, rendered by the
+viewer's diff component: gold answer on the left, what the query really returned on
+the right. The submitted side is produced by re-executing the final SQL through the
+agent's own DuckDB path, so it is the table that was actually graded, not the
+truncated preview the tool printed. That costs about 25 seconds for all 540 episodes;
+`--no-gold` skips it.
+
+The card's text gives the scorer's own verdict first, for example:
+
+```
+scorer says WRONG (result_mismatch)
+gold 1 rows x 1 cols (local031_a.csv)
+submitted 1 rows x 3 cols
+The scorer tolerates extra predicted columns, different column names and any row
+order, so textual differences below do not by themselves mean the answer is wrong.
+```
+
+**Read the verdict, not the diff.** The scorer matches each gold column against some
+predicted column, tolerates extra predicted columns, ignores row order on every local
+question and allows 0.01 of numeric slack. `local072` is the worked example: gold is
+1 column, the submission is 3, the diff looks completely different, and the scorer
+says CORRECT. The note on every card exists to stop that being misread.
+
+Where a question has several accepted gold variants -- 91 of the 135 do -- the diff
+uses the variant closest in shape to the submission, and says how many exist.
+
+The 24 locals that ship official gold SQL also get a card with that query. Treat it
+with care: 8 of those 24 answer a different question than the graded CSV (see
+Section 2 of the retrieval-vs-generation findings). The CSV is the graded artifact.
 
 Two deliberate choices:
 
