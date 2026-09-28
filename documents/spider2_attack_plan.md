@@ -295,3 +295,33 @@ trained judge. Best project number to date: **51.9%**.
 
 Teacher takeaway: ~46% pass@1 makes the 35B a productive trace generator — this run
 added 248 winning traces; corpus now 506 traces / 96 unique questions.
+
+
+### Results: search-fixed 35B lanes + selection (Sept 28, 2026)
+
+Bug (caught by teammate review): the raw q36 lanes ran with ollama dead — all 457
+search_context calls errored. Fixed (orchestrator gres inheritance) and reran 4 lanes:
+
+| | raw (search dead) | search-fixed |
+|---|---|---|
+| lanes | 62/62/61/63 | 64/71/55/66 |
+| pass@1 avg | 45.9% | 47.4% |
+| pass@4 | 63.0% | **69.6% (94/135)** |
+
+Findings: pass@1 +1.5 (noise-level); pass@4 +9 but confounded with extra sampling;
+lane variance tripled. Search usage is a checkbox: ~1 call/question, 98% in the opening
+steps, never revisited when stuck; 63% full gold-table recall when used. Win rate is
+identical with/without search per-episode. **Retrieval is vestigial on the local split**
+(overview + describe_table carry grounding); its real test is enterprise-scale schemas.
+
+Tool-usage profile (k1): run_sql_query 67% of calls (7.9/win-ep vs 13.6/loss-ep — losers
+grind), describe_table 17% (disciplined, early, the real orientation tool),
+read_documentation 13/13 compliance, find_value near-abandoned (10 calls), 43% of
+SQL-error episodes still win, zero submit protocol errors.
+
+Selection on search-fixed lanes: majority 52.6% vs judge 51.1% (raw set: 49.6% vs 51.9%).
+**Pooled: majority ≈ self-judge ≈ 52%; oracle gap widened to ~17 pts.** Self-judging is
+the bottleneck → cross-family judge / probe-augmented judge / trained verifier.
+
+Cumulative: all-8-lane 35B union 102/135 (75.6%); global solved-ever 105/135;
+762 winning traces; never-solved core 30.
