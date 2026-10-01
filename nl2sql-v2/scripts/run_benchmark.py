@@ -27,23 +27,19 @@ from nl2sql.config import (AgentConfig, CriticConfig, DCE_PROJECT_DIR, DOCS_DIR,
 from nl2sql.context import SearchContext
 from nl2sql.db import Database
 from nl2sql.eval import load_eval_standards, score_against_gold
+from nl2sql.questions import load_questions as _load_questions
 from nl2sql.tools import ToolSession
 
 
-def load_questions(instances=None, skip=None, limit=None):
-    out = []
-    with open(QUESTIONS_FILE) as f:
-        for line in f:
-            q = json.loads(line)
-            iid = q["instance_id"]
-            if not iid.startswith("local"):
-                continue
-            if instances and iid not in instances:
-                continue
-            if skip and iid in skip:
-                continue
-            out.append(q)
-    return out[:limit] if limit else out
+def load_questions(instances=None, skip=None, limit=None, override_mode="off"):
+    """Upstream questions, optionally with this repo's local corrections applied.
+
+    Returns (questions, applied); `applied` is the audit trail of which questions
+    were reworded or dropped, which the caller stores so a run can never be read
+    as a plain benchmark result when it was not one.
+    """
+    return _load_questions(instances=instances, skip=skip, limit=limit,
+                           override_mode=override_mode)
 
 
 def read_endpoint(cli_endpoint):
@@ -270,6 +266,13 @@ def main():
     ap.add_argument("--oracle-file", default="oracle_context.json",
                     help="linkage file for --context-mode oracle, relative to nl2sql-v2/ "
                          "(e.g. teacher_context.json from harvest_teacher.py)")
+    ap.add_argument("--question-overrides", default="off",
+                    choices=["off", "clarify", "all"],
+                    help="apply this repo's question_overrides.json. 'clarify' only "
+                         "disambiguates questions whose gold is consistent; 'all' also "
+                         "acts on questions that contradict their gold (dropping them by "
+                         "default). Off by default: an overlay run is not comparable to "
+                         "the leaderboard.")
     ap.add_argument("--schema-overview", action="store_true",
                     help="inject compressed table->columns overview into the "
                          "system prompt (databao v1 style)")
@@ -318,10 +321,18 @@ def main():
                           if args.critic_model and "qwen" in args.critic_model.lower()
                           else {})
 
-    questions = load_questions(
+    questions, overrides_applied = load_questions(
         set(args.instances.split(",")) if args.instances else None,
         set(args.skip_instances.split(",")) if args.skip_instances else None,
-        args.limit)
+        args.limit, override_mode=args.question_overrides)
+    if overrides_applied:
+        # Loud, because a run with a modified question set is not a benchmark
+        # result and must never be reported next to one without a label.
+        print(f"!! QUESTION OVERRIDES ACTIVE (--question-overrides {args.question_overrides}): "
+              f"{len(overrides_applied)} question(s) changed. "
+              f"These numbers are NOT comparable to the Spider2 leaderboard.")
+        for a in overrides_applied:
+            print(f"   {a['instance_id']}: {a['action']} ({a['kind']}) -- {a['reason']}")
 
     def load_context(filename: str, builder: str) -> dict:
         path = Path(__file__).resolve().parents[1] / filename
@@ -486,11 +497,18 @@ def main():
 
             if trace_dir:
                 with open(trace_dir / f"{iid}.json", "w") as tf:
-                    json.dump({"instance_id": iid, "question": q["question"],
-                               "status": result.status, "score": score,
-                               "detail": detail, "sql": result.sql,
-                               "system": result.system,
-                               "trace": result.trace}, tf, indent=2, default=str)
+                    rec = {"instance_id": iid, "question": q["question"],
+                           "status": result.status, "score": score,
+                           "detail": detail, "sql": result.sql,
+                           "system": result.system,
+                           "trace": result.trace}
+                    # Stamp the trace when this question was not the upstream one,
+                    # so an analysis cannot silently mix overlay and benchmark runs.
+                    ov = next((a for a in overrides_applied
+                               if a["instance_id"] == iid), None)
+                    if ov:
+                        rec["question_override"] = ov
+                    json.dump(rec, tf, indent=2, default=str)
 
     total_rows = len(list(csv.DictReader(open(out_path))))
     print(f"\n{correct}/{total_rows} correct "
