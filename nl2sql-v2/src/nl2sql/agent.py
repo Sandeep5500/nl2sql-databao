@@ -216,16 +216,6 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                                             f"first and use its query_id."})
                 continue
             sql, df = sub
-            # LIMIT-strip guard: a submission truncated by its own LIMIT loses
-            # against full-length golds; re-run without the trailing LIMIT.
-            m = re.search(r"(?is)^(.*)\bLIMIT\s+(\d+)\s*;?\s*$", sql)
-            if m and len(df) == int(m.group(2)) and int(m.group(2)) < cfg.result_rows_max:
-                try:
-                    df2, _ = session.db.query_preview(m.group(1), 1, cfg.result_rows_max)
-                    if len(df2) > len(df):
-                        sql, df = m.group(1).strip(), df2
-                except Exception:
-                    pass
             if critic_client and result.critic_rounds < critic_cfg.max_rounds:
                 verdict = critic_mod.review(
                     critic_client, critic_cfg, question, sql,
