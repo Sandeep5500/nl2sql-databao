@@ -20,9 +20,15 @@ workarounds.
 NULL / COALESCE deliberately.
 
 Pre-submit checklist:
-- Does the column set match exactly what was asked (no extra id/helper columns)?
-- Row count plausible? Ordering/rounding as requested?
-- If the question asks for a single value, return a single row and column.
+- Include EVERY asked-for quantity, plus identifying columns (ids AND names): extra \
+columns are harmless, missing columns are fatal.
+- Dates/months in the final SELECT formatted ISO (YYYY-MM-DD / YYYY-MM), never raw \
+DD-MM-YYYY strings or split year/month columns.
+- "Percentage" means a 0-100 number. "Which X and which Y" means a label column per row.
+- Never submit a query ending in LIMIT unless the question asks for exactly that many rows.
+- Row count plausible? Ordering/rounding as requested? Single value asked -> single row/column.
+- Once a candidate's numbers are verified twice, SUBMIT it — do not keep exploring \
+alternative interpretations; a submitted good answer beats an unsubmitted perfect one.
 
 Anti-loop rules:
 - If the same error occurs twice, change approach instead of retrying the same SQL.

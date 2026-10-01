@@ -39,6 +39,20 @@ class Database:
 
     def close(self):
         self.con.close()
+        if getattr(self, "_av", None) is not None:
+            self._av.close()
+
+    def _all_varchar_con(self):
+        """Fallback connection reading every SQLite column as text — survives
+        columns declared INTEGER that store text, which crash the normal scan."""
+        if getattr(self, "_av", None) is None:
+            av = duckdb.connect(":memory:")
+            av.execute("INSTALL sqlite; LOAD sqlite;")
+            av.execute("SET GLOBAL sqlite_all_varchar=true")
+            av.execute(f"ATTACH '{self.sqlite_path}' AS db (TYPE sqlite, READ_ONLY)")
+            av.execute("USE db")
+            self._av = av
+        return self._av
 
     # ── raw query ─────────────────────────────────────────────────────────
     def query(self, sql: str, max_rows: int = 100) -> pd.DataFrame:
@@ -54,8 +68,28 @@ class Database:
         import threading
         timer = threading.Timer(timeout_s, self.con.interrupt)
         timer.start()
+        av_note = ""
         try:
             df = _decode_bytes(self.con.execute(sql).df())
+        except Exception as e:
+            timer.cancel()
+            if "Mismatch Type Error" not in str(e):
+                raise
+            # mistyped column (INTEGER-declared storing text): retry with all
+            # columns as text; numeric ops need TRY_CAST, which the hint says.
+            av = self._all_varchar_con()
+            timer = threading.Timer(timeout_s, av.interrupt)
+            timer.start()
+            try:
+                df = _decode_bytes(av.execute(sql).df())
+                av_note = ("\n[note: this table has mixed-typed columns; all values "
+                           "were read as TEXT — use TRY_CAST(col AS DOUBLE) for math]")
+            except Exception as e2:
+                raise RuntimeError(
+                    f"{e2} [hint: this table has mixed-typed columns readable only "
+                    f"as TEXT — wrap numeric columns in TRY_CAST(col AS DOUBLE)]") from e2
+            finally:
+                timer.cancel()
         finally:
             timer.cancel()
         total = len(df)
@@ -64,6 +98,7 @@ class Database:
         csv = preview.to_csv(index=False)
         if total > preview_rows:
             csv += f"\n[showing {len(preview)} of {total} rows]"
+        csv += av_note
         return df, csv
 
     # ── catalog helpers ───────────────────────────────────────────────────
