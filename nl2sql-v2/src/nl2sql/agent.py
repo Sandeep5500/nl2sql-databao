@@ -256,8 +256,27 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                                  "args": args, "result": out})
 
     if result.status == "no_sql" and session.query_results:
-        # recursion budget exhausted: fall back to the last executed query
-        qid = max(session.query_results, key=lambda q: int(q[1:]))
+        # Budget exhausted without submit. Pick the agent's best-validated
+        # candidate: cluster results by value signature; the largest cluster's
+        # latest query (an answer computed repeatedly) beats the last scratch
+        # probe. Empty results rank last.
+        import io
+        def sig(df):
+            try:
+                buf = io.StringIO(); df.to_csv(buf, index=False, header=False)
+                return buf.getvalue()
+            except Exception:
+                return str(id(df))
+        clusters = {}
+        for qid, (sql_q, df_q) in session.query_results.items():
+            if df_q is None or len(df_q) == 0:
+                continue
+            clusters.setdefault(sig(df_q), []).append((int(qid[1:]), qid))
+        if clusters:
+            best = max(clusters.values(), key=lambda v: (len(v), max(x[0] for x in v)))
+            qid = max(best)[1]
+        else:
+            qid = max(session.query_results, key=lambda q: int(q[1:]))
         result.sql, result.pred_df = session.query_results[qid][0], session.query_results[qid][1]
         result.status = "fallback"
 

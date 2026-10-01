@@ -10,6 +10,7 @@ Usage (from nl2sql-v2/):
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -56,6 +57,48 @@ def read_endpoint(cli_endpoint):
     if not ep.rstrip("/").endswith("/v1"):
         ep = ep.rstrip("/") + "/v1"
     return ep
+
+
+INFRA_ERROR_MARKERS = ("Connection error", "timed out", "Timeout", "502", "503",
+                       "504", "Service Unavailable", "Bad Gateway")
+
+
+def is_infra_error(err: str | None) -> bool:
+    return bool(err) and err.startswith("llm_call") and \
+        any(m in err for m in INFRA_ERROR_MARKERS)
+
+
+def wait_for_services(base_url: str, ollama_host: str | None,
+                      max_wait_s: int = 4 * 3600, poll_s: int = 30) -> None:
+    """Block until vLLM (and Ollama, when search is on) answer health checks.
+
+    A preempted/requeued or crashed server otherwise turns every remaining
+    question into an instant 'Connection error' row that looks like a real
+    model failure."""
+    import urllib.request
+    checks = [("vLLM", base_url.rstrip("/") + "/models")]
+    if ollama_host:
+        checks.append(("Ollama", f"http://{ollama_host}:11434/api/tags"))
+    waited = 0
+    while True:
+        down = []
+        for name, url in checks:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as r:
+                    if r.status != 200:
+                        down.append(name)
+            except Exception:
+                down.append(name)
+        if not down:
+            if waited:
+                print(f"[services back after {waited // 60} min] ", end="", flush=True)
+            return
+        if waited == 0:
+            print(f"\n[waiting for {', '.join(down)} to come back] ", end="", flush=True)
+        if waited >= max_wait_s:
+            raise SystemExit(f"{', '.join(down)} down for {max_wait_s // 3600}h; giving up")
+        time.sleep(poll_s)
+        waited += poll_s
 
 
 def resolve_datasource(db_name: str) -> str | None:
@@ -406,11 +449,21 @@ def main():
                           "strong draft, then verify and refine it yourself before "
                           "submitting.")
 
-            session = ToolSession(db=db, cfg=cfg, search=search, doc_text=doc,
-                                  draft=draft)
+            ollama_host = os.environ.get("DCE_OLLAMA_HOST") if search else None
             try:
-                result = run_episode(q["question"], session, llm, cfg, critic,
-                                     extra_context=extra)
+                for attempt in range(2):
+                    wait_for_services(base_url, ollama_host)
+                    session = ToolSession(db=db, cfg=cfg, search=search,
+                                          doc_text=doc, draft=draft)
+                    result = run_episode(q["question"], session, llm, cfg, critic,
+                                         extra_context=extra)
+                    if not is_infra_error(result.error):
+                        break
+                    print("[infra error, retrying question] ", end="", flush=True)
+                else:
+                    # Still failing on infrastructure: record nothing, so the
+                    # restart wrapper + --resume retries this question later.
+                    raise SystemExit(f"infrastructure error on {iid}: {result.error}")
             finally:
                 db.close()
 
