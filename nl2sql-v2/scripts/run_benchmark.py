@@ -266,6 +266,10 @@ def main():
     ap.add_argument("--oracle-file", default="oracle_context.json",
                     help="linkage file for --context-mode oracle, relative to nl2sql-v2/ "
                          "(e.g. teacher_context.json from harvest_teacher.py)")
+    ap.add_argument("--no-shape-check", action="store_true",
+                    help="disable the submit-time shape gate (self-consistency check "
+                         "between the shape the model says the question asks for and "
+                         "the result it submits). On by default.")
     ap.add_argument("--question-overrides", default="off",
                     choices=["off", "clarify", "all"],
                     help="apply this repo's question_overrides.json. 'clarify' only "
@@ -314,7 +318,8 @@ def main():
                     if "qwen" in model.lower() and not args.thinking else {})
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
-                      text_sql_fallback=args.text_sql_fallback)
+                      text_sql_fallback=args.text_sql_fallback,
+                      shape_check=not args.no_shape_check)
     critic = CriticConfig(enabled=bool(args.critic_model),
                           base_url=args.critic_endpoint, model=args.critic_model,
                           chat_template_kwargs={"enable_thinking": False}

@@ -3,6 +3,11 @@
 them by URL (?fileUrl=...). Python's http.server sends no CORS header, and the
 visualizer runs on a different port, so a plain static server fails the fetch.
 
+The "search" column says whether semantic retrieval actually worked in that episode:
+the q36 and q36s runs are the same model and differ only in that, and their episodes
+otherwise look identical, so it is easy to read the wrong one. "BROKEN" means every
+search_context call in that episode errored.
+
 The "gold" column says what comparison material each episode carries: "diff" for the
 expected-vs-submitted diff, "+ SQL" when the benchmark also ships official gold SQL
 for that question (only 24 of the 135 locals do).
@@ -51,19 +56,27 @@ class Handler(SimpleHTTPRequestHandler):
             "code{font:12px ui-monospace}</style>",
             f"<h2>{len(rows)} trajectories"
             f" &middot; {sum(1 for r in rows if r.get('score') != 1)} failed</h2>",
+            ("<p><b>Newest run first.</b> Rows marked <span class=old>superseded</span> "
+             "come from an earlier run of the same model and are kept only for "
+             "comparison &mdash; check the <b>search</b> column before reading one.</p>"
+             if any(r.get("recency") == "superseded" for r in rows) else ""),
             "<p>Viewer must be running: <code>npm start</code> in trajectory-visualizer "
             f"(<a href='{VIEWER}'>{VIEWER}</a>).</p>",
-            "<table><tr><th>run<th>question<th>outcome<th>detail<th>gold<th>text",
+            "<table><tr><th>run<th>question<th>outcome<th>detail<th>search<th>gold<th>text",
         ]
         for r in rows:
             url = f"http://{host}/{r['path']}"
             ok = r.get("score") == 1
+            sup = r.get("recency") == "superseded"
             parts.append(
-                f"<tr><td>{html.escape(r['run'])}"
+                f"<tr class={'sup' if sup else ''}><td>{html.escape(r['run'])}"
+                f"{' <span class=old>superseded</span>' if sup else ''}"
                 f"<td><a href=\"{VIEWER}/?fileUrl={url}\">{html.escape(r['instance'])}</a>"
                 f"<td class={'p' if ok else 'f'}>{'correct' if ok else 'FAILED'}"
                 f" {html.escape(str(r.get('status') or ''))}"
                 f"<td>{html.escape(str(r.get('detail') or ''))}"
+                f"<td class={'f' if r.get('search') == 'BROKEN' else ''}>"
+                f"{html.escape(str(r.get('search') or ''))}"
                 f"<td>{'diff' if r.get('has_gold_diff') else ''}"
                 f"{' + SQL' if r.get('has_gold_sql') else ''}"
                 f"<td>{html.escape(r.get('question') or '')}")

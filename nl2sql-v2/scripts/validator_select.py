@@ -39,6 +39,36 @@ Reply with exactly two lines:
 CHOICE: <letter>
 WHY: <one sentence>"""
 
+# Same task, but the judge must commit to the shape the QUESTION implies before it
+# looks at which candidate to pick. Nothing here comes from the gold answer -- the
+# expectation is the judge's own reading, so this is deployable, unlike a contract
+# built from the gold CSV. Targets the largest failure class in the trace analysis:
+# the right computation returned at the wrong grain (16 category rows where the
+# question asks for one, the 5 qualifying states where it asks how many).
+SHAPE_PROMPT = """You are checking which candidate answer correctly answers a question about a SQL database.
+
+Question:
+{question}
+{doc}
+{n} candidates were produced independently. Each shows its SQL and the first rows of its result.
+
+{candidates}
+First decide, from the QUESTION ALONE, what shape a correct answer must have:
+- how many rows? "which X has the most Y" or "how many" or "what is the total" means ONE
+  row; "for each X" or "list all" means many.
+- which columns must appear? Include the identifying columns the question names.
+- units: does it ask for a percentage (0-100) or a proportion (0-1)?
+
+Then pick the ONE candidate whose RESULT matches that shape and answers the question.
+A candidate that returns a whole ranked table when the question asks for the top one, or
+that drops a column the question names, is wrong even if its numbers are right.
+
+Reply with exactly four lines:
+EXPECT_ROWS: <1 or many>
+EXPECT_COLUMNS: <comma-separated>
+CHOICE: <letter>
+WHY: <one sentence>"""
+
 
 def reasoning_block(c, mode, chars):
     """Optional: what the agent said while producing this candidate."""
@@ -64,7 +94,8 @@ def reasoning_block(c, mode, chars):
     return ("\n" + text[:chars] + "\n") if text else ""
 
 
-def build(item, sql_chars, prev_chars, doc_chars, reasoning="none", reasoning_chars=2500):
+def build(item, sql_chars, prev_chars, doc_chars, reasoning="none",
+          reasoning_chars=2500, shape=False):
     parts = []
     for c in item["candidates"]:
         if c["error"]:
@@ -75,8 +106,9 @@ def build(item, sql_chars, prev_chars, doc_chars, reasoning="none", reasoning_ch
         parts.append(f"[{c['label']}]\nSQL:\n{c['sql'][:sql_chars]}\n{body}\n"
                      + reasoning_block(c, reasoning, reasoning_chars))
     doc = f"\nDocumentation provided with the question:\n{item['doc'][:doc_chars]}\n" if item["doc"] else ""
-    return PROMPT.format(question=item["question"], doc=doc,
-                         n=len(item["candidates"]), candidates="\n".join(parts))
+    tmpl = SHAPE_PROMPT if shape else PROMPT
+    return tmpl.format(question=item["question"], doc=doc,
+                       n=len(item["candidates"]), candidates="\n".join(parts))
 
 
 def main():
@@ -86,6 +118,9 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--trace-dir")
+    ap.add_argument("--shape", action="store_true",
+                    help="make the judge commit to the shape the QUESTION implies "
+                         "before choosing (uses no gold information)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--max-tokens", type=int, default=300)
@@ -114,7 +149,7 @@ def main():
     def one(iid):
         item = data[iid]
         prompt = build(item, args.sql_chars, args.preview_chars, args.doc_chars,
-                       args.reasoning, args.reasoning_chars)
+                       args.reasoning, args.reasoning_chars, shape=args.shape)
         try:
             r = client.chat.completions.create(
                 model=args.model, messages=[{"role": "user", "content": prompt}],

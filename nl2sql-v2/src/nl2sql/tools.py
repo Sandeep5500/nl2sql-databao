@@ -50,11 +50,29 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
            ["term"]),
         fn("submit_result",
            "Submit the stored result of a previous run_sql_query as the final answer. "
-           "Must be your only tool call in the message.",
+           "Must be your only tool call in the message. State the shape the QUESTION "
+           "asks for (not the shape your query happens to return) — if they disagree "
+           "the submission is refused and you get to fix it.",
            {"query_id": {"type": "string"},
             "result_description": {"type": "string",
-                                   "description": "One-sentence summary of the answer."}},
-           ["query_id", "result_description"]),
+                                   "description": "One-sentence summary of the answer."},
+            "expected_rows": {"type": "string",
+                              "description": "How many rows the QUESTION asks for: an "
+                                             "exact number like \"1\" when it asks for "
+                                             "a single thing (\"which X has the most "
+                                             "Y\", \"what is the total\"), or \"many\" "
+                                             "when it asks for a list or a per-group "
+                                             "breakdown."},
+            "expected_columns": {"type": "array", "items": {"type": "string"},
+                                 "description": "One short label per column the question "
+                                                "asks for, e.g. [\"category name\", "
+                                                "\"total hours\"]. Include identifying "
+                                                "columns (ids AND names) you grouped by."},
+            "confirm_shape": {"type": "boolean",
+                              "description": "Only after a refused submission: set true to "
+                                             "submit anyway when you are sure the shape is "
+                                             "right."}},
+           ["query_id", "result_description", "expected_rows", "expected_columns"]),
     ]
     if has_search:
         tools.append(fn(

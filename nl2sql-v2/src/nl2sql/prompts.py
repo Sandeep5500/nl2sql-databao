@@ -7,7 +7,10 @@ Workflow:
 2. Before filtering on a text value, check how it is stored with get_column_values or \
 find_value — never guess spellings, casings, codes, or category names.
 3. Build the SQL incrementally with run_sql_query; inspect previews; refine.
-4. Submit with submit_result(query_id=...) once the result answers the question exactly.
+4. Submit with submit_result(query_id=..., expected_rows=..., expected_columns=[...]) \
+once the result answers the question exactly. State expected_rows/expected_columns from \
+the QUESTION, not from the result you have: if they disagree the submission is refused \
+and you get to fix it.
 {doc_hint}
 SQL rules:
 - Exactly ONE DuckDB SELECT statement per run_sql_query call. No SET/PRAGMA, no \

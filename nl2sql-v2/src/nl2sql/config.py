@@ -60,6 +60,10 @@ class AgentConfig:
     keep_recent_turns: int = 5           # turns kept verbatim by memory compaction
     summary_max_tokens: int = 700        # [MEMORY] note budget
     find_value_max_columns: int = 200
+    # Refuse a submission that contradicts the shape the model said the question
+    # asks for. Self-consistency only: nothing here comes from the gold answer.
+    shape_check: bool = True
+    max_shape_refusals: int = 2         # then accept, so it cannot eat the budget
     # search | full | oracle | contract | sweep | sweep_contract
     # (arms A/B/C, then the two gold-SQL-free arms and their combination)
     context_mode: str = "search"

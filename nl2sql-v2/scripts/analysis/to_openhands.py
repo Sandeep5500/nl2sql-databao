@@ -37,6 +37,7 @@ Usage (from nl2sql-v2/):
 import argparse
 import glob
 import json
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -283,7 +284,15 @@ def main():
         dest.write_text(json.dumps(convert(
             t, comparisons.get((run, iid)),
             gold_sql_file.read_text() if gold_sql_file.exists() else ""), indent=1))
+        sc = [str(e.get("result") or "") for e in t.get("trace", [])
+              if e.get("tool") == "search_context"]
+        sc_err = sum(1 for r in sc if r.lstrip().upper().startswith("ERROR"))
         index.append({"run": run, "instance": iid,
+                      # Surfaced in the index because two runs of the same model differ
+                      # only by whether retrieval worked, and the episodes look alike.
+                      "search": ("unused" if not sc else
+                                 "BROKEN" if sc_err == len(sc) else
+                                 f"{len(sc) - sc_err}/{len(sc)} ok"),
                       "score": t.get("score"), "status": t.get("status"),
                       "detail": t.get("detail"),
                       "has_gold_diff": comparisons.get((run, iid)) is not None,
@@ -291,6 +300,27 @@ def main():
                       "question": t.get("question", "")[:160],
                       "path": f"{run}/{iid}.json"})
         n += 1
+    # Order runs newest first, by the most recent trace in each source directory, so
+    # a superseded run never sits above the current one. Two runs of the same model
+    # can differ only in whether retrieval worked and are otherwise indistinguishable.
+    # Group lanes and shards into one run family first ("q36s_pass4_k3" and
+    # "q36s_pass4_k4" are one run), otherwise only the single newest lane counts
+    # as current and its siblings look superseded.
+    def family(run: str) -> str:
+        return re.sub(r"_(k\d+|r\d+)?_?\d*$", "", run) or run
+
+    mtime = {}
+    for run in {r["run"] for r in index}:
+        files = list((TRACES_DIR / run).glob("local*.json"))
+        mtime[run] = max((f.stat().st_mtime for f in files), default=0)
+    fam_mtime = {}
+    for run, t in mtime.items():
+        fam_mtime[family(run)] = max(fam_mtime.get(family(run), 0), t)
+    newest = max(fam_mtime.values(), default=0)
+    for r in index:
+        r["recency"] = ("current" if fam_mtime[family(r["run"])] == newest
+                        else "superseded")
+    index.sort(key=lambda r: (-fam_mtime[family(r["run"])], r["run"], r["instance"]))
     (out_root / "index.json").write_text(json.dumps(index, indent=1))
     with_diff = sum(1 for r in index if r["has_gold_diff"])
     print(f"wrote {n} trajectories to {out_root}")
