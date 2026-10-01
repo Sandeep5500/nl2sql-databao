@@ -64,6 +64,7 @@ class AgentConfig:
     # asks for. Self-consistency only: nothing here comes from the gold answer.
     shape_check: bool = True
     max_shape_refusals: int = 2         # then accept, so it cannot eat the budget
+    shape_check_reserve: int = 6        # never refuse with fewer steps left than this
     # search | full | oracle | contract | sweep | sweep_contract
     # (arms A/B/C, then the two gold-SQL-free arms and their combination)
     context_mode: str = "search"

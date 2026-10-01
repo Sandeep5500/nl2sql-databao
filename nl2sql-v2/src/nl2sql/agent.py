@@ -27,6 +27,7 @@ class EpisodeResult:
     steps: int = 0
     critic_rounds: int = 0
     shape_refusals: int = 0
+    refused_qid: str = ""
     search_calls: int = 0
     error: str | None = None
     trace: list = field(default_factory=list)
@@ -230,13 +231,22 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
             # Self-consistency gate: refuse a result that contradicts the shape the
             # model itself said the question asks for. Capped, and overridable with
             # confirm_shape, so it can never spend the whole step budget.
-            if cfg.shape_check and not args.get("confirm_shape"):
+            # Never refuse so late that the model cannot recover: a refused
+            # submission that then runs out of steps becomes a `fallback`, and
+            # fallback episodes score far worse than submitted ones. Below the
+            # reserve we take the shape we are given.
+            steps_left = cfg.max_steps - step
+            if (cfg.shape_check and not args.get("confirm_shape")
+                    and steps_left >= cfg.shape_check_reserve):
                 complaint = shapecheck.check(
                     question, df, args.get("expected_rows"),
                     args.get("expected_columns"))
                 if complaint and result.shape_refusals < cfg.max_shape_refusals:
                     result.shape_refusals += 1
                     result.trace.append({"step": step, "shape_refusal": complaint})
+                    # Keep what it wanted to submit: if the episode now dies at the
+                    # step cap, this beats an arbitrary scratch query.
+                    result.refused_qid = str(args.get("query_id", ""))
                     messages.append({"role": "tool", "tool_call_id": submit_call.id,
                                      "content": complaint})
                     continue
@@ -287,7 +297,10 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
             if df_q is None or len(df_q) == 0:
                 continue
             clusters.setdefault(sig(df_q), []).append((int(qid[1:]), qid))
-        if clusters:
+        if result.refused_qid and result.refused_qid in session.query_results:
+            # It explicitly chose this one; only the shape gate stopped it.
+            qid = result.refused_qid
+        elif clusters:
             best = max(clusters.values(), key=lambda v: (len(v), max(x[0] for x in v)))
             qid = max(best)[1]
         else:
