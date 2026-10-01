@@ -48,7 +48,7 @@ class VLLMDescriptionProvider:
         base_url: str,
         model: str,
         temperature: float = 0.1,
-        max_tokens: int = 256,
+        max_tokens: int = 1024,  # 256 truncated the per-table critique YAML (~3% of descriptions cut)
         timeout: float = 120.0,
         max_retries: int = 3,
     ) -> None:
@@ -216,7 +216,7 @@ def run_enrichment(
         base_url=vllm_base_url,
         model=vllm_model,
         temperature=0.1,
-        max_tokens=256,
+        max_tokens=1024,
         timeout=120.0,
     )
     logger.info("vLLM description provider ready: %s @ %s", vllm_model, vllm_base_url)

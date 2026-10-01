@@ -10,6 +10,7 @@ Usage (from nl2sql-v2/):
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -104,20 +105,58 @@ def oracle_context(db: Database, info: dict) -> str:
     return "\n".join(parts)
 
 
-def schema_overview(db: Database, char_cap: int = 8_000) -> str:
-    """Databao-style compressed schema in the system prompt: table -> column names."""
+def schema_overview(db: Database, char_cap: int = 8_000, datasource: str | None = None,
+                    facts_cap: int = 5_000) -> str:
+    """Databao-style compressed schema in the system prompt: table -> column names,
+    plus SQL-verified structure (grain, joins, coarser keys) from profile_dce.py."""
+    prof = _load_profile(datasource)
+    grains = {k.lower(): v for k, v in (prof.get("natural_grains") or {}).items() if v}
+    for k, v in (prof.get("grains") or {}).items():
+        if v:
+            grains.setdefault(k.lower(), v)
     lines = []
     for t in db.list_tables():
         try:
             cols = [c for c, _, _ in db._columns(t)]
         except ValueError:
             continue
-        lines.append(f"{t}: {', '.join(cols)}")
+        g = grains.get(t.lower())
+        grain = f" [one row per {', '.join(g)}]" if g else ""
+        lines.append(f"{t}{grain}: {', '.join(cols)}")
     text = "\n".join(lines)
     if len(text) > char_cap:
         text = text[:char_cap] + "\n[overview truncated — use list_tables/describe_table]"
-    return ("\nSchema overview (columns per table; use describe_table for "
-            "types/samples):\n" + text)
+    out = ("\nSchema overview (columns per table; [one row per ...] is the table's verified "
+           "grain; use describe_table for types/samples):\n" + text)
+    facts = []
+    for j in prof.get("joins") or []:
+        if len(j["cols"]) > 1:
+            facts.append(f"- {j['child']} -> {j['parent']}: join on ALL of "
+                         f"({', '.join(j['cols'])}) [{j['card']}]")
+        else:
+            facts.append(f"- {j['child']}.{j['cols'][0]} -> {j['parent']}.{j['keys'][0]} [{j['card']}]")
+    for t, es in (prof.get("entity_keys") or {}).items():
+        for e in es:
+            facts.append(f"- {t}.{e['coarse']} groups {e['fine']} (~{e['ratio']:g} per value): "
+                         f"count/group by {e['coarse']} for the thing it identifies, not {e['fine']}")
+    if facts:
+        ft = "\n".join(facts)
+        if len(ft) > facts_cap:
+            ft = ft[:facts_cap] + "\n[truncated]"
+        out += ("\n\nVerified joins and keys (checked against the data; declared FKs are "
+                "not repeated):\n" + ft)
+    return out
+
+
+def _load_profile(datasource: str | None) -> dict:
+    """spider2-dce/profiles/<db>.json written by scripts/profile_dce.py ({} if absent)."""
+    if not datasource:
+        return {}
+    p = DCE_PROJECT_DIR / "profiles" / f"{Path(datasource).stem}.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def full_schema_dump(db: Database, char_cap: int = 60_000) -> str:
@@ -177,7 +216,7 @@ def main():
         sources = [DATA_SOURCES[n] for n in names]
 
     base_url = read_endpoint(args.endpoint)
-    client = OpenAI(base_url=base_url, api_key="EMPTY")
+    client = OpenAI(base_url=base_url, api_key=os.environ.get("VLLM_API_KEY", "EMPTY"))
     model = args.model or client.models.list().data[0].id
     print(f"endpoint={base_url} model={model} context_mode={args.context_mode}")
 
@@ -265,7 +304,7 @@ def main():
             elif args.context_mode == "oracle":
                 extra = oracle_context(db, oracle[iid])
             if args.schema_overview and args.context_mode == "search":
-                extra += schema_overview(db)
+                extra += schema_overview(db, datasource=resolve_datasource(db_name))
 
             draft = None
             if args.draft_endpoint and args.draft_model:

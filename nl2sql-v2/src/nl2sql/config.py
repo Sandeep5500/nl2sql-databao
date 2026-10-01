@@ -9,7 +9,8 @@ import os
 #   export NL2SQL_DATA_ROOT=/data/user_data/sandeep3/personal/nl2sql-databao
 REPO_ROOT = Path(os.environ.get("NL2SQL_DATA_ROOT",
                                 Path(__file__).resolve().parents[3]))
-SPIDER2_LITE = REPO_ROOT / "Spider2/spider2-lite"
+# NL2SQL_SPIDER2_LITE: use a Spider2 checkout elsewhere (e.g. when the submodule is empty)
+SPIDER2_LITE = Path(os.environ.get("NL2SQL_SPIDER2_LITE", REPO_ROOT / "Spider2/spider2-lite"))
 SQLITE_DIR = SPIDER2_LITE / "resource/databases/spider2-localdb"
 DOCS_DIR = SPIDER2_LITE / "resource/documents"
 QUESTIONS_FILE = SPIDER2_LITE / "spider2-lite.jsonl"
@@ -54,7 +55,7 @@ DATA_SOURCES: dict[str, DataSource] = {
 class LLMConfig:
     base_url: str
     model: str
-    api_key: str = "EMPTY"
+    api_key: str = field(default_factory=lambda: os.environ.get("VLLM_API_KEY", "EMPTY"))
     temperature: float = 0.0
     max_tokens: int = 4096
     timeout: float = 180.0

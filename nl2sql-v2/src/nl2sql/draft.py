@@ -2,6 +2,7 @@
 Arctic-Text2SQL-R1). The specialist sees the full schema and the agent's
 request; the agent verifies/refines the returned draft."""
 
+import os
 import re
 
 from openai import OpenAI
@@ -24,7 +25,7 @@ Think step by step, then output the final SQLite query in a ```sql code block.""
 class DraftSQL:
     def __init__(self, base_url: str, model: str, schema_text: str,
                  max_tokens: int = 8192, timeout: float = 600.0):
-        self.client = OpenAI(base_url=base_url, api_key="EMPTY", timeout=timeout)
+        self.client = OpenAI(base_url=base_url, api_key=os.environ.get("VLLM_API_KEY", "EMPTY"), timeout=timeout)
         self.model = model
         self.schema_text = schema_text
         self.max_tokens = max_tokens

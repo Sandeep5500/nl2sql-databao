@@ -55,7 +55,7 @@ def main():
 
     desc_provider = VLLMDescriptionProvider(
         base_url=f"http://{args.vllm_host}:{args.vllm_port}",
-        model=args.vllm_model, temperature=0.1, max_tokens=256, timeout=120.0)
+        model=args.vllm_model, temperature=0.1, max_tokens=1024, timeout=120.0)
 
     db_path = project_layout.db_path
     if not db_path.exists():
