@@ -35,6 +35,8 @@ EXTRA="${EXTRA:-}"
 REPEATS="${REPEATS:-1}"          # >1: repeat 0 is greedy, the rest sample at SAMPLE_TEMP
 SAMPLE_TEMP="${SAMPLE_TEMP:-0.7}"
 SKIP_HARVEST="${SKIP_HARVEST:-0}"  # set 1 when the model under test is not a teacher
+# AWQ/GPTQ checkpoints carry their own dtype; forcing bfloat16 makes vLLM refuse.
+DTYPE="${DTYPE:-auto}"
 export HF_HOME="${HF_HOME:-/data/user_data/$USER/.cache/huggingface}"
 LOG="$REPO/logs/teacher"; mkdir -p "$LOG"
 cd "$REPO"
@@ -57,7 +59,7 @@ fi
 "$VENV/bin/python" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --port "$PORT" --host 0.0.0.0 \
     --max-model-len 60000 --gpu-memory-utilization 0.92 \
-    --tensor-parallel-size "$TP" --dtype bfloat16 --trust-remote-code \
+    --tensor-parallel-size "$TP" --dtype "$DTYPE" --trust-remote-code \
     --enforce-eager --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     > "$LOG/vllm_${SLURM_JOB_ID}.log" 2>&1 &
