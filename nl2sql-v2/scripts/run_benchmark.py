@@ -140,12 +140,13 @@ def oracle_context(db: Database, info: dict) -> str:
 def schema_overview(db: Database, char_cap: int = 8_000) -> str:
     """Databao-style compressed schema in the system prompt: table -> column names."""
     lines = []
-    for t in db.list_tables():
+    views = set(db.list_views())
+    for t in db.list_tables() + sorted(views):
         try:
             cols = [c for c, _, _ in db._columns(t)]
         except ValueError:
             continue
-        lines.append(f"{t}: {', '.join(cols)}")
+        lines.append(f"{t}{' (view)' if t in views else ''}: {', '.join(cols)}")
     text = "\n".join(lines)
     if len(text) > char_cap:
         text = text[:char_cap] + "\n[overview truncated — use list_tables/describe_table]"

@@ -28,7 +28,7 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
                              "description": f"Rows to show (1-{cfg.preview_rows_max}). "
                                             f"Default {cfg.preview_rows_default}."}},
            ["sql"]),
-        fn("list_tables", "List all table names in the database.", {}, []),
+        fn("list_tables", "List all table and view names in the database.", {}, []),
         fn("describe_table",
            "Exact schema of one table: columns with types, nullability, distinct/null "
            "counts, row count, and 5 sample rows. Use this to verify columns before "
@@ -116,7 +116,8 @@ class ToolSession:
             self.query_results[qid] = (args["sql"], df)
             return f"query_id='{qid}'\n{csv}"
         if name == "list_tables":
-            return "\n".join(self.db.list_tables())
+            views = self.db.list_views()
+            return "\n".join(self.db.list_tables() + [f"{v} (view)" for v in views])
         if name == "describe_table":
             return self.db.describe_table(args["table"])
         if name == "get_column_values":

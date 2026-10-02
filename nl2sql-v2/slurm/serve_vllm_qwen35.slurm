@@ -28,6 +28,7 @@ VLLM_PORT="${VLLM_PORT:-8765}"
 MODEL="${MODEL:-Qwen/Qwen3.5-9B}"
 HF_HOME="/data/user_data/sandeep3/.cache/huggingface"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-60000}"
+DTYPE="${DTYPE:-bfloat16}"
 TP_SIZE="${TP_SIZE:-1}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_coder}"
 
@@ -77,7 +78,7 @@ HF_HOME="$HF_HOME" "$VENV_PYTHON" -m vllm.entrypoints.openai.api_server \
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization 0.92 \
     --tensor-parallel-size "$TP_SIZE" \
-    --dtype bfloat16 \
+    --dtype "$DTYPE" \
     --trust-remote-code \
     --enforce-eager \
     --enable-auto-tool-choice \
