@@ -44,7 +44,6 @@ Question: {question}
 Instructions:
 - Think step by step about which tables, joins, filters and computations are needed.
 - Check value formats shown in the sample rows before writing filters.
-- Return exactly the columns the question asks for — no extra id/helper columns.
 - End your answer with the final SQLite query in a ```sql code block.
 """
 

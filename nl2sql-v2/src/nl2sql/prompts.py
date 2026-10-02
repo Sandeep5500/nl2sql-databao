@@ -20,7 +20,6 @@ workarounds.
 NULL / COALESCE deliberately.
 
 Pre-submit checklist:
-- Does the column set match exactly what was asked (no extra id/helper columns)?
 - Row count plausible? Ordering/rounding as requested?
 - If the question asks for a single value, return a single row and column.
 
