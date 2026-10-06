@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Run the Spider 2.0-Lite local benchmark with the v2 harness.
+
+Usage (from nl2sql-v2/):
+    uv run python scripts/run_benchmark.py --instances local002,local007
+    uv run python scripts/run_benchmark.py --output ../results/v2.csv \
+        --trace-dir ../logs/traces/v2_run --context-mode search
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from openai import OpenAI
+
+from nl2sql.agent import run_episode
+from nl2sql.config import (AgentConfig, CriticConfig, DCE_PROJECT_DIR, DOCS_DIR,
+                           LLMConfig, QUESTIONS_FILE, SQLITE_DIR,
+                           VLLM_ENDPOINT_FILE)
+from nl2sql.context import SearchContext, TableContext
+from nl2sql.db import Database
+from nl2sql.eval import load_eval_standards, score_against_gold
+from nl2sql.rubric import load_rubric, render_rubric
+from nl2sql.tools import ToolSession
+
+
+def load_questions(instances=None, skip=None, limit=None):
+    out = []
+    with open(QUESTIONS_FILE) as f:
+        for line in f:
+            q = json.loads(line)
+            iid = q["instance_id"]
+            if not iid.startswith("local"):
+                continue
+            if instances and iid not in instances:
+                continue
+            if skip and iid in skip:
+                continue
+            out.append(q)
+    return out[:limit] if limit else out
+
+
+def read_endpoint(cli_endpoint):
+    ep = cli_endpoint
+    if not ep:
+        if not VLLM_ENDPOINT_FILE.exists():
+            raise SystemExit("no vLLM endpoint: pass --endpoint or start serve_vllm.slurm")
+        ep = VLLM_ENDPOINT_FILE.read_text().splitlines()[0].strip()  # "host:port"
+    if not ep.startswith("http"):
+        ep = f"http://{ep}"
+    if not ep.rstrip("/").endswith("/v1"):
+        ep = ep.rstrip("/") + "/v1"
+    return ep
+
+
+INFRA_ERROR_MARKERS = ("Connection error", "timed out", "Timeout", "502", "503",
+                       "504", "Service Unavailable", "Bad Gateway")
+
+
+def is_infra_error(err: str | None) -> bool:
+    return bool(err) and err.startswith("llm_call") and \
+        any(m in err for m in INFRA_ERROR_MARKERS)
+
+
+def wait_for_services(base_url: str, ollama_host: str | None,
+                      max_wait_s: int = 4 * 3600, poll_s: int = 30) -> None:
+    """Block until vLLM (and Ollama, when search is on) answer health checks.
+
+    A preempted/requeued or crashed server otherwise turns every remaining
+    question into an instant 'Connection error' row that looks like a real
+    model failure."""
+    import urllib.request
+    checks = [("vLLM", base_url.rstrip("/") + "/models")]
+    if ollama_host:
+        checks.append(("Ollama", f"http://{ollama_host}:11434/api/tags"))
+    waited = 0
+    while True:
+        down = []
+        for name, url in checks:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as r:
+                    if r.status != 200:
+                        down.append(name)
+            except Exception:
+                down.append(name)
+        if not down:
+            if waited:
+                print(f"[services back after {waited // 60} min] ", end="", flush=True)
+            return
+        if waited == 0:
+            print(f"\n[waiting for {', '.join(down)} to come back] ", end="", flush=True)
+        if waited >= max_wait_s:
+            raise SystemExit(f"{', '.join(down)} down for {max_wait_s // 3600}h; giving up")
+        time.sleep(poll_s)
+        waited += poll_s
+
+
+def resolve_datasource(db_name: str) -> str | None:
+    """Map a question's db name to a DCE datasource id, or None if unenriched.
+
+    Question db names ('E_commerce', 'Db-IMDB') differ from DCE yaml names
+    ('e_commerce', 'db_imdb'): lowercase with non-alnum folded to underscore.
+    v1 used db_name.lower() and silently lost search for 4 DBs (23 questions).
+    """
+    norm = re.sub(r"[^a-z0-9]", "_", db_name.lower())
+    for cand in (db_name, db_name.lower(), norm):
+        if (DCE_PROJECT_DIR / "output" / "databases" / f"{cand}.yaml").exists():
+            return f"databases/{cand}.yaml"
+    return None
+
+
+def oracle_context(db: Database, info: dict) -> str:
+    """Arm C: inject gold tables + (schema-verified) gold columns."""
+    real_cols = set()
+    for t in info["tables"]:
+        try:
+            real_cols.update(c for c, _, _ in db._columns(t))
+        except ValueError:
+            pass
+    cols = [c for c in info["columns"] if c in real_cols]
+    parts = ["\nThe correct answer is known to use these tables: "
+             + ", ".join(info["tables"]) + "."]
+    if cols:
+        parts.append("Relevant columns: " + ", ".join(cols) + ".")
+    parts.append("Details of those tables:\n")
+    for t in info["tables"]:
+        try:
+            parts.append(db.describe_table(t))
+        except Exception as e:
+            parts.append(f"table {t}: describe failed ({e})")
+    return "\n".join(parts)
+
+
+def schema_overview(db: Database, char_cap: int = 8_000) -> str:
+    """Databao-style compressed schema in the system prompt: table -> column names."""
+    lines = []
+    views = set(db.list_views())
+    for t in db.list_tables() + sorted(views):
+        try:
+            cols = [c for c, _, _ in db._columns(t)]
+        except ValueError:
+            continue
+        lines.append(f"{t}{' (view)' if t in views else ''}: {', '.join(cols)}")
+    text = "\n".join(lines)
+    if len(text) > char_cap:
+        text = text[:char_cap] + "\n[overview truncated — use list_tables/describe_table]"
+    return ("\nSchema overview (columns per table; use describe_table for "
+            "types/samples):\n" + text)
+
+
+def full_schema_dump(db: Database, char_cap: int = 60_000) -> str:
+    parts = []
+    for t in db.list_tables():
+        try:
+            parts.append(db.describe_table(t))
+        except Exception as e:
+            parts.append(f"table: {t} (describe failed: {e})")
+    text = "\n\n".join(parts)
+    if len(text) > char_cap:
+        text = text[:char_cap] + "\n[schema dump truncated]"
+    return "\nFull database schema:\n" + text
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--endpoint", help="vLLM base URL (default: logs/vllm_endpoint.txt)")
+    ap.add_argument("--model", default=None, help="model name (default: first served model)")
+    ap.add_argument("--instances", help="comma-separated instance ids")
+    ap.add_argument("--skip-instances", help="comma-separated ids to skip")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--output", default="../results/v2_run.csv")
+    ap.add_argument("--trace-dir")
+    ap.add_argument("--context-mode", choices=["search", "full", "oracle"],
+                    default="search")
+    ap.add_argument("--schema-overview", action="store_true",
+                    help="inject compressed table->columns overview into the "
+                         "system prompt (databao v1 style)")
+    ap.add_argument("--no-expansion", action="store_true",
+                    help="disable query expansion in search_context")
+    ap.add_argument("--critic-endpoint")
+    ap.add_argument("--critic-model")
+    ap.add_argument("--draft-endpoint",
+                    help="specialist SQL model endpoint for the draft_sql tool")
+    ap.add_argument("--draft-model")
+    ap.add_argument("--max-steps", type=int, default=30)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--text-sql-fallback", action="store_true",
+                    help="execute ```sql blocks from replies of models without "
+                         "tool training (e.g. Arctic as actor)")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip instances already in --output and append to it")
+    ap.add_argument("--thinking", action="store_true",
+                    help="let the model reason before each step (Qwen "
+                         "enable_thinking); slower, reasoning is kept in the trace")
+    ap.add_argument("--plain-describe", action="store_true",
+                    help="describe_table without the context engine's keys and "
+                         "notes (the behaviour before Oct 2026)")
+    ap.add_argument("--rubric-confident-only", action="store_true",
+                    help="use a question's rubric only when it states an exact row "
+                         "count with high confidence; otherwise add nothing")
+    ap.add_argument("--rubric-dir",
+                    help="directory of per-question output-shape rubrics from "
+                         "scripts/run_rubric.py; appended to the system prompt")
+    args = ap.parse_args()
+
+    base_url = read_endpoint(args.endpoint)
+    client = OpenAI(base_url=base_url, api_key="EMPTY")
+    model = args.model or client.models.list().data[0].id
+    print(f"endpoint={base_url} model={model} context_mode={args.context_mode}")
+
+    llm = LLMConfig(base_url=base_url, model=model,
+                    temperature=args.temperature,
+                    chat_template_kwargs={"enable_thinking": args.thinking}
+                    if "qwen" in model.lower() else {})
+    if args.thinking:
+        # reasoning tokens count against the completion budget
+        llm.max_tokens, llm.timeout = 12_000, 900.0
+    cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
+                      expansion_queries=0 if args.no_expansion else 3,
+                      text_sql_fallback=args.text_sql_fallback)
+    critic = CriticConfig(enabled=bool(args.critic_model),
+                          base_url=args.critic_endpoint, model=args.critic_model,
+                          chat_template_kwargs={"enable_thinking": False}
+                          if args.critic_model and "qwen" in args.critic_model.lower()
+                          else {})
+
+    questions = load_questions(
+        set(args.instances.split(",")) if args.instances else None,
+        set(args.skip_instances.split(",")) if args.skip_instances else None,
+        args.limit)
+
+    oracle = {}
+    if args.context_mode == "oracle":
+        oracle_path = Path(__file__).resolve().parents[1] / "oracle_context.json"
+        if not oracle_path.exists():
+            raise SystemExit("run scripts/build_oracle_context.py first")
+        oracle = json.loads(oracle_path.read_text())
+        questions = [q for q in questions if q["instance_id"] in oracle]
+        print(f"oracle mode: restricted to {len(questions)} instances with gold SQL")
+    standards = load_eval_standards()
+    trace_dir = Path(args.trace_dir) if args.trace_dir else None
+    if trace_dir:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["instance_id", "db", "score", "score_detail", "status", "steps",
+                  "critic_rounds", "search_calls", "draft_calls", "wall_seconds",
+                  "sql"]
+    correct = 0
+    if args.resume and out_path.exists():
+        prior = list(csv.DictReader(open(out_path)))
+        done_ids = {r["instance_id"] for r in prior}
+        correct = sum(1 for r in prior if r.get("score") == "1")
+        questions = [q for q in questions if q["instance_id"] not in done_ids]
+        print(f"resume: {len(done_ids)} already done ({correct} correct), "
+              f"{len(questions)} remaining")
+        mode, write_header = "a", False
+    else:
+        mode, write_header = "w", True
+    with open(out_path, mode, newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        for i, q in enumerate(questions):
+            iid, db_name = q["instance_id"], q["db"]
+            print(f"[{i + 1}/{len(questions)}] {iid} ({db_name}) ... ",
+                  end="", flush=True)
+            db_path = SQLITE_DIR / f"{db_name}.sqlite"
+            if not db_path.exists():
+                writer.writerow({"instance_id": iid, "db": db_name, "score": 0,
+                                 "score_detail": "db_not_found"})
+                print("db_not_found")
+                continue
+
+            db = Database(db_path)
+            doc = None
+            if q.get("external_knowledge"):
+                p = DOCS_DIR / q["external_knowledge"]
+                doc = p.read_text() if p.exists() else None
+            search = None
+            table_context = None
+            extra = ""
+            if args.context_mode == "search":
+                ds = resolve_datasource(db_name)
+                if ds and not args.plain_describe:
+                    table_context = TableContext(DCE_PROJECT_DIR, ds)
+                if ds:
+                    search = SearchContext(DCE_PROJECT_DIR, ds,
+                                           expansion_client=client,
+                                           expansion_model=model)
+                else:
+                    print(f"[warn: no DCE enrichment for {db_name}; "
+                          f"search_context disabled] ", end="")
+            elif args.context_mode == "full":
+                extra = full_schema_dump(db)
+            elif args.context_mode == "oracle":
+                extra = oracle_context(db, oracle[iid])
+            if args.schema_overview and args.context_mode == "search":
+                extra += schema_overview(db)
+
+            if args.rubric_dir:
+                rubric = load_rubric(args.rubric_dir, iid)
+                if rubric and args.rubric_confident_only and not (
+                        rubric.get("rows_confidence") == "high"
+                        and rubric.get("exact_rows") is not None):
+                    rubric = None
+                if rubric:
+                    extra += "\n" + render_rubric(rubric)
+
+            draft = None
+            if args.draft_endpoint and args.draft_model:
+                from run_single_shot import build_schema
+                from nl2sql.draft import DraftSQL
+                draft = DraftSQL(args.draft_endpoint, args.draft_model,
+                                 build_schema(db_path))
+                extra += ("\nA specialist SQL model is available via the draft_sql "
+                          "tool. Call it EARLY with the full question to get a "
+                          "strong draft, then verify and refine it yourself before "
+                          "submitting.")
+
+            ollama_host = os.environ.get("DCE_OLLAMA_HOST") if search else None
+            try:
+                for attempt in range(2):
+                    wait_for_services(base_url, ollama_host)
+                    session = ToolSession(db=db, cfg=cfg, search=search,
+                                          table_context=table_context,
+                                          doc_text=doc, draft=draft)
+                    result = run_episode(q["question"], session, llm, cfg, critic,
+                                         extra_context=extra)
+                    if not is_infra_error(result.error):
+                        break
+                    print("[infra error, retrying question] ", end="", flush=True)
+                else:
+                    # Still failing on infrastructure: record nothing, so the
+                    # restart wrapper + --resume retries this question later.
+                    raise SystemExit(f"infrastructure error on {iid}: {result.error}")
+            finally:
+                db.close()
+
+            if result.pred_df is not None:
+                score, detail = score_against_gold(result.pred_df, iid, standards)
+            else:
+                score, detail = 0, result.error or result.status
+            correct += score
+            writer.writerow({
+                "instance_id": iid, "db": db_name, "score": score,
+                "score_detail": detail, "status": result.status,
+                "steps": result.steps, "critic_rounds": result.critic_rounds,
+                "search_calls": result.search_calls,
+                "draft_calls": session.draft_calls,
+                "wall_seconds": round(result.wall_seconds, 1),
+                "sql": (result.sql or "").replace("\n", "\\n")})
+            f.flush()
+            print(f"{'✓' if score else '✗'} {detail} "
+                  f"({result.steps} steps, {result.wall_seconds:.0f}s)")
+
+            if trace_dir:
+                with open(trace_dir / f"{iid}.json", "w") as tf:
+                    json.dump({"instance_id": iid, "question": q["question"],
+                               "status": result.status, "score": score,
+                               "detail": detail, "sql": result.sql,
+                               "system": result.system,
+                               "trace": result.trace}, tf, indent=2, default=str)
+
+    total_rows = len(list(csv.DictReader(open(out_path))))
+    print(f"\n{correct}/{total_rows} correct "
+          f"({100 * correct // max(total_rows, 1)}%) → {out_path}")
+
+    if trace_dir:
+        try:
+            from traces_to_inspect import convert
+            convert(trace_dir, out_path, model)
+        except Exception as e:
+            print(f"inspect-log conversion failed (non-fatal): {e}")
+
+
+if __name__ == "__main__":
+    main()

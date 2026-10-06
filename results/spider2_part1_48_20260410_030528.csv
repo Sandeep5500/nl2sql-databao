@@ -1,0 +1,1064 @@
+instance_id,db,question,external_knowledge,predicted_sql,execution_result,score,score_detail,error,time_s
+local002,E_commerce,"Can you calculate the 5-day symmetric moving average of predicted toy sales for December 5 to 8, 2018, using daily sales data from January 1, 2017, to August 29, 2018, with a simple linear regression model? Finally provide the sum of those four 5-day moving averages?",,"WITH toy_sales AS (
+    SELECT 
+        DATE(o.order_purchase_timestamp) as sale_date,
+        COUNT(DISTINCT oi.order_id) as daily_sales_count,
+        SUM(oi.price) as daily_sales_value
+    FROM e_commerce.main.order_items oi
+    JOIN e_commerce.main.orders o ON oi.order_id = o.order_id
+    JOIN e_commerce.main.products p ON oi.product_id = p.product_id
+    JOIN e_commerce.main.product_category_name_translation t ON p.product_category_name = t.product_category_name
+    WHERE t.product_category_name_english = 'toys'
+        AND DATE(o.order_purchase_timestamp) >= '2017-01-01'
+        AND DATE(o.order_purchase_timestamp) <= '2018-08-29'
+    GROUP BY DATE(o.order_purchase_timestamp)
+),
+regression_data AS (
+    SELECT 
+        sale_date,
+        daily_sales_value,
+        EXTRACT(DOY FROM sale_date) + (EXTRACT(YEAR FROM sale_date) - 2017) * 365 as day_number
+    FROM toy_sales
+),
+regression_model AS (
+    SELECT 
+        REGR_SLOPE(daily_sales_value, day_number) as slope,
+        REGR_INTERCEPT(daily_sales_value, day_number) as intercept
+    FROM regression_data
+),
+predicted_sales AS (
+    SELECT 
+        '2018-12-05'::DATE as sale_date,
+        slope * (EXTRACT(DOY FROM '2018-12-05'::DATE) + (2018 - 2017) * 365) + intercept as predicted_value
+    FROM regression_model
+    UNION ALL
+    SELECT 
+        '2018-12-06'::DATE as sale_date,
+        slope * (EXTRACT(DOY FROM '2018-12-06'::DATE) + (2018 - 2017) * 365) + intercept as predicted_value
+    FROM regression_model
+    UNION ALL
+    SELECT 
+        '2018-12-07'::DATE as sale_date,
+        slope * (EXTRACT(DOY FROM '2018-12-07'::DATE) + (2018 - 2017) * 365) + intercept as predicted_value
+    FROM regression_model
+    UNION ALL
+    SELECT 
+        '2018-12-08'::DATE as sale_date,
+        slope * (EXTRACT(DOY FROM '2018-12-08'::DATE) + (2018 - 2017) * 365) + intercept as predicted_value
+    FROM regression_model
+),
+moving_average AS (
+    SELECT 
+        sale_date,
+        predicted_value,
+        AVG(predicted_value) OVER (
+            ORDER BY sale_date
+            ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING
+        ) as five_day_symmetric_avg
+    FROM predicted_sales
+)
+SELECT 
+    SUM(five_day_symmetric_avg) as total_sum_of_averages
+FROM moving_average",1 rows,1,matches local002_c.csv,,1177.49
+local003,E_commerce,"According to the RFM definition document, calculate the average sales per order for each customer within distinct RFM segments, considering only 'delivered' orders. Use the customer unique identifier. Clearly define how to calculate Recency based on the latest purchase timestamp and specify the criteria for classifying RFM segments. The average sales should be computed as the total spend divided by the total number of orders. Please analyze and report the differences in average sales across the RFM segments",RFM.md,"WITH customer_orders AS (
+  -- Calculate total spend per order and join with customers
+  SELECT 
+    o.order_id,
+    o.customer_id,
+    cu.customer_unique_id,
+    o.order_purchase_timestamp,
+    o.order_status,
+    SUM(oi.price + oi.freight_value) AS order_total,
+    COUNT(*) AS order_count
+  FROM e_commerce.main.orders o
+  JOIN e_commerce.main.order_items oi ON o.order_id = oi.order_id
+  JOIN e_commerce.main.customers cu ON o.customer_id = cu.customer_id
+  WHERE o.order_status = 'delivered'
+  GROUP BY o.order_id, o.customer_id, cu.customer_unique_id, o.order_purchase_timestamp, o.order_status
+),
+customer_rfm AS (
+  -- Calculate RFM metrics per customer
+  SELECT 
+    customer_unique_id,
+    -- Recency: days since last purchase (lower = more recent)
+    EXTRACT(DAY FROM AGE(CURRENT_DATE::DATE, MAX(order_purchase_timestamp)::DATE)) AS recency_days,
+    -- Frequency: number of orders
+    COUNT(DISTINCT order_id) AS frequency,
+    -- Monetary: total spend
+    SUM(order_total) AS monetary
+  FROM customer_orders
+  GROUP BY customer_unique_id
+),
+rfm_scores AS (
+  -- Score each dimension (1-5) using NTILE(5) for percentiles
+  SELECT 
+    customer_unique_id,
+    -- R score: 1 = most recent, 5 = least recent
+    NTILE(5) OVER (ORDER BY recency_days ASC) AS r_score,
+    -- F score: 1 = most frequent, 5 = least frequent
+    NTILE(5) OVER (ORDER BY frequency DESC) AS f_score,
+    -- M score: 1 = highest spending, 5 = lowest spending
+    NTILE(5) OVER (ORDER BY monetary DESC) AS m_score
+  FROM customer_rfm
+),
+rfm_segments AS (
+  -- Apply RFM segmentation logic
+  SELECT 
+    customer_unique_id,
+    r_score,
+    f_score,
+    m_score,
+    -- Calculate F+M score for segmentation
+    f_score + m_score AS fm_score,
+    CASE 
+      -- Champions: R=1 and F+M between 1-4
+      WHEN r_score = 1 AND fm_score BETWEEN 1 AND 4 THEN 'Champions'
+      -- Can't Lose Them: R=4 or 5 and F+M between 1-2
+      WHEN r_score IN (4, 5) AND fm_score BETWEEN 1 AND 2 THEN 'Can_t_Lose_Them'
+      -- Hibernating: R=4 or 5 and F+M between 3-6
+      WHEN r_score IN (4, 5) AND fm_score BETWEEN 3 AND 6 THEN 'Hibernating'
+      -- Lost: R=4 or 5 and F+M between 7-10
+      WHEN r_score IN (4, 5) AND fm_score BETWEEN 7 AND 10 THEN 'Lost'
+      -- Loyal Customers: R=2 or 3 and F+M between 1-4
+      WHEN r_score IN (2, 3) AND fm_score BETWEEN 1 AND 4 THEN 'Loyal_Customers'
+      -- Needs Attention: R=3 and F+M between 5-6
+      WHEN r_score = 3 AND fm_score BETWEEN 5 AND 6 THEN 'Needs_Attention'
+      -- Recent Users: R=1 and F+M between 7-8
+      WHEN r_score = 1 AND fm_score BETWEEN 7 AND 8 THEN 'Recent_Users'
+      -- Potential Loyalists: R=1 and F+M between 5-6 OR R=2 and F+M between 5-8
+      WHEN (r_score = 1 AND fm_score BETWEEN 5 AND 6) OR (r_score = 2 AND fm_score BETWEEN 5 AND 8) THEN 'Potential_Loyalists'
+      -- Price Sensitive: R=1 and F+M between 9-10
+      WHEN r_score = 1 AND fm_score BETWEEN 9 AND 10 THEN 'Price_Sensitive'
+      -- Promising: R=2 and F+M between 9-10
+      WHEN r_score = 2 AND fm_score BETWEEN 9 AND 10 THEN 'Promising'
+      -- About to Sleep: R=3 and F+M between 7-10
+      WHEN r_score = 3 AND fm_score BETWEEN 7 AND 10 THEN 'About_to_Sleep'
+      ELSE 'Other'
+    END AS rfm_segment
+  FROM rfm_scores
+),
+segment_metrics AS (
+  -- Calculate total spend and order count per segment
+  SELECT 
+    rfm_segment,
+    COUNT(DISTINCT c.customer_unique_id) AS customer_count,
+    SUM(c.order_total) AS total_spend,
+    SUM(c.order_count) AS total_orders
+  FROM customer_orders c
+  JOIN rfm_segments r ON c.customer_unique_id = r.customer_unique_id
+  GROUP BY rfm_segment
+)
+-- Calculate average sales per order for each segment
+SELECT 
+  rfm_segment,
+  customer_count,
+  total_orders,
+  total_spend,
+  -- Average sales per order = total spend / total orders
+  100 * total_spend / total_orders AS average_sales_per_order
+FROM segment_metrics
+WHERE rfm_segment != 'Other'
+ORDER BY average_sales_per_order DESC;",11 rows,0,result_mismatch,,736.87
+local004,E_commerce,"Could you tell me the number of orders, average payment per order and customer lifespan in weeks of the 3 custumers with the highest average payment per order, where the lifespan is calculated by subtracting the earliest purchase date from the latest purchase date in days, dividing by seven, and if the result is less than seven days, setting it to 1.0?",,"WITH customer_stats AS (
+    SELECT 
+        o.customer_id,
+        COUNT(DISTINCT o.order_id) AS order_count,
+        AVG(p.payment_value) AS avg_payment_per_order,
+        MIN(TRY_CAST(o.order_purchase_timestamp AS DATE)) AS earliest_purchase_date,
+        MAX(TRY_CAST(o.order_purchase_timestamp AS DATE)) AS latest_purchase_date
+    FROM e_commerce.main.orders o
+    JOIN e_commerce.main.order_payments p ON o.order_id = p.order_id
+    WHERE o.order_purchase_timestamp IS NOT NULL
+      AND p.payment_value IS NOT NULL
+    GROUP BY o.customer_id
+),
+customer_lifespan AS (
+    SELECT 
+        customer_id,
+        order_count,
+        avg_payment_per_order,
+        CASE 
+            WHEN (latest_purchase_date - earliest_purchase_date) < 7 
+            THEN 1.0
+            ELSE (latest_purchase_date - earliest_purchase_date) / 7.0
+        END AS customer_lifespan_weeks
+    FROM customer_stats
+)
+SELECT 
+    customer_id,
+    order_count,
+    avg_payment_per_order,
+    customer_lifespan_weeks
+FROM customer_lifespan
+ORDER BY avg_payment_per_order DESC
+LIMIT 3",3 rows,0,result_mismatch,,208.88
+local007,Baseball,"Could you help me calculate the average single career span value in years for all baseball players? Please precise the result as a float number. First, calculate the difference in years, months, and days between the debut and final game dates. For each player, the career span is computed as the sum of the absolute number of years, plus the absolute number of months divided by 12, plus the absolute number of days divided by 365. Round each part to two decimal places before summing. Finally, average the career spans and round the result to a float number.",,"SELECT 
+  ROUND(AVG(
+    ROUND(years, 2) + ROUND(months / 12, 2) + ROUND(days / 365, 2)
+  ), 2) AS average_career_span_years
+FROM (
+  SELECT 
+    EXTRACT(YEAR FROM age(TRY_CAST(final_game AS DATE), TRY_CAST(debut AS DATE))) AS years,
+    EXTRACT(MONTH FROM age(TRY_CAST(final_game AS DATE), TRY_CAST(debut AS DATE))) AS months,
+    EXTRACT(DAY FROM age(TRY_CAST(final_game AS DATE), TRY_CAST(debut AS DATE))) AS days
+  FROM baseball.main.player
+  WHERE debut IS NOT NULL 
+    AND final_game IS NOT NULL 
+    AND debut != '' 
+    AND final_game != ''
+) AS career_durations
+WHERE years IS NOT NULL AND months IS NOT NULL AND days IS NOT NULL",1 rows,1,matches local007_c.csv,,219.29
+local008,Baseball,"I would like to know the given names of baseball players who have achieved the highest value of games played, runs, hits, and home runs, with their corresponding score values.",,"WITH max_values AS (
+    SELECT 
+        CAST((SELECT MAX(g) FROM baseball.main.batting WHERE g IS NOT NULL AND g != '') AS DOUBLE) as max_games,
+        CAST((SELECT MAX(r) FROM baseball.main.batting WHERE r IS NOT NULL AND r != '') AS DOUBLE) as max_runs,
+        CAST((SELECT MAX(h) FROM baseball.main.batting WHERE h IS NOT NULL AND h != '') AS DOUBLE) as max_hits,
+        CAST((SELECT MAX(hr) FROM baseball.main.batting WHERE hr IS NOT NULL AND hr != '') AS DOUBLE) as max_home_runs
+)
+SELECT 
+    p.name_first,
+    p.name_last,
+    b.g as games_played,
+    b.r as runs,
+    b.h as hits,
+    b.hr as home_runs,
+    -- Normalize each metric to 0-100 scale
+    CASE WHEN mv.max_games > 0 
+         THEN 100 * (TRY_CAST(b.g AS DOUBLE) / mv.max_games) 
+         ELSE 0 END as games_score,
+    CASE WHEN mv.max_runs > 0 
+         THEN 100 * (TRY_CAST(b.r AS DOUBLE) / mv.max_runs) 
+         ELSE 0 END as runs_score,
+    CASE WHEN mv.max_hits > 0 
+         THEN 100 * (TRY_CAST(b.h AS DOUBLE) / mv.max_hits) 
+         ELSE 0 END as hits_score,
+    CASE WHEN mv.max_home_runs > 0 
+         THEN 100 * (TRY_CAST(b.hr AS DOUBLE) / mv.max_home_runs) 
+         ELSE 0 END as home_runs_score,
+    -- Combined score (sum of normalized values)
+    CASE WHEN mv.max_games > 0 
+         THEN 100 * (TRY_CAST(b.g AS DOUBLE) / mv.max_games) +
+              100 * (TRY_CAST(b.r AS DOUBLE) / mv.max_runs) +
+              100 * (TRY_CAST(b.h AS DOUBLE) / mv.max_hits) +
+              100 * (TRY_CAST(b.hr AS DOUBLE) / mv.max_home_runs)
+         ELSE 0 END as total_score
+FROM baseball.main.batting b
+JOIN baseball.main.player p ON b.player_id = p.player_id
+CROSS JOIN max_values mv
+WHERE b.g IS NOT NULL AND b.r IS NOT NULL AND b.h IS NOT NULL AND b.hr IS NOT NULL
+ORDER BY total_score DESC
+LIMIT 20",20 rows,0,result_mismatch,,773.1
+local009,Airlines,What is the distance of the longest route where Abakan is either the departure or destination city (in kilometers)?,haversine_formula.md,"WITH flight_routes AS (
+  SELECT 
+    f.flight_id,
+    f.departure_airport,
+    f.arrival_airport,
+    d1.city AS from_city,
+    d2.city AS to_city,
+    d1.coordinates AS from_coords,
+    d2.coordinates AS to_coords
+  FROM airlines.flights f
+  JOIN airlines.airports_data d1 ON f.departure_airport = d1.airport_code
+  JOIN airlines.airports_data d2 ON f.arrival_airport = d2.airport_code
+  WHERE d1.city LIKE '%Abakan%' OR d2.city LIKE '%Abakan%'
+),
+route_distances AS (
+  SELECT 
+    flight_id,
+    departure_airport,
+    arrival_airport,
+    from_city,
+    to_city,
+    -- Parse coordinates by removing parentheses and splitting
+    TRY_CAST(string_split(regexp_replace(from_coords, '[()]', '', 'g'), ',')[1] AS DOUBLE) AS from_lon,
+    TRY_CAST(string_split(regexp_replace(from_coords, '[()]', '', 'g'), ',')[2] AS DOUBLE) AS from_lat,
+    TRY_CAST(string_split(regexp_replace(to_coords, '[()]', '', 'g'), ',')[1] AS DOUBLE) AS to_lon,
+    TRY_CAST(string_split(regexp_replace(to_coords, '[()]', '', 'g'), ',')[2] AS DOUBLE) AS to_lat,
+    -- Calculate distance using Haversine formula
+    2 * 6371 * ASIN(
+      SQRT(
+        POWER(SIN((to_lat - from_lat) * PI() / 180 / 2), 2) +
+        COS(from_lat * PI() / 180) * COS(to_lat * PI() / 180) *
+        POWER(SIN((to_lon - from_lon) * PI() / 180 / 2), 2)
+      )
+    ) AS distance_km
+  FROM flight_routes
+  WHERE from_coords IS NOT NULL AND to_coords IS NOT NULL
+)
+SELECT 
+  MAX(distance_km) AS longest_route_distance_km
+FROM route_distances",1 rows,1,matches local009_a.csv,,594.75
+local010,Airlines,"Distribute all the unique city pairs into the distance ranges 0, 1000, 2000, 3000, 4000, 5000, and 6000+, based on their average distance of all routes between them. Then how many pairs are there in the distance range with the fewest unique city paires?",haversine_formula.md,,agent_error,0,agent_error,"Error code: 400 - {'error': {'message': ""This model's maximum context length is 50000 tokens. However, you requested 4096 output tokens and your prompt contains at least 45905 input tokens, for a total of at least 50001 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=45905)"", 'type': 'BadRequestError', 'param': 'input_tokens', 'code': 400}}",1435.17
+local015,California_Traffic_Collision,"Please calculate the fatality rate for motorcycle collisions, separated by helmet usage. Specifically, calculate two percentages: 1) the percentage of motorcyclist fatalities in collisions where parties (drivers or passengers) were wearing helmets, and 2) the percentage of motorcyclist fatalities in collisions where parties were not wearing helmets. For each group, compute this by dividing the total number of motorcyclist fatalities by the total number of collisions involving that group. Use the parties table to determine helmet usage (from party_safety_equipment fields).",,"WITH motorcycle_collisions AS (
+  SELECT 
+    c.case_id,
+    c.motorcyclist_killed_count,
+    CASE 
+      WHEN p.party_safety_equipment_1 LIKE '%helmet%' OR p.party_safety_equipment_2 LIKE '%helmet%' THEN 'helmet used'
+      WHEN p.party_safety_equipment_1 LIKE '%helmet not used%' OR p.party_safety_equipment_2 LIKE '%helmet not used%' THEN 'helmet not used'
+      ELSE 'unknown'
+    END AS helmet_status
+  FROM california_traffic_collision.main.collisions c
+  LEFT JOIN california_traffic_collision.main.parties p ON c.case_id = p.case_id
+  WHERE c.motorcycle_collision = 1
+),
+helmet_groups AS (
+  SELECT 
+    helmet_status,
+    COUNT(*) FILTER (WHERE helmet_status IS NOT NULL) AS collision_count,
+    SUM(motorcyclist_killed_count) FILTER (WHERE helmet_status IS NOT NULL) AS fatalities
+  FROM motorcycle_collisions
+  WHERE helmet_status IS NOT NULL
+  GROUP BY helmet_status
+)
+SELECT 
+  helmet_status,
+  collision_count,
+  fatalities,
+  CASE 
+    WHEN collision_count > 0 THEN ROUND(100.0 * fatalities / collision_count, 2)
+    ELSE NULL
+  END AS fatality_rate_percentage
+FROM helmet_groups
+ORDER BY helmet_status",2 rows,0,result_mismatch,,397.01
+local017,California_Traffic_Collision,In which year were the two most common causes of traffic accidents different from those in other years?,,,agent_error,0,agent_error,"Recursion limit of 60 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.
+For troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",613.79
+local018,California_Traffic_Collision,"For the primary collision factor violation category that was the most common cause of traffic accidents in 2021, how many percentage points did its share of annual road incidents in 2021 decrease compared to its share in 2011?",,"WITH
+-- Get counts for 2011
+counts_2011 AS (
+  SELECT 
+    pcf_violation_category,
+    COUNT(*) as count
+  FROM california_traffic_collision.main.collisions
+  WHERE collision_date LIKE '2011-%'
+  GROUP BY pcf_violation_category
+),
+-- Get counts for 2021
+counts_2021 AS (
+  SELECT 
+    pcf_violation_category,
+    COUNT(*) as count
+  FROM california_traffic_collision.main.collisions
+  WHERE collision_date LIKE '2021-%'
+  GROUP BY pcf_violation_category
+),
+-- Find the most common category in 2021
+most_common_2021 AS (
+  SELECT pcf_violation_category, count
+  FROM counts_2021
+  WHERE count = (SELECT MAX(count) FROM counts_2021)
+),
+-- Get total incidents for each year
+total_incidents AS (
+  SELECT 
+    COUNT(*) as total_2011,
+    COUNT(*) as total_2021
+  FROM california_traffic_collision.main.collisions
+  WHERE collision_date LIKE '2011-%' OR collision_date LIKE '2021-%'
+)
+SELECT 
+  100.0 * (c2011.count / t.total_2011 - m.count / t.total_2021) as percentage_point_decrease
+FROM most_common_2021 m
+LEFT JOIN counts_2011 c2011 ON m.pcf_violation_category = c2011.pcf_violation_category
+CROSS JOIN total_incidents t",1 rows,0,result_mismatch,,482.64
+local019,WWE,"For the NXT title that had the shortest match (excluding titles with ""title change""), what were the names of the two wrestlers involved?",,"WITH nxt_matches AS (
+  SELECT 
+    m.id AS match_id,
+    m.duration,
+    m.winner_id,
+    m.loser_id,
+    CAST(w1.name AS VARCHAR) AS winner_name,
+    CAST(w2.name AS VARCHAR) AS loser_name
+  FROM wwe.main.Matches m
+  LEFT JOIN wwe.main.Wrestlers w1 ON m.winner_id = w1.id::TEXT
+  LEFT JOIN wwe.main.Wrestlers w2 ON m.loser_id = w2.id::TEXT
+  WHERE m.title_id = '23153'
+    AND m.title_change = 0
+    AND m.duration IS NOT NULL
+    AND m.duration != ''
+),
+shortest_match AS (
+  SELECT *
+  FROM nxt_matches
+  ORDER BY 
+    CASE 
+      WHEN duration LIKE '%:%' THEN CAST(SUBSTRING(duration, 1, 2) AS INTEGER) * 60 + CAST(SUBSTRING(duration, 4, 2) AS INTEGER)
+      ELSE 999999
+    END
+  LIMIT 1
+)
+SELECT 
+  winner_name,
+  loser_name
+FROM shortest_match",1 rows,1,matches local019_a.csv,,312.32
+local026,IPL,"Please help me identify the top 3 bowlers who, in the overs where the maximum runs were conceded in each match, gave up the highest number of runs in a single over across all matches. For each of these bowlers, provide the match in which they conceded these maximum runs. Only consider overs that had the most runs conceded within their respective matches, and among these, determine which bowlers conceded the most runs in a single over overall.",,"SELECT 
+    mb.match_id,
+    mb.over_id,
+    mb.bowler,
+    p.player_name,
+    COUNT(*) as balls_in_over,
+    SUM(bs.runs_scored) as runs_from_batsman,
+    SUM(er.extra_runs) as extra_runs,
+    SUM(bs.runs_scored) + SUM(er.extra_runs) as total_runs_conceded
+FROM ipl.main.ball_by_ball mb
+LEFT JOIN ipl.main.batsman_scored bs ON mb.match_id = bs.match_id AND mb.over_id = bs.over_id AND mb.ball_id = bs.ball_id AND mb.innings_no = bs.innings_no
+LEFT JOIN ipl.main.extra_runs er ON mb.match_id = er.match_id AND mb.over_id = er.over_id AND mb.ball_id = er.ball_id AND mb.innings_no = er.innings_no
+LEFT JOIN ipl.main.player p ON mb.bowler = p.player_id
+WHERE mb.bowler IS NOT NULL
+    AND mb.match_id IN (
+        SELECT match_id
+        FROM (
+            SELECT 
+                mb.match_id,
+                mb.over_id,
+                mb.bowler,
+                COUNT(*) as balls_in_over,
+                SUM(bs.runs_scored) as runs_from_batsman,
+                SUM(er.extra_runs) as extra_runs,
+                SUM(bs.runs_scored) + SUM(er.extra_runs) as total_runs_conceded
+            FROM ipl.main.ball_by_ball mb
+            LEFT JOIN ipl.main.batsman_scored bs ON mb.match_id = bs.match_id AND mb.over_id = bs.over_id AND mb.ball_id = bs.ball_id AND mb.innings_no = bs.innings_no
+            LEFT JOIN ipl.main.extra_runs er ON mb.match_id = er.match_id AND mb.over_id = er.over_id AND mb.ball_id = er.ball_id AND mb.innings_no = er.innings_no
+            WHERE mb.bowler IS NOT NULL
+            GROUP BY mb.match_id, mb.over_id, mb.bowler
+        ) t
+        GROUP BY match_id
+    )
+GROUP BY mb.match_id, mb.over_id, mb.bowler, p.player_name
+ORDER BY total_runs_conceded DESC
+LIMIT 10",10 rows,0,result_mismatch,,329.15
+local020,IPL,Which bowler has the lowest bowling average per wicket taken?,,,no_sql_generated,0,no_sql,,399.66
+local021,IPL,Could you calculate the average of the total runs scored by all strikers who have scored more than 50 runs in any single match?,,"WITH strikers_with_50plus AS (
+    -- Find strikers who scored more than 50 runs in any single match
+    SELECT 
+        striker,
+        SUM(runs_scored) as match_runs
+    FROM ipl.ball_by_ball b
+    JOIN ipl.batsman_scored s ON b.match_id = s.match_id 
+        AND b.over_id = s.over_id 
+        AND b.ball_id = s.ball_id 
+        AND b.innings_no = s.innings_no
+    GROUP BY striker, b.match_id
+    HAVING SUM(runs_scored) > 50
+),
+striker_totals AS (
+    -- Calculate total runs for each striker who met the 50+ criteria
+    SELECT 
+        striker,
+        SUM(match_runs) as total_runs
+    FROM strikers_with_50plus
+    GROUP BY striker
+)
+SELECT AVG(total_runs) as average_total_runs
+FROM striker_totals;",1 rows,0,result_mismatch,,164.16
+local022,IPL,Retrieve the names of players who scored no less than 100 runs in a match while playing for the team that lost that match.,,"SELECT DISTINCT p.player_name
+FROM ipl.main.match m
+JOIN ipl.main.batsman_scored bs ON m.match_id = bs.match_id
+JOIN ipl.main.player_match pm ON m.match_id = pm.match_id AND bs.match_id = pm.match_id
+JOIN ipl.main.player p ON pm.player_id = p.player_id
+WHERE 
+    -- Determine losing team (team that is NOT the match_winner)
+    (m.team_1 = m.match_winner AND m.team_2 != m.match_winner) OR
+    (m.team_2 = m.match_winner AND m.team_1 != m.match_winner)
+    -- AND the player was playing for the losing team
+    AND pm.team_id = (CASE 
+        WHEN m.team_1 = m.match_winner THEN m.team_2
+        WHEN m.team_2 = m.match_winner THEN m.team_1
+        ELSE NULL
+    END)
+    -- AND the player scored at least 100 runs
+    AND bs.runs_scored >= 100",444 rows,0,result_mismatch,,371.43
+local023,IPL,"Please help me find the names of top 5 players with the highest average runs per match in season 5, along with their batting averages.",,"SELECT 
+    p.player_name,
+    AVG(bs.runs_scored) AS average_runs_per_match
+FROM 
+    ipl.match m
+JOIN 
+    ipl.player_match pm ON m.match_id = pm.match_id
+JOIN 
+    ipl.batsman_scored bs ON m.match_id = bs.match_id
+JOIN 
+    ipl.player p ON pm.player_id = p.player_id
+WHERE 
+    m.season_id = 5
+GROUP BY 
+    p.player_id, p.player_name
+ORDER BY 
+    average_runs_per_match DESC
+LIMIT 5",5 rows,0,result_mismatch,,178.42
+local024,IPL,"Can you help me find the top 5 countries whose players have the highest average of their individual average runs per match across all seasons? Specifically, for each player, calculate their average runs per match over all matches they played, then compute the average of these player averages for each country, and include these country batting averages in the result.",,"WITH player_match_runs AS (
+    -- Get total runs and matches for each player
+    SELECT 
+        p.player_id,
+        p.country_name,
+        COUNT(DISTINCT bm.match_id) as total_matches,
+        SUM(bs.runs_scored) as total_runs
+    FROM ipl.ball_by_ball bm
+    JOIN ipl.batsman_scored bs ON bm.match_id = bs.match_id 
+        AND bm.over_id = bs.over_id 
+        AND bm.ball_id = bs.ball_id 
+        AND bm.innings_no = bs.innings_no
+    JOIN ipl.player p ON bm.striker = p.player_id
+    WHERE bs.runs_scored IS NOT NULL
+    GROUP BY p.player_id, p.country_name
+),
+player_averages AS (
+    -- Calculate average runs per match for each player
+    SELECT 
+        player_id,
+        country_name,
+        total_runs / total_matches as avg_runs_per_match
+    FROM player_match_runs
+    WHERE total_matches > 0
+)
+SELECT 
+    country_name,
+    AVG(avg_runs_per_match) as country_avg_runs_per_match
+FROM player_averages
+GROUP BY country_name
+ORDER BY country_avg_runs_per_match DESC
+LIMIT 5",5 rows,0,result_mismatch,,234.69
+local025,IPL,"For each match, considering every innings, please combine runs from both batsman scored and extra runs for each over, then identify the single over with the highest total runs, retrieve the bowler for that over from the ball by ball table, and calculate the average of these highest over totals across all matches, ensuring that all runs and bowler details are accurately reflected.",,"SELECT 
+    AVG(max_over_total) AS average_highest_over_total
+FROM (
+    SELECT 
+        match_id,
+        innings_no,
+        MAX(total_runs) AS max_over_total,
+        bowler
+    FROM (
+        SELECT 
+            bb.match_id,
+            bb.innings_no,
+            bb.over_id,
+            SUM(COALESCE(bs.runs_scored, 0) + COALESCE(er.extra_runs, 0)) AS total_runs,
+            bb.bowler
+        FROM ipl.ball_by_ball bb
+        LEFT JOIN ipl.batsman_scored bs ON bb.match_id = bs.match_id 
+            AND bb.over_id = bs.over_id 
+            AND bb.ball_id = bs.ball_id 
+            AND bb.innings_no = bs.innings_no
+        LEFT JOIN ipl.extra_runs er ON bb.match_id = er.match_id 
+            AND bb.over_id = er.over_id 
+            AND bb.ball_id = er.ball_id 
+            AND bb.innings_no = er.innings_no
+        GROUP BY bb.match_id, bb.innings_no, bb.over_id, bb.bowler
+    ) AS over_totals
+    GROUP BY match_id, innings_no, bowler
+) AS match_max_over",1 rows,0,result_mismatch,,595.76
+local028,Brazilian_E_Commerce,"Could you generate a report that shows the number of delivered orders for each month in the years 2016, 2017, and 2018? Each column represents a year, and each row represents a month",,"SELECT 
+    EXTRACT(MONTH FROM TRY_CAST(order_purchase_timestamp AS DATE)) AS month,
+    SUM(CASE WHEN EXTRACT(YEAR FROM TRY_CAST(order_purchase_timestamp AS DATE)) = 2016 THEN 1 ELSE 0 END) AS delivered_2016,
+    SUM(CASE WHEN EXTRACT(YEAR FROM TRY_CAST(order_purchase_timestamp AS DATE)) = 2017 THEN 1 ELSE 0 END) AS delivered_2017,
+    SUM(CASE WHEN EXTRACT(YEAR FROM TRY_CAST(order_purchase_timestamp AS DATE)) = 2018 THEN 1 ELSE 0 END) AS delivered_2018
+FROM brazilian_e_commerce.main.olist_orders
+WHERE order_status = 'delivered'
+    AND TRY_CAST(order_purchase_timestamp AS DATE) IS NOT NULL
+    AND EXTRACT(YEAR FROM TRY_CAST(order_purchase_timestamp AS DATE)) IN (2016, 2017, 2018)
+GROUP BY EXTRACT(MONTH FROM TRY_CAST(order_purchase_timestamp AS DATE))
+ORDER BY month",12 rows,0,result_mismatch,,238.56
+local031,Brazilian_E_Commerce,"What is the highest monthly delivered orders volume in the year with the lowest annual delivered orders volume among 2016, 2017, and 2018?",,"SELECT 
+  EXTRACT(YEAR FROM TRY_CAST(order_delivered_customer_date AS DATE)) AS year,
+  EXTRACT(MONTH FROM TRY_CAST(order_delivered_customer_date AS DATE)) AS month,
+  COUNT(*) AS monthly_delivered_orders
+FROM brazilian_e_commerce.main.olist_orders
+WHERE order_status = 'delivered'
+  AND TRY_CAST(order_delivered_customer_date AS DATE) IS NOT NULL
+  AND EXTRACT(YEAR FROM TRY_CAST(order_delivered_customer_date AS DATE)) = 2016
+GROUP BY EXTRACT(YEAR FROM TRY_CAST(order_delivered_customer_date AS DATE)), 
+         EXTRACT(MONTH FROM TRY_CAST(order_delivered_customer_date AS DATE))
+ORDER BY monthly_delivered_orders DESC
+LIMIT 1",1 rows,1,matches local031_a.csv,,131.92
+local029,Brazilian_E_Commerce,"Please identify the top three customers, based on their customer_unique_id, who have the highest number of delivered orders, and provide the average payment value, city, and state for each of these customers.",,"SELECT 
+    cu.customer_unique_id,
+    cu.customer_city,
+    cu.customer_state,
+    AVG(op.payment_value) AS average_payment_value,
+    COUNT(oo.order_id) AS delivered_orders_count
+FROM brazilian_e_commerce.olist_orders oo
+JOIN brazilian_e_commerce.olist_customers cu ON oo.customer_id = cu.customer_id
+LEFT JOIN brazilian_e_commerce.olist_order_payments op ON oo.order_id = op.order_id
+WHERE oo.order_status = 'delivered'
+GROUP BY cu.customer_unique_id, cu.customer_city, cu.customer_state
+ORDER BY delivered_orders_count DESC
+LIMIT 3",3 rows,0,result_mismatch,,186.75
+local030,Brazilian_E_Commerce,"Among all cities with delivered orders, find the five cities whose summed payments are the lowest, then calculate the average of their total payments and the average of their total delivered order counts.",,"WITH delivered_orders AS (
+  SELECT 
+    o.order_id,
+    o.customer_id,
+    o.order_status,
+    c.customer_city
+  FROM brazilian_e_commerce.olist_orders o
+  JOIN brazilian_e_commerce.olist_customers c ON o.customer_id = c.customer_id
+  WHERE o.order_status = 'delivered'
+),
+city_payments AS (
+  SELECT 
+    customer_city,
+    SUM(payment_value) AS total_payments,
+    COUNT(*) AS order_count
+  FROM delivered_orders od
+  JOIN brazilian_e_commerce.olist_order_payments op ON od.order_id = op.order_id
+  GROUP BY customer_city
+),
+top_5_lowest_cities AS (
+  SELECT customer_city, total_payments, order_count
+  FROM city_payments
+  ORDER BY total_payments ASC
+  LIMIT 5
+)
+SELECT 
+  AVG(total_payments) AS avg_total_payments,
+  AVG(order_count) AS avg_order_count
+FROM top_5_lowest_cities",1 rows,1,matches local030_a.csv,,128.84
+local032,Brazilian_E_Commerce,"Could you help me find the sellers who excel in the following categories, considering only delivered orders: the seller with the highest number of distinct customer unique IDs, the seller with the highest profit (calculated as price minus freight value), the seller with the highest number of distinct orders, and the seller with the most 5-star ratings? For each category, please provide the seller ID and the corresponding value, labeling each row with a description of the achievement.",,"WITH delivered_orders AS (
+    SELECT 
+        o.order_id,
+        o.customer_id,
+        c.customer_unique_id,
+        o.order_status
+    FROM brazilian_e_commerce.olist_orders o
+    LEFT JOIN brazilian_e_commerce.olist_customers c ON o.customer_id = c.customer_id
+    WHERE o.order_status = 'delivered'
+        AND o.order_delivered_customer_date IS NOT NULL
+),
+
+-- Calculate all metrics for each seller
+seller_metrics AS (
+    SELECT 
+        oi.seller_id,
+        COUNT(DISTINCT od.customer_unique_id) AS distinct_customers,
+        SUM(oi.price - oi.freight_value) AS total_profit,
+        COUNT(DISTINCT od.order_id) AS distinct_orders,
+        COUNT(rev.review_id) AS five_star_reviews
+    FROM delivered_orders od
+    JOIN brazilian_e_commerce.olist_order_items oi ON od.order_id = oi.order_id
+    LEFT JOIN brazilian_e_commerce.olist_order_reviews rev ON od.order_id = rev.order_id
+    WHERE oi.seller_id IS NOT NULL
+    GROUP BY oi.seller_id
+)
+
+SELECT 
+    seller_id,
+    'Highest number of distinct customer unique IDs' AS achievement,
+    distinct_customers AS value
+FROM seller_metrics
+WHERE distinct_customers = (SELECT MAX(distinct_customers) FROM seller_metrics)
+
+UNION ALL
+
+SELECT 
+    seller_id,
+    'Highest profit (price minus freight value)' AS achievement,
+    total_profit AS value
+FROM seller_metrics
+WHERE total_profit = (SELECT MAX(total_profit) FROM seller_metrics)
+
+UNION ALL
+
+SELECT 
+    seller_id,
+    'Highest number of distinct orders' AS achievement,
+    distinct_orders AS value
+FROM seller_metrics
+WHERE distinct_orders = (SELECT MAX(distinct_orders) FROM seller_metrics)
+
+UNION ALL
+
+SELECT 
+    seller_id,
+    'Most 5-star ratings' AS achievement,
+    five_star_reviews AS value
+FROM seller_metrics
+WHERE five_star_reviews = (SELECT MAX(five_star_reviews) FROM seller_metrics)
+ORDER BY achievement;",4 rows,0,result_mismatch,,491.13
+local034,Brazilian_E_Commerce,"Could you help me calculate the average of the total number of payments made using the most preferred payment method for each product category, where the most preferred payment method in a category is the one with the highest number of payments?",,"WITH category_payment_totals AS (
+  -- Calculate total payments by payment type and product category
+  SELECT 
+    p.product_category_name,
+    op.payment_type,
+    SUM(op.payment_value) as total_payments
+  FROM brazilian_e_commerce.olist_order_items oi
+  JOIN brazilian_e_commerce.olist_products p ON oi.product_id = p.product_id
+  JOIN brazilian_e_commerce.olist_order_payments op ON oi.order_id = op.order_id
+  GROUP BY p.product_category_name, op.payment_type
+),
+category_most_preferred_payment AS (
+  -- Find the most preferred payment method for each category (highest total payments)
+  SELECT 
+    product_category_name,
+    payment_type as most_preferred_payment,
+    total_payments
+  FROM category_payment_totals
+  WHERE (product_category_name, total_payments) IN (
+    SELECT product_category_name, MAX(total_payments)
+    FROM category_payment_totals
+    GROUP BY product_category_name
+  )
+)
+-- Calculate the average of total payments using most preferred method for each category
+SELECT AVG(total_payments) as average_total_payments
+FROM category_most_preferred_payment;",1 rows,0,result_mismatch,,386.17
+local037,Brazilian_E_Commerce,"Identify the top three product categories whose most commonly used payment type has the highest number of payments across all categories, and specify the number of payments made in each category using that payment type.",,"WITH category_payments AS (
+    SELECT 
+        p.product_category_name,
+        op.payment_type,
+        COUNT(*) as payment_count
+    FROM brazilian_e_commerce.main.olist_order_items oi
+    JOIN brazilian_e_commerce.main.olist_order_payments op ON oi.order_id = op.order_id
+    JOIN brazilian_e_commerce.main.olist_products p ON oi.product_id = p.product_id
+    GROUP BY p.product_category_name, op.payment_type
+),
+category_most_common_payment AS (
+    SELECT 
+        product_category_name,
+        payment_type,
+        payment_count,
+        ROW_NUMBER() OVER (PARTITION BY product_category_name ORDER BY payment_count DESC) as rn
+    FROM category_payments
+)
+SELECT 
+    product_category_name,
+    payment_type,
+    payment_count
+FROM category_most_common_payment
+WHERE rn = 1
+ORDER BY payment_count DESC
+LIMIT 3",3 rows,0,result_mismatch,,163.4
+local035,Brazilian_E_Commerce,"In the “olist_geolocation” table, please identify which two consecutive cities, when sorted by geolocation_state, geolocation_city, geolocation_zip_code_prefix, geolocation_lat, and geolocation_lng, have the greatest distance between them based on the difference in distance computed between each city and its immediate predecessor in that ordering.",spherical_law.md,"WITH sorted_cities AS (
+  SELECT DISTINCT
+    geolocation_state,
+    geolocation_city,
+    geolocation_zip_code_prefix,
+    geolocation_lat,
+    geolocation_lng,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        geolocation_state,
+        geolocation_city,
+        geolocation_zip_code_prefix,
+        geolocation_lat,
+        geolocation_lng
+    ) AS row_num
+  FROM brazilian_e_commerce.main.olist_geolocation
+),
+consecutive_pairs AS (
+  SELECT
+    city1.geolocation_state AS state1,
+    city1.geolocation_city AS city1,
+    city1.geolocation_zip_code_prefix AS zip1,
+    city1.geolocation_lat AS lat1,
+    city1.geolocation_lng AS lng1,
+    city2.geolocation_state AS state2,
+    city2.geolocation_city AS city2,
+    city2.geolocation_zip_code_prefix AS zip2,
+    city2.geolocation_lat AS lat2,
+    city2.geolocation_lng AS lng2,
+    6371 * acos(
+      LEAST(1.0, GREATEST(-1.0,
+        cos(lat1 * PI() / 180) * 
+        cos(lat2 * PI() / 180) * 
+        cos((lng2 - lng1) * PI() / 180) + 
+        sin(lat1 * PI() / 180) * 
+        sin(lat2 * PI() / 180)
+      ))
+    ) AS distance_km
+  FROM sorted_cities city1
+  JOIN sorted_cities city2
+    ON city1.row_num + 1 = city2.row_num
+)
+SELECT 
+  state1,
+  city1,
+  zip1,
+  lat1,
+  lng1,
+  state2,
+  city2,
+  zip2,
+  lat2,
+  lng2,
+  distance_km
+FROM consecutive_pairs
+ORDER BY distance_km DESC
+LIMIT 1",1 rows,1,matches local035_a.csv,,408.92
+local038,Pagila,"Could you help me determine which actor starred most frequently in English-language children's category films that were rated either G or PG, had a running time of 120 minutes or less, and were released between 2000 and 2010? Please provide the actor's full name.",,"SELECT a.first_name, a.last_name
+FROM pagila.film_actor fa
+JOIN pagila.actor a ON fa.actor_id = a.actor_id
+JOIN pagila.film f ON fa.film_id = f.film_id
+JOIN pagila.film_category fc ON f.film_id = fc.film_id
+JOIN pagila.category c ON fc.category_id = c.category_id
+WHERE f.language_id = 1
+  AND c.category_id = 3
+  AND f.rating IN ('G', 'PG')
+  AND f.length <= 120
+  AND f.release_year BETWEEN '2000' AND '2010'
+GROUP BY a.actor_id, a.first_name, a.last_name
+ORDER BY COUNT(fa.film_id) DESC
+LIMIT 1",1 rows,0,result_mismatch,,280.88
+local039,Pagila,"Please help me find the film category with the highest total rental hours in cities where the city's name either starts with ""A"" or contains a hyphen. ",,,agent_error,0,agent_error,"Recursion limit of 60 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.
+For troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",917.44
+local040,modern_data,"In the combined dataset that unifies the trees data with the income data by ZIP code, filling missing ZIP values where necessary, which three boroughs, restricted to records with median and mean income both greater than zero and a valid borough name, contain the highest number of trees, and what is the average mean income for each of these three boroughs?",,"SELECT 
+    t.boroname AS borough,
+    COUNT(t.tree_id) AS tree_count,
+    AVG(i.Estimate_Mean_income) AS avg_mean_income
+FROM modern_data.main.trees t
+LEFT JOIN modern_data.main.income_trees i ON t.zipcode = i.zipcode
+WHERE 
+    TRY_CAST(i.Estimate_Median_income AS DOUBLE) > 0
+    AND TRY_CAST(i.Estimate_Mean_income AS DOUBLE) > 0
+    AND t.boroname IS NOT NULL
+GROUP BY t.boroname
+ORDER BY tree_count DESC
+LIMIT 3",3 rows,1,matches local040_b.csv,,119.41
+local041,modern_data,What percentage of trees in the Bronx have a health status of Good?,,"SELECT 
+  (COUNT(CASE WHEN health = 'Good' THEN 1 END) * 100.0 / COUNT(*)) AS percentage_good_health
+FROM modern_data.main.trees
+WHERE boroname = 'Bronx'",1 rows,1,matches local041_a.csv,,85.01
+local049,modern_data,Can you help me calculate the average number of new unicorn companies per year in the top industry from 2019 to 2021?,,"SELECT 
+    AVG(new_unicorn_count) as average_new_unicorns_per_year
+FROM (
+    SELECT 
+        EXTRACT(YEAR FROM TRY_CAST(date_joined AS DATE)) as year,
+        COUNT(DISTINCT company_id) as new_unicorn_count
+    FROM modern_data.main.companies_dates
+    WHERE company_id IN (
+        SELECT company_id 
+        FROM modern_data.main.companies_industries
+        WHERE industry = 'Fintech'
+    )
+    AND company_id IN (
+        SELECT company_id 
+        FROM modern_data.main.companies_funding 
+        WHERE valuation >= 1000000000
+    )
+    AND TRY_CAST(date_joined AS DATE) BETWEEN '2019-01-01' AND '2021-12-31'
+    GROUP BY EXTRACT(YEAR FROM TRY_CAST(date_joined AS DATE))
+) as yearly_counts",1 rows,1,matches local049_b.csv,,222.88
+local054,chinook,"Could you tell me the first names of customers who spent less than $1 on albums by the best-selling artist, along with the amounts they spent?",,"WITH best_artist AS (
+    SELECT ArtistId, ArtistName
+    FROM (
+        SELECT 
+            a.ArtistId,
+            a.Name AS ArtistName,
+            SUM(ii.Quantity * ii.UnitPrice) AS TotalSales
+        FROM chinook.artists a
+        JOIN chinook.albums al ON a.ArtistId = al.ArtistId
+        JOIN chinook.tracks t ON al.AlbumId = t.AlbumId
+        JOIN chinook.invoice_items ii ON t.TrackId = ii.TrackId
+        GROUP BY a.ArtistId, a.Name
+    ) AS artist_sales
+    WHERE TotalSales = (SELECT MAX(TotalSales) FROM (
+        SELECT 
+            a.ArtistId,
+            a.Name AS ArtistName,
+            SUM(ii.Quantity * ii.UnitPrice) AS TotalSales
+        FROM chinook.artists a
+        JOIN chinook.albums al ON a.ArtistId = al.ArtistId
+        JOIN chinook.tracks t ON al.AlbumId = t.AlbumId
+        JOIN chinook.invoice_items ii ON t.TrackId = ii.TrackId
+        GROUP BY a.ArtistId, a.Name
+    ) AS artist_sales)
+),
+customer_spending AS (
+    SELECT 
+        c.CustomerId,
+        c.FirstName,
+        SUM(ii.Quantity * ii.UnitPrice) AS TotalSpending
+    FROM chinook.customers c
+    JOIN chinook.invoices i ON c.CustomerId = i.CustomerId
+    JOIN chinook.invoice_items ii ON i.InvoiceId = ii.InvoiceId
+    JOIN chinook.tracks t ON ii.TrackId = t.TrackId
+    JOIN chinook.albums al ON t.AlbumId = al.AlbumId
+    JOIN best_artist ba ON al.ArtistId = ba.ArtistId
+    GROUP BY c.CustomerId, c.FirstName
+)
+SELECT 
+    FirstName,
+    TotalSpending AS SpendingAmount
+FROM customer_spending
+WHERE TotalSpending < 1
+ORDER BY TotalSpending ASC;",5 rows,1,matches local054_a.csv,,287.09
+local055,chinook,"Identify the artist with the highest overall sales of albums (tie broken by alphabetical order) and the artist with the lowest overall sales of albums (tie broken by alphabetical order), then calculate the amount each customer spent specifically on those two artists’ albums. Next, compute the average spending for the customers who purchased from the top-selling artist and the average spending for the customers who purchased from the lowest-selling artist, and finally return the absolute difference between these two averages.",,,agent_error,0,agent_error,"Recursion limit of 60 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.
+For troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",1720.34
+local198,chinook,"Using the sales data, what is the median value of total sales made in countries where the number of customers is greater than 4?",,"WITH countries_with_more_than_4_customers AS (
+    SELECT Country
+    FROM chinook.customers
+    GROUP BY Country
+    HAVING COUNT(*) > 4
+),
+country_sales AS (
+    SELECT 
+        c.Country,
+        SUM(i.Total) AS total_sales
+    FROM chinook.customers c
+    JOIN chinook.invoices i ON c.CustomerId = i.CustomerId
+    WHERE c.Country IN (SELECT Country FROM countries_with_more_than_4_customers)
+    GROUP BY c.Country
+)
+SELECT 
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total_sales) AS median_total_sales
+FROM country_sales",1 rows,1,matches local198_a.csv,,118.4
+local056,sqlite-sakila,Which customer has the highest average monthly change in payment amounts? Provide the customer's full name.,,,agent_error,0,agent_error,Request timed out.,1736.33
+local058,education_business,"Can you provide a list of hardware product segments along with their unique product counts for 2020 in the output, ordered by the highest percentage increase in unique fact sales products from 2020 to 2021?",,"WITH
+-- Get unique products per segment for 2020
+segment_products_2020 AS (
+  SELECT DISTINCT
+    hp.segment,
+    hp.product_code
+  FROM education_business.hardware_fact_sales_monthly hsm
+  JOIN education_business.hardware_dim_product hp ON hsm.product_code = hp.product_code
+  WHERE hsm.fiscal_year = 2020
+),
+
+-- Get unique products per segment for 2021
+segment_products_2021 AS (
+  SELECT DISTINCT
+    hp.segment,
+    hp.product_code
+  FROM education_business.hardware_fact_sales_monthly hsm
+  JOIN education_business.hardware_dim_product hp ON hsm.product_code = hp.product_code
+  WHERE hsm.fiscal_year = 2021
+),
+
+-- Count unique products per segment for each year
+segment_counts_2020 AS (
+  SELECT
+    segment,
+    COUNT(DISTINCT product_code) AS product_count_2020
+  FROM segment_products_2020
+  GROUP BY segment
+),
+
+segment_counts_2021 AS (
+  SELECT
+    segment,
+    COUNT(DISTINCT product_code) AS product_count_2021
+  FROM segment_products_2021
+  GROUP BY segment
+)
+
+-- Calculate percentage increase and order by highest increase
+SELECT
+  s2020.segment,
+  s2020.product_count_2020,
+  s2021.product_count_2021,
+  100 * (s2021.product_count_2021 - s2020.product_count_2020) / s2020.product_count_2020 AS percentage_increase
+FROM segment_counts_2020 s2020
+JOIN segment_counts_2021 s2021 ON s2020.segment = s2021.segment
+ORDER BY percentage_increase DESC;",6 rows,1,matches local058_a.csv,,205.47
+local059,education_business,"For the calendar year 2021, what is the overall average quantity sold of the top three best-selling hardware products (by total quantity sold) in each division?",,"WITH sales_2021 AS (
+  SELECT 
+    hfm.product_code,
+    hfm.sold_quantity,
+    hd.division
+  FROM education_business.main.hardware_fact_sales_monthly hfm
+  JOIN education_business.main.hardware_dim_product hd ON hfm.product_code = hd.product_code
+  WHERE TRY_CAST(hfm.date AS DATE) BETWEEN '2021-01-01' AND '2021-12-31'
+    AND hfm.fiscal_year = 2021
+),
+product_rankings AS (
+  SELECT 
+    division,
+    product_code,
+    SUM(sold_quantity) AS total_quantity,
+    NTILE(3) OVER (PARTITION BY division ORDER BY SUM(sold_quantity) DESC) AS rank
+  FROM sales_2021
+  GROUP BY division, product_code
+)
+SELECT 
+  division,
+  AVG(total_quantity) AS avg_quantity_top3
+FROM product_rankings
+WHERE rank <= 3
+GROUP BY division
+ORDER BY division",3 rows,0,result_mismatch,,133.98
+local060,complex_oracle,"In the United States, for Q4 2019 and Q4 2020, first select only those cities where total sales (with no promotions) rose by at least 20% from Q4 2019 to Q4 2020. Among these cities, rank products by their overall sales (still excluding promotions) in those quarters and take the top 20%. Then compute each top product’s share of total sales in Q4 2019 and Q4 2020 and calculate the difference in share from Q4 2019 to Q4 2020, returning the results in descending order of that share change.",,,agent_error,0,agent_error,"Recursion limit of 60 reached without hitting a stop condition. You can increase the limit by setting the `recursion_limit` config key.
+For troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT",732.25
+local063,complex_oracle,"Among all products sold in the United States with promo_id=999, considering only those cities whose sales increased by at least 20% from Q4 2019 (calendar_quarter_id=1772) to Q4 2020 (calendar_quarter_id=1776), which product that ranks in the top 20% of total sales has the smallest percentage-point change in its share of total sales between these two quarters?",,,agent_error,0,agent_error,Request timed out.,1719.45
+local061,complex_oracle,"What is the average projected monthly sales in USD for France in 2021, considering only product sales with promotions where promo_total_id = 1 and channels where channel_total_id = 1, by taking each product’s monthly sales from 2019 and 2020, calculating the growth rate from 2019 to 2020 for that same product and month, applying this growth rate to project 2021 monthly sales, converting all projected 2021 amounts to USD with the 2021 exchange rates, and finally averaging and listing them by month?",projection_calculation.md,"WITH france_sales AS (
+  -- Filter sales for France, promotions with promo_total_id=1, and channels with channel_total_id=1
+  SELECT 
+    s.prod_id,
+    EXTRACT(MONTH FROM s.time_id) AS month,
+    EXTRACT(YEAR FROM s.time_id) AS year,
+    SUM(s.amount_sold) AS total_amount
+  FROM complex_oracle.main.sales s
+  JOIN complex_oracle.main.customers c ON s.cust_id = c.cust_id
+  JOIN complex_oracle.main.promotions p ON s.promo_id = p.promo_id
+  JOIN complex_oracle.main.channels ch ON s.channel_id = ch.channel_id
+  WHERE c.country_id = 52779
+    AND p.promo_total_id = 1
+    AND ch.channel_total_id = 1
+    AND EXTRACT(YEAR FROM s.time_id) IN (2019, 2020)
+  GROUP BY s.prod_id, EXTRACT(MONTH FROM s.time_id), EXTRACT(YEAR FROM s.time_id)
+),
+monthly_sales_2019_2020 AS (
+  -- Aggregate by product and month for 2019 and 2020
+  SELECT 
+    prod_id,
+    month,
+    SUM(CASE WHEN year = 2019 THEN total_amount ELSE 0 END) AS sales_2019,
+    SUM(CASE WHEN year = 2020 THEN total_amount ELSE 0 END) AS sales_2020
+  FROM france_sales
+  GROUP BY prod_id, month
+),
+growth_rates AS (
+  -- Calculate growth rate from 2019 to 2020 for each product and month
+  SELECT 
+    prod_id,
+    month,
+    sales_2020,
+    sales_2019,
+    CASE 
+      WHEN sales_2019 = 0 THEN 0
+      ELSE (sales_2020 - sales_2019) / sales_2019
+    END AS growth_rate
+  FROM monthly_sales_2019_2020
+),
+projected_sales_2021 AS (
+  -- Project 2021 monthly sales using growth rate
+  SELECT 
+    prod_id,
+    month,
+    sales_2020,
+    growth_rate,
+    -- Apply growth rate: ((Sales_2020 - Sales_2019) / Sales_2019) * Sales_2020 + Sales_2020
+    (sales_2020 * (1 + growth_rate)) AS projected_amount
+  FROM growth_rates
+),
+projected_sales_2021_usd AS (
+  -- Convert projected 2021 amounts to USD using 2021 exchange rates
+  SELECT 
+    ps.prod_id,
+    ps.month,
+    ps.projected_amount,
+    c.to_us AS exchange_rate
+  FROM projected_sales_2021 ps
+  JOIN complex_oracle.main.currency c 
+    ON c.country = 'France'
+    AND c.year = 2021
+    AND c.month = ps.month
+  WHERE ps.projected_amount IS NOT NULL
+),
+monthly_average_2021_usd AS (
+  -- Average projected sales by month in USD
+  SELECT 
+    month,
+    AVG(projected_amount * exchange_rate) AS avg_projected_sales_usd
+  FROM projected_sales_2021_usd
+  GROUP BY month
+  ORDER BY month
+)
+SELECT 
+  month,
+  ROUND(avg_projected_sales_usd, 2) AS avg_projected_monthly_sales_usd
+FROM monthly_average_2021_usd",12 rows,0,result_mismatch,,260.36
+local050,complex_oracle,"What is the median of the average monthly projected sales in USD for France in 2021, calculated by using the monthly sales data from 2019 and 2020 (filtered by promo_total_id=1 and channel_total_id=1), applying the growth rate from 2019 to 2020 to project 2021, converting to USD based on the currency table, and then determining the monthly averages before finding their median?",projection_calculation.md,,agent_error,0,agent_error,Connection error.,1438.26
+local062,complex_oracle,"Please group all Italian customers into ten buckets for December 2021 by summing their profits from all products purchased (where profit is calculated as quantity_sold multiplied by the difference between unit_price and unit_cost), then divide the overall range of total monthly profits into ten equal intervals. For each bucket, provide the number of customers, and identify the minimum and maximum total profits within that bucket.",,,agent_error,0,agent_error,Connection error.,8.38
+local067,complex_oracle,Can you provide the highest and lowest profits for Italian customers segmented into ten evenly divided tiers based on their December 2021 sales profits?,,,agent_error,0,agent_error,Connection error.,8.61
+local070,city_legislation,"Please examine our database records for Chinese cities (country_code_2 = 'cn') during July 2021 and identify both the shortest and longest streaks of consecutive date entries. For each date in these streaks, return exactly one record per date along with the corresponding city name. In your output, please ensure the first letter of each city name is capitalized and the rest are lowercase. Display the dates and city names for both the shortest and longest consecutive date streaks, ordered by date.",,,agent_error,0,agent_error,Connection error.,8.44
+local071,city_legislation,Could you review our records in June 2022 and identify which countries have the longest streak of consecutive inserted city dates? Please list the 2-letter length country codes of these countries.,,,agent_error,0,agent_error,Connection error.,7.53
+local072,city_legislation,"Identify the country with data inserted on nine different days in January 2022. Then, find the longest consecutive period with data insertions for this country during January 2022, and calculate the proportion of entries that are from its capital city within this longest consecutive insertion period.",,,agent_error,0,agent_error,Connection error.,7.92
+local068,city_legislation,"Calculate the number of new cities inserted in April, May, and June for each year from 2021 to 2023. For each month, compute the cumulative running total of cities added for that specific month across the years up to and including the given year (i.e., sum the counts of that month over the years). Additionally, calculate the year-over-year growth percentages for both the monthly total and the running total for each month, comparing each year to the previous year. Present the results only for 2022 and 2023, listing the year, the month, the total number of cities added in that month, the cumulative running total for that month, and the year-over-year growth percentages for both the monthly total and the running total. Use the data from 2021 solely as a baseline for calculating growth rates, and exclude it from the final output.",,,agent_error,0,agent_error,Connection error.,8.52
+local073,modern_data,"For each pizza order, provide a single result row with the row ID, order ID, customer ID, pizza name, and final set of ingredients. The final ingredients are determined by starting with the standard toppings from the pizza’s recipe, removing any excluded toppings, and adding any extra toppings. Present the ingredients in a string starting with the pizza name followed by ': ', with ingredients listed in alphabetical order. Ingredients appearing multiple times (e.g., from standard and extra toppings) should be prefixed with '2x' and listed first, followed by single-occurrence ingredients, both in alphabetical order. Group by row ID, order ID, pizza name, and order time to ensure each order appears once. Sort results by row ID in ascending order. Assign pizza_id 1 to 'Meatlovers' pizzas and pizza_id 2 to all others.",,,agent_error,0,agent_error,Connection error.,8.78
