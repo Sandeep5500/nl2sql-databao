@@ -54,6 +54,39 @@ class Database:
             self._av = av
         return self._av
 
+    def _exec(self, sql: str):
+        """Execute, retrying on the all-varchar connection when a column's
+        declared type is a lie.
+
+        The scanner raises Mismatch Type Error on, for example, Airlines'
+        `coordinates`, declared INTEGER and storing "(129.77,62.09)". The query
+        tool already retried this way; the inspection tools did not, so the
+        model would be told the column is BIGINT with no sample rows and could
+        never learn what it actually holds.
+        """
+        try:
+            return self.con.execute(sql)
+        except Exception as e:
+            if "Mismatch Type Error" not in str(e):
+                raise
+            return self._all_varchar_con().execute(sql)
+
+    def mistyped_columns(self, table: str) -> list[str]:
+        """Columns whose declared type the data contradicts, so describe_table
+        can say so instead of printing the declared type as fact."""
+        bad = []
+        for c, dtype, _ in self._columns(table):
+            if dtype.upper().startswith(("VARCHAR", "TEXT", "CHAR", "CLOB", "BLOB")):
+                continue
+            try:
+                self.con.execute(
+                    f"SELECT {self._q(c)} FROM {self._q(table)} "
+                    f"WHERE {self._q(c)} IS NOT NULL LIMIT 1").fetchone()
+            except Exception as e:
+                if "Mismatch Type Error" in str(e):
+                    bad.append(c)
+        return bad
+
     # ── raw query ─────────────────────────────────────────────────────────
     def query(self, sql: str, max_rows: int = 100) -> pd.DataFrame:
         return _decode_bytes(self.con.execute(sql).df().head(max_rows))
@@ -145,23 +178,28 @@ class Database:
                 for c, _, _ in cols
             )
             try:
-                vals = self.con.execute(f"SELECT {aggs} FROM {qt}").fetchone()
+                vals = self._exec(f"SELECT {aggs} FROM {qt}").fetchone()
                 for i, (c, _, _) in enumerate(cols):
                     stats[c] = (vals[2 * i], vals[2 * i + 1])
             except Exception:
                 pass  # stats are best-effort
+        mistyped = set(self.mistyped_columns(table))
         for name, dtype, nullable in cols:
             extra = ""
             if name in stats:
                 nd, nn = stats[name]
                 extra = f"  distinct={nd} nulls={nn}"
+            if name in mistyped:
+                # Say the declared type is wrong rather than repeating it as fact.
+                extra += (f"  [DECLARED {dtype} BUT STORES TEXT — read as TEXT; "
+                          f"use TRY_CAST for math]")
             lines.append(f"  {name}  {dtype}  nullable={nullable}{extra}")
 
         if n_rows:
             select = ", ".join(f"CAST({self._q(c)} AS VARCHAR) AS {self._q(c)}"
                                for c, _, _ in cols)
             try:
-                sample = self.con.execute(
+                sample = self._exec(
                     f"SELECT {select} FROM {qt} LIMIT {sample_rows}").df()
                 sample = sample.map(lambda v: _trim_cell(v, 200))
                 lines.append(f"sample rows:\n{sample.to_csv(index=False)}")
@@ -175,12 +213,12 @@ class Database:
             raise ValueError(f"Unknown column {column!r} in table {table!r}. "
                              f"Columns: {sorted(cols)}")
         qt, qc = self._q(table), self._q(column)
-        df = self.con.execute(
+        df = self._exec(
             f"SELECT {qc} AS value, COUNT(*) AS count FROM {qt} "
             f"GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT {int(limit)}"
         ).df()
         df = _decode_bytes(df)
-        total = self.con.execute(f"SELECT COUNT(DISTINCT {qc}) FROM {qt}").fetchone()[0]
+        total = self._exec(f"SELECT COUNT(DISTINCT {qc}) FROM {qt}").fetchone()[0]
         out = df.to_csv(index=False)
         if total > limit:
             out += f"[showing {limit} of {total} distinct values]"
