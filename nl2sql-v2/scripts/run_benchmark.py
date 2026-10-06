@@ -24,9 +24,10 @@ from nl2sql.agent import run_episode
 from nl2sql.config import (AgentConfig, CriticConfig, DCE_PROJECT_DIR, DOCS_DIR,
                            LLMConfig, QUESTIONS_FILE, SQLITE_DIR,
                            VLLM_ENDPOINT_FILE)
-from nl2sql.context import SearchContext
+from nl2sql.context import SearchContext, TableContext
 from nl2sql.db import Database
 from nl2sql.eval import load_eval_standards, score_against_gold
+from nl2sql.rubric import load_rubric, render_rubric
 from nl2sql.tools import ToolSession
 
 
@@ -195,6 +196,18 @@ def main():
                          "tool training (e.g. Arctic as actor)")
     ap.add_argument("--resume", action="store_true",
                     help="skip instances already in --output and append to it")
+    ap.add_argument("--thinking", action="store_true",
+                    help="let the model reason before each step (Qwen "
+                         "enable_thinking); slower, reasoning is kept in the trace")
+    ap.add_argument("--plain-describe", action="store_true",
+                    help="describe_table without the context engine's keys and "
+                         "notes (the behaviour before Oct 2026)")
+    ap.add_argument("--rubric-confident-only", action="store_true",
+                    help="use a question's rubric only when it states an exact row "
+                         "count with high confidence; otherwise add nothing")
+    ap.add_argument("--rubric-dir",
+                    help="directory of per-question output-shape rubrics from "
+                         "scripts/run_rubric.py; appended to the system prompt")
     args = ap.parse_args()
 
     base_url = read_endpoint(args.endpoint)
@@ -204,8 +217,11 @@ def main():
 
     llm = LLMConfig(base_url=base_url, model=model,
                     temperature=args.temperature,
-                    chat_template_kwargs={"enable_thinking": False}
+                    chat_template_kwargs={"enable_thinking": args.thinking}
                     if "qwen" in model.lower() else {})
+    if args.thinking:
+        # reasoning tokens count against the completion budget
+        llm.max_tokens, llm.timeout = 12_000, 900.0
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
                       text_sql_fallback=args.text_sql_fallback)
@@ -270,9 +286,12 @@ def main():
                 p = DOCS_DIR / q["external_knowledge"]
                 doc = p.read_text() if p.exists() else None
             search = None
+            table_context = None
             extra = ""
             if args.context_mode == "search":
                 ds = resolve_datasource(db_name)
+                if ds and not args.plain_describe:
+                    table_context = TableContext(DCE_PROJECT_DIR, ds)
                 if ds:
                     search = SearchContext(DCE_PROJECT_DIR, ds,
                                            expansion_client=client,
@@ -286,6 +305,15 @@ def main():
                 extra = oracle_context(db, oracle[iid])
             if args.schema_overview and args.context_mode == "search":
                 extra += schema_overview(db)
+
+            if args.rubric_dir:
+                rubric = load_rubric(args.rubric_dir, iid)
+                if rubric and args.rubric_confident_only and not (
+                        rubric.get("rows_confidence") == "high"
+                        and rubric.get("exact_rows") is not None):
+                    rubric = None
+                if rubric:
+                    extra += "\n" + render_rubric(rubric)
 
             draft = None
             if args.draft_endpoint and args.draft_model:
@@ -303,6 +331,7 @@ def main():
                 for attempt in range(2):
                     wait_for_services(base_url, ollama_host)
                     session = ToolSession(db=db, cfg=cfg, search=search,
+                                          table_context=table_context,
                                           doc_text=doc, draft=draft)
                     result = run_episode(q["question"], session, llm, cfg, critic,
                                          extra_context=extra)

@@ -180,7 +180,9 @@ class Database:
         return '"' + identifier.replace('"', '""') + '"'
 
     def describe_table(self, table: str, sample_rows: int = 5,
-                       stats_row_limit: int = 2_000_000) -> str:
+                       stats_row_limit: int = 2_000_000, context=None) -> str:
+        """`context` is an optional nl2sql.context.TableContext; when given, the
+        output also carries the context engine's declared keys and descriptions."""
         cols = self._columns(table)
         qt = self._q(table)
         n_rows = self.con.execute(f"SELECT COUNT(*) FROM {qt}").fetchone()[0]
@@ -208,6 +210,13 @@ class Database:
                 extra = f"  distinct={nd} nulls={nn}"
             lines.append(f"  {name}  {dtype}  nullable={nullable}{extra}")
 
+        if context is not None:
+            keys = context.key_lines(table)
+            fks = context.foreign_keys(table)
+            if fks:
+                keys.append("foreign keys (declared): " + "; ".join(fks))
+            lines[1:1] = keys
+
         if n_rows:
             select = ", ".join(f"CAST({self._q(c)} AS VARCHAR) AS {self._q(c)}"
                                for c, _, _ in cols)
@@ -218,6 +227,11 @@ class Database:
                 lines.append(f"sample rows:\n{sample.to_csv(index=False)}")
             except Exception as e:
                 lines.append(f"sample rows unavailable: {e}")
+        notes = context.notes(table) if context is not None else ""
+        if notes:
+            lines.append("notes (written by an LLM from the schema and a few sample "
+                         "rows; they can be wrong — the facts above take precedence):\n"
+                         + notes)
         return "\n".join(lines)
 
     def get_column_values(self, table: str, column: str, limit: int = 20) -> str:

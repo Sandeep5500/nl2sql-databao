@@ -42,7 +42,11 @@ DCE_OLLAMA_HOST=<vllm_node> uv run python scripts/run_benchmark.py \
 
 Key runner flags: `--resume` (skip done, append), `--temperature` (pass@K sampling),
 `--context-mode search|full|oracle` (ablations), `--critic-model/-endpoint`,
-`--draft-model/-endpoint`, `--text-sql-fallback`, `--max-steps` (default 30).
+`--draft-model/-endpoint`, `--text-sql-fallback`, `--max-steps` (default 30),
+`--rubric-dir <dir> [--rubric-confident-only]` (output-shape rubric from
+`scripts/run_rubric.py`; the gated form shows it only when it states an exact row count
+with high confidence), `--plain-describe` (describe_table without DCE keys/notes),
+`--thinking` (Qwen reasoning on; no gain measured, a few questions run away).
 Single-shot lane: `scripts/run_single_shot.py`. Long runs: wrap with
 `../logs/bench/run_lane.sh <tag> <command...>` for auto-restart (up to 15 attempts).
 
@@ -77,6 +81,13 @@ One-time per database. Single DB (~4 min): from `spider2-dce/`,
 Datasource names are lowercase with non-alnum → `_` (question db `Db-IMDB` → `db_imdb.yaml`);
 `run_benchmark.py::resolve_datasource` handles the mapping. Don't rebuild the index while
 a search-mode run is reading `dce.duckdb`.
+
+Table keys (`spider2-dce/output/keys/<db>.json`, tracked) feed describe_table's
+"one row per (...)" line for tables with no declared primary key. Rebuild from repo root:
+`uv run --project nl2sql-v2 python scripts/compute_keys.py --out-dir spider2-dce/output/keys`
+(data only: smallest unique column sets), then the same with
+`--choose --endpoint http://<node>:<port>/v1 --model <model>` (the model proposes the
+intended key; it is kept only if the data confirms it is unique).
 
 ## Known result baselines (Sept 2026, Qwen3.5-9B)
 

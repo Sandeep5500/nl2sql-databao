@@ -59,3 +59,71 @@ class SearchContext:
         if not chunks:
             return "no matching context found"
         return "\n\n---\n\n".join(chunks)
+
+
+class TableContext:
+    """Per-table records from the context engine's enriched YAML (descriptions,
+    declared keys), looked up by table name. This is the same content
+    search_context returns, addressed by name instead of ranked retrieval."""
+
+    def __init__(self, project_dir: Path, datasource_id: str):
+        import yaml
+        path = Path(project_dir) / "output" / datasource_id
+        doc = yaml.safe_load(path.read_text())
+        self.tables: dict[str, dict] = {}
+        for cat in (doc.get("context") or {}).get("catalogs") or []:
+            for schema in cat.get("schemas") or []:
+                for t in schema.get("tables") or []:
+                    self.tables[str(t.get("name", "")).lower()] = t
+        # keys precomputed by scripts/compute_keys.py (absent -> no key lines
+        # for tables without a declared primary key)
+        self.keys: dict[str, dict] = {}
+        kpath = Path(project_dir) / "output" / "keys" / (Path(datasource_id).stem + ".json")
+        if kpath.exists():
+            import json
+            self.keys = {k.lower(): v for k, v in json.loads(kpath.read_text()).items()}
+
+    def get(self, table: str) -> dict | None:
+        return self.tables.get(table.lower())
+
+    def primary_key(self, table: str) -> list[str] | None:
+        t = self.get(table) or {}
+        return (t.get("primary_key") or {}).get("columns") or None
+
+    def key_lines(self, table: str) -> list[str]:
+        """What one row of the table is, labelled by how we know it."""
+        pk = self.primary_key(table)
+        if pk:
+            return [f"primary key (declared): ({', '.join(pk)})"]
+        rec = self.keys.get(table.lower())
+        if not rec or "attempts" not in rec:
+            return []
+        if rec.get("chosen"):
+            what = f" — {rec['row_is']}" if rec.get("row_is") else ""
+            return [f"one row per ({', '.join(rec['chosen'])}){what}  "
+                    "[no declared key; proposed by an LLM and verified unique in the data]"]
+        dups = rec.get("duplicate_rows") or 0
+        if dups:
+            return [f"no key: {dups} rows are exact copies of another row"]
+        return ["no key confirmed for this table"]
+
+    def foreign_keys(self, table: str) -> list[str]:
+        out = []
+        for fk in (self.get(table) or {}).get("foreign_keys") or []:
+            ref = str(fk.get("referenced_table", "")).split(".")[-1]
+            src = ", ".join(m["from_column"] for m in fk.get("mapping") or [])
+            dst = ", ".join(m["to_column"] for m in fk.get("mapping") or [])
+            out.append(f"{src} -> {ref}.{dst}")
+        return out
+
+    def notes(self, table: str) -> str:
+        t = self.get(table)
+        if not t:
+            return ""
+        lines = []
+        if t.get("description"):
+            lines.append(f"  (table) {' '.join(str(t['description']).split())}")
+        for c in t.get("columns") or []:
+            if c.get("description"):
+                lines.append(f"  {c['name']}: {' '.join(str(c['description']).split())}")
+        return "\n".join(lines)

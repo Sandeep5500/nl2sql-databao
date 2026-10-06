@@ -30,9 +30,10 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
            ["sql"]),
         fn("list_tables", "List all table and view names in the database.", {}, []),
         fn("describe_table",
-           "Exact schema of one table: columns with types, nullability, distinct/null "
-           "counts, row count, and 5 sample rows. Use this to verify columns before "
-           "writing SQL — it is ground truth, unlike search results.",
+           "Everything known about one table: columns with types, nullability, "
+           "distinct/null counts, row count, what one row is (primary or unique key), "
+           "foreign keys, 5 sample rows, and generated column notes. Use this to "
+           "verify columns and keys before writing SQL.",
            {"table": {"type": "string"}}, ["table"]),
         fn("get_column_values",
            "Top distinct values of a column with occurrence counts. Use before writing "
@@ -91,6 +92,7 @@ class ToolSession:
     db: Database
     cfg: AgentConfig
     search: object | None = None          # SearchContext
+    table_context: object | None = None   # TableContext (keys + notes in describe_table)
     doc_text: str | None = None
     draft: object | None = None           # DraftSQL (specialist model client)
     query_results: dict = field(default_factory=dict)  # query_id -> (sql, df)
@@ -119,7 +121,7 @@ class ToolSession:
             views = self.db.list_views()
             return "\n".join(self.db.list_tables() + [f"{v} (view)" for v in views])
         if name == "describe_table":
-            return self.db.describe_table(args["table"])
+            return self.db.describe_table(args["table"], context=self.table_context)
         if name == "get_column_values":
             return self.db.get_column_values(args["table"], args["column"],
                                              int(args.get("limit") or 20))

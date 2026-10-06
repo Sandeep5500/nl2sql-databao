@@ -166,7 +166,12 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                               "arguments": tc.function.arguments}}
                 for tc in tool_calls]
         messages.append(assistant)
-        result.trace.append({"step": step, "assistant": assistant})
+        entry = {"step": step, "assistant": assistant}
+        reasoning = (msg.model_dump().get("reasoning")
+                     or msg.model_dump().get("reasoning_content"))
+        if reasoning:  # kept for analysis only; never sent back to the model
+            entry["reasoning"] = reasoning
+        result.trace.append(entry)
 
         if not tool_calls:
             if cfg.text_sql_fallback:
