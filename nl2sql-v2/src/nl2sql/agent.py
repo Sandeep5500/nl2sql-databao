@@ -127,7 +127,13 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
         critic_client = OpenAI(base_url=critic_cfg.base_url or llm.base_url,
                                api_key=llm.api_key, timeout=llm.timeout)
 
-    has_search = session.search is not None and cfg.context_mode == "search"
+    # Offer the tool iff there is an index behind it. Do NOT also require
+    # context_mode == "search": a warehouse lane can carry retrieval ON TOP of the
+    # schema dump (run_benchmark.py --retrieval), and that extra clause silently
+    # turned such a lane into a duplicate of the one without retrieval. For the
+    # SQLite lane the two conditions are equivalent, since it only builds a search
+    # object in search mode.
+    has_search = session.search is not None
     # a session may define its own toolset and prompt (the dbt lane does);
     # the SQL lanes take neither branch and are unaffected.
     # A backend that refuses find_value (BigQuery: a cross-table LIKE sweep is

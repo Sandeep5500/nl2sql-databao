@@ -25,6 +25,7 @@ CHECKS = [
     # guarantee that the SQLite lane still matches theirs.
     ("check_prompt_parity.py", ["--ref", "origin/main"], False),
     ("check_schema_dump.py", [], False),
+    ("check_retrieval_wiring.py", [], False),
     ("check_sources.py", [], False),
     ("check_sqlite_episode.py", [], False),
     ("check_snowflake_db.py", [], False),
