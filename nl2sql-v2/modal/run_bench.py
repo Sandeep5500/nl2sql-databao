@@ -464,6 +464,11 @@ def snow(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
 def _merge_shards(tag: str) -> int:
     import csv
     from pathlib import Path
+    # reload(), not just commit(): a Modal volume mount is a snapshot from when the
+    # container started, so the orchestrator cannot see what the shard containers
+    # committed while it waited. Without this the bq_v3 merge read 0 rows from six
+    # shard CSVs that were all sitting on the volume.
+    results.reload()
     d = Path("/results") / tag
     shard_files = sorted(d.glob("shard*.csv"))
     rows, fieldnames = [], None

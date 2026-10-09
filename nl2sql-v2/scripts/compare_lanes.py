@@ -32,7 +32,11 @@ GiB = 1024.0 ** 3
 
 # the tool-layer exception names and query-refusal classes worth contrasting
 ERROR_PROBES = {
-    "information_schema_404": r"Not found: Dataset|INFORMATION_SCHEMA",
+    # the failure, not the word. Matching a bare "INFORMATION_SCHEMA" also matched
+    # the prompt rule that tells the model how to qualify it, which showed up as an
+    # 18 -> 204 "regression" that was purely an artifact of this probe.
+    "information_schema_404": r"Not found: Dataset|has no project in front of it"
+                              r"|asks for PROJECT-level metadata",
     "out_of_scope_refused": r"is not part of the",
     "forbidden": r"Forbidden",
     "not_found": r"NotFound|Not found: Table",
@@ -75,12 +79,18 @@ def probe_counts(traces: dict) -> dict:
     episode cannot look like a widespread problem."""
     hit = defaultdict(set)
     for iid, t in traces.items():
-        blob = str(t.get("system") or "")
-        for ev in t.get("trace", []):
-            blob += "\n" + str(ev.get("result") or "")
+        # Tool RESULTS only. Scanning the system prompt too meant a prompt that
+        # merely mentions a failure mode counted as having suffered it.
+        results_blob = "\n".join(str(ev.get("result") or "")
+                                 for ev in t.get("trace", []))
         for label, pat in ERROR_PROBES.items():
-            if re.search(pat, blob, re.IGNORECASE):
+            if label == "schema_truncated":
+                continue        # a property of the prompt, handled below
+            if re.search(pat, results_blob, re.IGNORECASE):
                 hit[label].add(iid)
+        if re.search(ERROR_PROBES["schema_truncated"],
+                     str(t.get("system") or ""), re.IGNORECASE):
+            hit["schema_truncated"].add(iid)
     return hit
 
 
