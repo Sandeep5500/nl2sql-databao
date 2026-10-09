@@ -517,6 +517,8 @@ def main():
                           if args.critic_model and "qwen" in args.critic_model.lower()
                           else {})
 
+    # database -> CatalogSearchContext (or None when it has no index)
+    warehouse_search: dict = {}
     questions = load_questions(
         sources,
         set(args.instances.split(",")) if args.instances else None,
@@ -604,12 +606,20 @@ def main():
             search = None
             extra = ""
             if args.context_mode == "search" and (snow_cfg or bq_cfg):
-                idx = warehouse_index_dir(q["_dialect"])
-                try:
-                    search = CatalogSearchContext(
-                        idx, db_name, expansion_client=client,
-                        expansion_model=model)
-                except FileNotFoundError as e:
+                # cached per database: the larger indexes are ~150 MiB of float32
+                # (fec is 52,357 chunks) and shards are grouped by database, so
+                # rebuilding this per episode would re-read the same file for every
+                # question on it
+                if db_name not in warehouse_search:
+                    idx = warehouse_index_dir(q["_dialect"])
+                    try:
+                        warehouse_search[db_name] = CatalogSearchContext(
+                            idx, db_name, expansion_client=client,
+                            expansion_model=model)
+                    except FileNotFoundError:
+                        warehouse_search[db_name] = None
+                search = warehouse_search[db_name]
+                if search is None:
                     print(f"[warn: no retrieval index for {db_name}; "
                           f"falling back to the schema dump] ", end="")
                     extra = full_schema_dump(db)

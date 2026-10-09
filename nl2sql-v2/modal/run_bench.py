@@ -299,6 +299,21 @@ def bq_index(source: str = "spider2_lite_bq", embedder: str = "bge",
     return rc
 
 
+@app.function(image=embed_image, volumes=VOLUMES, gpu="L4", timeout=60 * 60)
+def bq_recall(source: str = "spider2_lite_bq", k: int = 8, verbose: bool = True):
+    """Recall@k of the retrieval index against the official gold SQL.
+
+    The gate before a retrieval lane: spider2-lite ships gold SQL for 148 of the 204
+    BigQuery instances, so this measures whether search_context actually surfaces
+    the tables the answer needs, rather than whether it is merely wired up.
+    """
+    results.reload()
+    argv = ["scripts/check_retrieval_recall.py", "--source", source, "-k", str(k)]
+    if verbose:
+        argv.append("--verbose")
+    return _run(argv)
+
+
 @app.function(image=image, volumes=VOLUMES, secrets=BQ_SECRETS, timeout=60 * 60)
 def bq_preflight(source: str = "spider2_lite_bq", limit_dbs: int = 0):
     """Which BigQuery databases can we actually reach? All probes are dry runs,
