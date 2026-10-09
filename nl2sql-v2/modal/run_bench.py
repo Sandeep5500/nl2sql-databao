@@ -483,6 +483,14 @@ def snow(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
     return codes
 
 
+# run_benchmark.py's own CSV columns. Fixed here rather than inferred from the first
+# shard: a shard written in append mode has no header, and inferring made the merge
+# take a question id as its column names.
+RUN_FIELDS = ["instance_id", "db", "score", "score_detail", "status", "steps",
+              "critic_rounds", "search_calls", "draft_calls", "wall_seconds",
+              "sf_queries", "sf_seconds", "scan_bytes", "sql"]
+
+
 def _merge_shards(tag: str) -> int:
     import csv
     from pathlib import Path
@@ -493,18 +501,28 @@ def _merge_shards(tag: str) -> int:
     results.reload()
     d = Path("/results") / tag
     shard_files = sorted(d.glob("shard*.csv"))
-    rows, fieldnames = [], None
-    for p in shard_files:
-        with open(p, newline="", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            fieldnames = fieldnames or r.fieldnames
-            rows.extend(list(r))
-    if not rows:
+    raw = []
+    for sp in shard_files:
+        with open(sp, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f, fieldnames=RUN_FIELDS):
+                if row["instance_id"] in ("instance_id", "", None):
+                    continue            # a header line, where one exists
+                raw.append(row)
+    # last write wins: a retried shard appends to what the previous attempt left
+    by_id = {r["instance_id"]: r for r in raw}
+    if not by_id:
+        print(f"merge: {len(shard_files)} shard file(s) but no rows -- check that "
+              f"the shards committed", flush=True)
         return 0
+    rows = [by_id[i] for i in sorted(by_id)]
     with open(d / "all.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=RUN_FIELDS)
         w.writeheader()
         w.writerows(rows)
+    print(f"merge: {len(shard_files)} shards, {len(raw)} rows, "
+          f"{len(rows)} unique instances"
+          + (f" ({len(raw) - len(rows)} duplicates dropped)"
+             if len(raw) != len(rows) else ""), flush=True)
     return len(rows)
 
 
