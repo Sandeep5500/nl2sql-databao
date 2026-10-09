@@ -246,7 +246,15 @@ class CatalogSearchContext(SearchContext):
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         self.vecs = mat / np.where(norms == 0, 1.0, norms)
         self.model_id = str(blob["model_id"][0]) if "model_id" in blob else ""
-        self.query_prefix = str(blob["query_prefix"][0])             if "query_prefix" in blob else ""
+        self.query_prefix = (str(blob["query_prefix"][0])
+                             if "query_prefix" in blob else "")
+
+        # Load the encoder NOW, not on the first search. A missing
+        # sentence-transformers surfaced as a per-call tool error, which
+        # ToolSession.dispatch turns into an ERROR string handed to the model: the
+        # lane then ran with a dead search_context that the prompt kept
+        # recommending. Raising here means it is reported before any episode starts.
+        _encoder(self.model_id)
 
     def _search(self, text: str, limit: int):
         import numpy as np

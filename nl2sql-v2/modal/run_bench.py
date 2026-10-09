@@ -348,7 +348,10 @@ def bq_rubric(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
     return rc
 
 
-@app.function(image=image, volumes=VOLUMES, secrets=BQ_SECRETS,
+# embed_image, not image: with --retrieval the shard embeds the search query at
+# runtime, so it needs the encoder too. Keeping torch out of this container cost a
+# whole lane to a dead search_context tool.
+@app.function(image=embed_image, volumes=VOLUMES, secrets=BQ_SECRETS,
               timeout=24 * 60 * 60)
 def bq_shard(instances: list, shard_ix: int, tag: str, endpoint: str,
              model: str, max_steps: int, temperature: float,
