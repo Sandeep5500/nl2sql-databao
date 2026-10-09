@@ -49,13 +49,26 @@ import yaml
 from nl2sql.config import DATA_SOURCES, SPIDER2_LITE
 from nl2sql.lite_catalog import LiteCatalog
 
-# nomic-embed-text v1.5 is what the SQLite index uses, and it is trained with task
-# prefixes: documents and queries go into different sub-spaces without them. An index
-# built with one convention must be queried with the same one, so both strings are
-# written into the .npz rather than assumed.
-EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5"
-DOC_PREFIX = "search_document: "
-QUERY_PREFIX = "search_query: "
+# The SQLite index uses nomic-embed-text v1.5, but through Ollama, which ships its
+# own implementation. Loading it here goes through transformers + trust_remote_code,
+# and its modeling file calls get_extended_attention_mask, which the pinned
+# transformers 5.5.3 removed. bge-base-en-v1.5 is stock BERT, needs no remote code,
+# and is a strong retrieval model.
+#
+# Retrieval models are trained with asymmetric prefixes -- queries and documents land
+# in different sub-spaces without them -- so an index built with one convention must
+# be queried with the same one. Both strings go into the .npz so CatalogSearchContext
+# reads them back instead of assuming them.
+EMBED_MODELS = {
+    "bge": ("BAAI/bge-base-en-v1.5", "",
+            "Represent this sentence for searching relevant passages: "),
+    "e5": ("intfloat/e5-base-v2", "passage: ", "query: "),
+    "minilm": ("sentence-transformers/all-MiniLM-L6-v2", "", ""),
+    # works only where Ollama serves it; kept for parity with the SQLite index
+    "nomic": ("nomic-ai/nomic-embed-text-v1.5", "search_document: ",
+              "search_query: "),
+}
+EMBED_MODEL, DOC_PREFIX, QUERY_PREFIX = EMBED_MODELS["bge"]
 
 SHARD_SUFFIX = re.compile(r"^(?P<stem>.+?)_(?P<date>\d{6}(?:\d{2})?)$")
 
@@ -143,7 +156,10 @@ def build_tables(cat: LiteCatalog) -> tuple[list[dict], dict]:
             "name": name, "kind": "table",
             "description": " ".join(desc),
             "columns": cols,
-            "samples": (t.sample_rows or [])[:3],
+            # No `samples`. Nothing on the retrieval path reads them -- _card renders
+            # the description and column names, and describe_table pulls sample rows
+            # from the catalog at query time -- and they were ~95% of a 200MB build,
+            # including one 36MB file that would have been yaml-parsed per episode.
             "foreign_keys": fks,
         })
     return tables, families
@@ -171,7 +187,19 @@ def chunk_texts(tables: list[dict]) -> list[str]:
     return out
 
 
-def build_db(db_name: str, engine: str, out_dir: Path, embed: bool) -> dict:
+def load_encoder():
+    """The embedding model, loaded once per build.
+
+    Raises on the spot rather than inside the per-database handler: nomic's modeling
+    code needs einops, and when it was missing the loop produced 32 databases with a
+    YAML and no index, each reported as its own failure.
+    """
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(EMBED_MODEL,
+                               trust_remote_code="nomic" in EMBED_MODEL)
+
+
+def build_db(db_name: str, engine: str, out_dir: Path, encoder=None) -> dict:
     cat = LiteCatalog(db_name, engine, SPIDER2_LITE)
     if not cat.available:
         return {"db": db_name, "error": "no catalog directory"}
@@ -202,23 +230,34 @@ def build_db(db_name: str, engine: str, out_dir: Path, embed: bool) -> dict:
 
     chunks = chunk_texts(tables)
     n_fk = sum(len(t["foreign_keys"]) for t in tables)
+    n_cols = sum(len(t["columns"]) for t in tables)
+    n_desc = sum(1 for t in tables for c in t["columns"]
+                 if (c["description"] or "").strip())
+    n_tdesc = sum(1 for t in tables
+                  if any((c["description"] or "").strip() for c in t["columns"]))
     info = {"db": db_name, "tables_raw": raw, "tables": len(tables),
-            "families": len(families), "chunks": len(chunks), "fks": n_fk}
-    if not embed:
+            "families": len(families), "chunks": len(chunks), "fks": n_fk,
+            # how much meaning the chunks actually carry: with no descriptions the
+            # index can only match on names, which is a different experiment
+            "columns": n_cols, "columns_described": n_desc,
+            "tables_described": n_tdesc,
+            "describe_pct": round(100.0 * n_desc / max(n_cols, 1), 1)}
+    if encoder is None:
         return info
 
     import numpy as np
-    from sentence_transformers import SentenceTransformer
 
-    enc = SentenceTransformer(EMBED_MODEL, trust_remote_code=True)
-    vecs = enc.encode([DOC_PREFIX + c for c in chunks],
+    vecs = encoder.encode([DOC_PREFIX + c for c in chunks],
                       batch_size=64, normalize_embeddings=True,
                       show_progress_bar=False)
+    # the table metadata rides inside the .npz as JSON: CatalogSearchContext then
+    # opens one file per database and parses it in milliseconds, instead of
+    # yaml-loading a file that can run to tens of megabytes
     np.savez_compressed(
         out_dir / f"{db_name}.npz",
-        chunks=np.array(chunks, dtype=object).astype("U") if False
-        else np.array(chunks),
+        chunks=np.array(chunks),
         vecs=np.asarray(vecs, dtype="float32"),
+        tables=np.array([json.dumps(tables)]),
         model_id=np.array([EMBED_MODEL]),
         query_prefix=np.array([QUERY_PREFIX]),
         doc_prefix=np.array([DOC_PREFIX]))
@@ -238,9 +277,16 @@ def main():
                     help="default: spider2-dce/output/<engine>/")
     ap.add_argument("--no-embed", action="store_true",
                     help="write the YAML only; skip the embedding model")
+    ap.add_argument("--embedder", default="bge", choices=sorted(EMBED_MODELS),
+                    help="embedding model (default bge: stock BERT, no remote code). "
+                         "'nomic' matches the SQLite index but needs Ollama, since "
+                         "its transformers path is broken by the pinned 5.5.3.")
     ap.add_argument("--force", action="store_true",
                     help="rebuild databases that already have an index")
     args = ap.parse_args()
+
+    global EMBED_MODEL, DOC_PREFIX, QUERY_PREFIX
+    EMBED_MODEL, DOC_PREFIX, QUERY_PREFIX = EMBED_MODELS[args.embedder]
 
     src = DATA_SOURCES.get(args.source)
     if src is None:
@@ -261,6 +307,12 @@ def main():
         dbs = sorted({q["db"] for q in load_questions([src])})
     print(f"{len(dbs)} database(s) from {args.source} ({engine}) -> {out_dir}")
 
+    encoder = None
+    if not args.no_embed:
+        print(f"loading {EMBED_MODEL} ... ", end="", flush=True)
+        encoder = load_encoder()
+        print("ok")
+
     rows, t0 = [], time.time()
     for i, db in enumerate(dbs, 1):
         if not args.force and (out_dir / f"{db}.yaml").exists() and (
@@ -269,7 +321,7 @@ def main():
             continue
         print(f"[{i}/{len(dbs)}] {db} ... ", end="", flush=True)
         try:
-            info = build_db(db, engine, out_dir, embed=not args.no_embed)
+            info = build_db(db, engine, out_dir, encoder=encoder)
         except Exception as e:
             info = {"db": db, "error": f"{type(e).__name__}: {e}"}
         rows.append(info)
@@ -278,7 +330,8 @@ def main():
         else:
             print(f"{info['tables_raw']} -> {info['tables']} tables "
                   f"({info['families']} sharded families), "
-                  f"{info['chunks']} chunks, {info['fks']} prose FKs")
+                  f"{info['chunks']} chunks, {info['fks']} prose FKs, "
+                  f"{info['describe_pct']}% of columns described")
 
     ok = [r for r in rows if not r.get("error")]
     bad = [r for r in rows if r.get("error")]
@@ -289,6 +342,14 @@ def main():
               f"{sum(r['families'] for r in ok)} sharded families")
         print(f"  chunks   : {sum(r['chunks'] for r in ok)}")
         print(f"  prose FKs: {sum(r['fks'] for r in ok)} recovered from descriptions")
+        cols = sum(r["columns"] for r in ok)
+        print(f"  described: {sum(r['columns_described'] for r in ok)}/{cols} columns "
+              f"= {100.0 * sum(r['columns_described'] for r in ok) / max(cols, 1):.1f}%")
+        bare = [r["db"] for r in ok if r["columns_described"] == 0]
+        if bare:
+            print(f"  {len(bare)} database(s) ship NO column descriptions, so their "
+                  f"index can match on names only:")
+            print("    " + ", ".join(sorted(bare)))
     for r in bad:
         print(f"  FAILED {r['db']}: {r['error']}")
     (out_dir / "build_report.json").write_text(json.dumps(rows, indent=1),

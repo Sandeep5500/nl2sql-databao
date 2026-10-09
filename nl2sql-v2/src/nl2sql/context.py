@@ -186,7 +186,10 @@ def _encoder(model_id: str):
     episode on a shard embeds queries against the same model."""
     if model_id not in _ENCODERS:
         from sentence_transformers import SentenceTransformer
-        _ENCODERS[model_id] = SentenceTransformer(model_id, trust_remote_code=True)
+        # remote code only where the model actually needs it: the default embedder
+        # is stock BERT, and asking for it unconditionally is a needless trust grant
+        _ENCODERS[model_id] = SentenceTransformer(
+            model_id, trust_remote_code="nomic" in model_id)
     return _ENCODERS[model_id]
 
 
@@ -223,19 +226,20 @@ class CatalogSearchContext(SearchContext):
         import numpy as np
 
         base = Path(index_dir)
-        yml = base / f"{db_name}.yaml"
         npz = base / f"{db_name}.npz"
-        if not yml.exists() or not npz.exists():
+        if not npz.exists():
             raise FileNotFoundError(
-                f"no catalog index for {db_name!r} in {base} "
-                f"(expected {yml.name} and {npz.name}); "
-                f"run scripts/build_bq_context.py --db {db_name}")
-
-        doc = yaml.safe_load(yml.read_text(encoding="utf-8"))
-        self.tables = {t["name"]: t for t in
-                       doc["context"]["catalogs"][0]["schemas"][0]["tables"]}
+                f"no retrieval index for {db_name!r} in {base} (expected "
+                f"{npz.name}); run scripts/build_bq_context.py --db {db_name}")
 
         blob = np.load(npz, allow_pickle=False)
+        # the table metadata travels in the npz, not the companion YAML: that file
+        # keeps the DCE shape for people to read, and can be tens of megabytes,
+        # which is not something to yaml-parse once per episode
+        import json
+
+        self.tables = {t["name"]: t
+                       for t in json.loads(str(blob["tables"][0]))}
         self.chunks = [str(c) for c in blob["chunks"]]
         mat = blob["vecs"].astype("float32")
         # stored normalised, but renormalise so a hand-built index cannot skew scores

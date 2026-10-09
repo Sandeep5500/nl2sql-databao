@@ -24,7 +24,7 @@ from nl2sql.agent import run_episode
 from nl2sql.config import (AgentConfig, CriticConfig, DATA_SOURCES,
                            DCE_PROJECT_DIR, SPIDER2_LITE,
                            LLMConfig, VLLM_ENDPOINT_FILE)
-from nl2sql.context import SearchContext
+from nl2sql.context import CatalogSearchContext, SearchContext
 from nl2sql.db import Database
 from nl2sql.eval import load_eval_standards, score_against_gold
 from nl2sql.rubric import load_rubric, render_rubric
@@ -164,6 +164,12 @@ def resolve_datasource(db_name: str) -> str | None:
         if (DCE_PROJECT_DIR / "output" / "databases" / f"{cand}.yaml").exists():
             return f"databases/{cand}.yaml"
     return None
+
+
+def warehouse_index_dir(dialect: str) -> Path:
+    """Where build_bq_context.py writes <db>.yaml and <db>.npz."""
+    return DCE_PROJECT_DIR / "output" / ("bigquery" if dialect == "bigquery"
+                                         else "snowflake")
 
 
 def oracle_context(db: Database, info: dict) -> str:
@@ -474,11 +480,22 @@ def main():
         bq_cfg = BigQueryConfig.load(**over)
         print(f"bigquery: {bq_cfg.redacted()}")
     if (snow_cfg or bq_cfg) and args.context_mode == "search":
-        # there is no DCE enrichment for the warehouse databases, and retrieval
-        # measured as vestigial on the local split; say so instead of silently
-        # running every episode with a dead search_context (the 457-call bug).
-        print("warehouse lane: search_context unavailable (no DCE enrichment) - "
-              "running with schema overview + describe_table only")
+        # Retrieval IS available on a warehouse lane now, from the index
+        # build_bq_context.py synthesises out of the catalog Spider2 ships. Say
+        # which databases have one rather than running episodes with a dead
+        # search_context, which is how the 457-silently-failed-call bug stayed
+        # invisible for days.
+        idx = warehouse_index_dir("bigquery" if bq_cfg else "snowflake")
+        have = {p.stem for p in idx.glob("*.yaml")}
+        want = {q["db"] for q in load_questions(sources)}
+        missing = sorted(want - have)
+        print(f"warehouse lane: retrieval index at {idx} covers "
+              f"{len(want & have)}/{len(want)} databases")
+        if missing:
+            print(f"  NO index for {len(missing)}: {', '.join(missing[:10])}"
+                  + (" ..." if len(missing) > 10 else ""))
+            print("  those episodes fall back to the schema dump; build them with "
+                  "scripts/build_bq_context.py --all")
 
     base_url = read_endpoint(args.endpoint)
     client = OpenAI(base_url=base_url, api_key=os.environ.get("VLLM_API_KEY", "EMPTY"))
@@ -587,7 +604,17 @@ def main():
                 doc = p.read_text() if p.exists() else None
             search = None
             extra = ""
-            if args.context_mode == "search":
+            if args.context_mode == "search" and (snow_cfg or bq_cfg):
+                idx = warehouse_index_dir(q["_dialect"])
+                try:
+                    search = CatalogSearchContext(
+                        idx, db_name, expansion_client=client,
+                        expansion_model=model)
+                except FileNotFoundError as e:
+                    print(f"[warn: no retrieval index for {db_name}; "
+                          f"falling back to the schema dump] ", end="")
+                    extra = full_schema_dump(db)
+            elif args.context_mode == "search":
                 ds = resolve_datasource(db_name)
                 if ds:
                     search = SearchContext(DCE_PROJECT_DIR, ds,
@@ -601,9 +628,12 @@ def main():
             elif args.context_mode == "oracle":
                 extra = oracle_context(db, oracle[iid])
             if args.schema_overview and args.context_mode == "search":
+                # compact overview (table -> columns) rather than the full dump:
+                # with retrieval available, describe_table and search_context carry
+                # the detail, and this matches what the SQLite lane sends
                 extra += schema_overview(
                     db, datasource=resolve_datasource(db_name),
-                    report_truncation=snow_cfg is not None)
+                    report_truncation=bool(snow_cfg or bq_cfg))
 
             if args.rubric_dir:
                 rubric = load_rubric(args.rubric_dir, iid)
