@@ -23,7 +23,7 @@ import modal
 
 REPO = "/root/nl2sql-v2"
 
-image = (
+base_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "unzip")
     .uv_pip_install(
@@ -47,14 +47,22 @@ image = (
           # by stage_data, while this is written by bq_index and read by every shard
           "NL2SQL_CONTEXT_DIR": "/results/context",
           "PYTHONUNBUFFERED": "1"})
-    .add_local_dir("nl2sql-v2", REPO)
 )
 
+# add_local_dir has to be the LAST layer: Modal refuses any layer added after a
+# local-dir mount that was not made with copy=True. So both images branch from the
+# base above and mount the source at the end.
+image = base_image.add_local_dir("nl2sql-v2", REPO)
+
 # The index builder needs torch + sentence-transformers, which the benchmark
-# containers have no use for, so it is its own layer. einops is required by nomic's
-# remote code (see build_bq_context.py --embedder); the default bge needs none of it,
-# but installing it keeps the flag usable.
-embed_image = image.uv_pip_install("sentence-transformers>=3.0", "einops>=0.8")
+# containers have no use for, so it gets its own branch. einops is required by
+# nomic's remote code (build_bq_context.py --embedder nomic); the default bge needs
+# none of it, but installing it keeps the flag usable.
+embed_image = (
+    base_image
+    .uv_pip_install("sentence-transformers>=3.0", "einops>=0.8")
+    .add_local_dir("nl2sql-v2", REPO)
+)
 
 # Spider2 questions/gold/dbt projects; the big downloads happen inside a container
 spider2_data = modal.Volume.from_name("spider2-data", create_if_missing=True)
