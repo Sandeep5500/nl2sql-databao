@@ -191,7 +191,7 @@ def main():
 
     from nl2sql.config import SQLITE_DIR
     by_norm = {re.sub(r"[^a-z0-9]", "_", p.stem.lower()): p
-               for p in SQLITE_DIR.glob("*.sqlite")}
+               for p in SQLITE_DIR.glob("*.sqlite") if p.stat().st_size}
     for src in sorted((DCE_PROJECT_DIR / "output" / "databases").glob("*.yaml")):
         if want and src.stem not in want:
             continue

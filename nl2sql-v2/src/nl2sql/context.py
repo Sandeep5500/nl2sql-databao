@@ -66,7 +66,8 @@ class TableContext:
     declared keys), looked up by table name. This is the same content
     search_context returns, addressed by name instead of ranked retrieval."""
 
-    def __init__(self, project_dir: Path, datasource_id: str):
+    def __init__(self, project_dir: Path, datasource_id: str,
+                 explored: bool = False):
         import yaml
         path = Path(project_dir) / "output" / datasource_id
         doc = yaml.safe_load(path.read_text())
@@ -82,6 +83,67 @@ class TableContext:
         if kpath.exists():
             import json
             self.keys = {k.lower(): v for k, v in json.loads(kpath.read_text()).items()}
+        # notes from scripts/explore_notes.py
+        self.explored: dict = {}
+        npath = Path(project_dir) / "output" / "notes" / (Path(datasource_id).stem + ".json")
+        if explored and npath.exists():
+            import json
+            self.explored = json.loads(npath.read_text())
+        # column profiles precomputed by scripts/compute_profile.py
+        self.profiles: dict[str, dict] = {}
+        ppath = Path(project_dir) / "output" / "profile" / (Path(datasource_id).stem + ".json")
+        if ppath.exists():
+            import json
+            self.profiles = {
+                t.lower(): {c.lower(): p for c, p in (rec.get("columns") or {}).items()}
+                for t, rec in json.loads(ppath.read_text()).items()}
+
+    def profile(self, table: str, column: str) -> str:
+        """One-line facts about a column's values (scripts/compute_profile.py)."""
+        p = (self.profiles.get(table.lower()) or {}).get(column.lower())
+        if not p:
+            return ""
+        kind, parts = p.get("kind", ""), []
+        if kind in ("integer", "decimal", "date", "datetime") and "min" in p:
+            parts.append(f"{kind} {p['min']} .. {p['max']}")
+            if p.get("stored_like"):
+                parts.append(f"stored as text like '{p['stored_like']}'")
+        elif kind:
+            parts.append(kind)
+        if p.get("values"):
+            parts.append("values: " + ", ".join(f"{v} ({n})" for v, n in p["values"]))
+        elif p.get("shapes"):
+            parts.append("formats (9 = digit, A = letters): " + ", ".join(
+                f"{s} {round(100 * share)}% e.g. '{ex}'" for s, share, ex in p["shapes"]))
+        if p.get("numeric_values"):
+            parts.append(f"{p['numeric_values']} values are numbers")
+        if p.get("empty_strings"):
+            parts.append(f"{p['empty_strings']} empty strings")
+        return "; ".join(parts)
+
+    def explored_notes(self, table: str) -> str:
+        """Notes from scripts/explore_notes.py, in the form left by the two later
+        passes: verify_notes.py drops a note whose cited query does not show it,
+        rewrite_notes.py reduces the rest to facts with no advice."""
+        tables = {k.lower(): v for k, v in (self.explored.get("tables") or {}).items()}
+        rec = tables.get(table.lower())
+        if not rec or rec.get("error") or "table_note" not in rec:
+            return ""
+
+        def text(x):
+            if x.get("verdict") == "no":
+                return ""
+            return " ".join(str(x.get("fact", x.get("note", ""))).split())
+
+        lines = [f"  (table) {' '.join(str(rec.get('table_fact', rec['table_note'])).split())}"]
+        lines += [f"  (table) {text(p)}" for p in rec.get("pitfalls") or [] if text(p)]
+        lines += [f"  {c.get('column')}: {text(c)}"
+                  for c in rec.get("column_notes") or [] if text(c)]
+        return "\n".join(lines)
+
+    def database_note(self) -> str:
+        return (self.explored.get("database_fact")
+                or self.explored.get("database_note") or "").strip()
 
     def get(self, table: str) -> dict | None:
         return self.tables.get(table.lower())

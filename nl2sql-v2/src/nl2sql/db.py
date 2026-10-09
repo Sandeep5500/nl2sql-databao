@@ -180,7 +180,8 @@ class Database:
         return '"' + identifier.replace('"', '""') + '"'
 
     def describe_table(self, table: str, sample_rows: int = 5,
-                       stats_row_limit: int = 2_000_000, context=None) -> str:
+                       stats_row_limit: int = 2_000_000, context=None,
+                       notes: bool = True) -> str:
         """`context` is an optional nl2sql.context.TableContext; when given, the
         output also carries the context engine's declared keys and descriptions."""
         cols = self._columns(table)
@@ -208,7 +209,9 @@ class Database:
             if name in stats:
                 nd, nn = stats[name]
                 extra = f"  distinct={nd} nulls={nn}"
-            lines.append(f"  {name}  {dtype}  nullable={nullable}{extra}")
+            prof = context.profile(table, name) if context is not None else ""
+            lines.append(f"  {name}  {dtype}  nullable={nullable}{extra}"
+                         + (f"  | {prof}" if prof else ""))
 
         if context is not None:
             keys = context.key_lines(table)
@@ -227,11 +230,17 @@ class Database:
                 lines.append(f"sample rows:\n{sample.to_csv(index=False)}")
             except Exception as e:
                 lines.append(f"sample rows unavailable: {e}")
-        notes = context.notes(table) if context is not None else ""
-        if notes:
-            lines.append("notes (written by an LLM from the schema and a few sample "
-                         "rows; they can be wrong — the facts above take precedence):\n"
-                         + notes)
+        if context is not None and notes:
+            explored = context.explored_notes(table)
+            if explored:
+                lines.append("notes (written by an LLM after querying this table; they "
+                             "can still be wrong — the facts above take precedence):\n"
+                             + explored)
+            else:
+                old = context.notes(table)
+                if old:
+                    lines.append("notes (from the context engine's records; they can "
+                                 "be wrong — the facts above take precedence):\n" + old)
         return "\n".join(lines)
 
     def get_column_values(self, table: str, column: str, limit: int = 20) -> str:
