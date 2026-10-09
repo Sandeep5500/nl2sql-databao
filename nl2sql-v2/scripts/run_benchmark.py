@@ -21,11 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from openai import OpenAI
 
 from nl2sql.agent import run_episode
-from nl2sql.config import (AgentConfig, CriticConfig, DATA_SOURCES, DCE_PROJECT_DIR,
+from nl2sql.config import (AgentConfig, CriticConfig, DATA_SOURCES,
+                           DCE_PROJECT_DIR, SPIDER2_LITE,
                            LLMConfig, VLLM_ENDPOINT_FILE)
 from nl2sql.context import SearchContext
 from nl2sql.db import Database
 from nl2sql.eval import load_eval_standards, score_against_gold
+from nl2sql.rubric import load_rubric, render_rubric
 from nl2sql.tools import ToolSession
 
 
@@ -33,7 +35,12 @@ def load_questions(sources, instances=None, skip=None, limit=None):
     """Load questions from one or more DATA_SOURCES entries.
 
     Each returned question dict carries '_db_dir'/'_docs_dir' (that source's
-    paths) so callers don't need to re-derive them per instance.
+    paths) so callers don't need to re-derive them per instance, plus the
+    source's dialect and eval paths.
+
+    Sources whose jsonl names fields differently (spider2-snow uses
+    'instruction'/'db_id') declare a field_map, applied here so everything
+    downstream only ever sees q["question"] / q["db"].
     """
     out = []
     for src in sources:
@@ -46,12 +53,23 @@ def load_questions(sources, instances=None, skip=None, limit=None):
                 iid = q["instance_id"]
                 if src.id_prefix and not iid.startswith(src.id_prefix):
                     continue
+                if src.id_prefixes and not iid.startswith(src.id_prefixes):
+                    continue
+                if any(iid.startswith(x) for x in src.id_exclude_prefixes):
+                    continue
                 if instances and iid not in instances:
                     continue
                 if skip and iid in skip:
                     continue
+                for canon, src_key in src.field_map.items():
+                    if canon not in q and src_key in q:
+                        q[canon] = q[src_key]
                 q["_db_dir"] = src.db_dir
                 q["_docs_dir"] = src.docs_dir
+                q["_source"] = src.name
+                q["_dialect"] = src.dialect
+                q["_gold_exec_dir"] = src.gold_exec_dir
+                q["_eval_jsonl"] = src.eval_jsonl
                 out.append(q)
     return out[:limit] if limit else out
 
@@ -85,18 +103,41 @@ def wait_for_services(base_url: str, ollama_host: str | None,
     A preempted/requeued or crashed server otherwise turns every remaining
     question into an instant 'Connection error' row that looks like a real
     model failure."""
+    import urllib.error
     import urllib.request
     checks = [("vLLM", base_url.rstrip("/") + "/models")]
     if ollama_host:
         checks.append(("Ollama", f"http://{ollama_host}:11434/api/tags"))
+    # a server started with --api-key answers /v1/models with 401 unless the key is
+    # sent, which would make a perfectly healthy endpoint look down for the whole
+    # max_wait_s. Send the key, and count 401/403 as alive anyway: the question here
+    # is whether the server is answering, not whether we are authorised.
+    api_key = os.environ.get("VLLM_API_KEY", "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     waited = 0
     while True:
         down = []
         for name, url in checks:
             try:
-                with urllib.request.urlopen(url, timeout=10) as r:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    body = r.read(20000)
                     if r.status != 200:
                         down.append(name)
+                    elif name == "vLLM" and b'"id"' not in body:
+                        # 200 with no model listed means the HTTP app is serving but
+                        # the weights are not loaded yet. Proceeding here is what made
+                        # a whole run die on a malformed first completion.
+                        down.append(name)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    # we sent the key, so this is a wrong key, not a warm-up state --
+                    # waiting cannot fix it
+                    raise SystemExit(
+                        f"{name} rejected our API key ({e.code}) at {url}. Check the "
+                        f"VLLM_API_KEY in the nl2sql-vllm secret matches the one the "
+                        f"serve app was deployed with.")
+                down.append(name)
             except Exception:
                 down.append(name)
         if not down:
@@ -147,8 +188,8 @@ def oracle_context(db: Database, info: dict) -> str:
     return "\n".join(parts)
 
 
-def schema_overview(db: Database, char_cap: int = 8_000, datasource: str | None = None,
-                    facts_cap: int = 5_000) -> str:
+def schema_overview(db, char_cap: int = 8_000, datasource: str | None = None,
+                    facts_cap: int = 5_000, report_truncation: bool = False) -> str:
     """Databao-style compressed schema in the system prompt: table -> column names,
     plus SQL-verified structure (grain, joins, coarser keys) from profile_dce.py."""
     prof = _load_profile(datasource)
@@ -167,7 +208,24 @@ def schema_overview(db: Database, char_cap: int = 8_000, datasource: str | None 
         lines.append(f"{t}{grain}: {', '.join(cols)}")
     text = "\n".join(lines)
     if len(text) > char_cap:
-        text = text[:char_cap] + "\n[overview truncated — use list_tables/describe_table]"
+        if report_truncation:
+            # On a 300-table warehouse database the cap bites hard, and how
+            # much schema the model never saw is a confound on any retrieval
+            # claim. Cut at a table boundary and say what was dropped, so the
+            # trace records it. (Local SQLite keeps the original wording so the
+            # baseline prompt stays byte-identical.)
+            kept, used = [], 0
+            for ln in lines:
+                if used + len(ln) + 1 > char_cap:
+                    break
+                kept.append(ln)
+                used += len(ln) + 1
+            text = ("\n".join(kept)
+                    + f"\n[overview truncated at the {char_cap}-char cap: showing "
+                      f"{len(kept)} of {len(lines)} tables — use list_tables/"
+                      f"describe_table for the rest]")
+        else:
+            text = text[:char_cap] + "\n[overview truncated — use list_tables/describe_table]"
     out = ("\nSchema overview (columns per table; [one row per ...] is the table's verified "
            "grain; use describe_table for types/samples):\n" + text)
     facts = []
@@ -201,17 +259,119 @@ def _load_profile(datasource: str | None) -> dict:
         return {}
 
 
-def full_schema_dump(db: Database, char_cap: int = 60_000) -> str:
-    parts = []
-    for t in db.list_tables():
+SHARD_SUFFIX = re.compile(r"^(?P<stem>.+?)_(?P<date>\d{6}(?:\d{2})?)$")
+
+
+def collapse_shards(tables: list[str]) -> tuple[list[str], dict]:
+    """Group `<stem>_YYYYMMDD` / `<stem>_YYYYMM` families into one representative.
+
+    Returns (tables, families) where families maps the representative name to
+    (stem, n_shards, first, last). A family of two is left alone -- collapsing it
+    would hide a name to save nothing.
+    """
+    fams = {}
+    for t in tables:
+        m = SHARD_SUFFIX.match(t)
+        if m:
+            fams.setdefault(m.group("stem"), []).append(m.group("date"))
+    families, drop = {}, set()
+    for stem, dates in fams.items():
+        if len(dates) < 3:
+            continue
+        rep = f"{stem}_*"
+        families[rep] = (stem, len(dates), min(dates), max(dates))
+        drop |= {f"{stem}_{d}" for d in dates}
+    out = [t for t in tables if t not in drop]
+    # keep the representative where the first shard used to sort
+    for rep, (stem, *_rest) in families.items():
+        out.append(rep)
+    return sorted(out), families
+
+
+def _family_note(rep: str, fam: tuple) -> str:
+    stem, n, lo, hi = fam
+    return (f"table: {rep}  ({n} date-sharded tables, {lo} to {hi})\n"
+            f"  Query the whole family with the wildcard and filter the suffix:\n"
+            f"    FROM `{rep}` WHERE _TABLE_SUFFIX BETWEEN '{lo}' AND '{hi}'\n"
+            f"  All shards share one schema; describe_table('{stem}_{hi}') shows it.")
+
+
+def full_schema_dump(db, char_cap: int = 58_000) -> str:
+    """The whole catalog, budgeted so the table list itself is never truncated.
+
+    See the module history: cutting the joined text mid-table made 73% of the bq_v2
+    episodes blind to part of their own database.
+    """
+    tables, families = collapse_shards(db.list_tables())
+    detail_for = {rep: f"{fam[0]}_{fam[3]}" for rep, fam in families.items()}
+
+    names, columns, blocks = {}, {}, {}
+    for t in tables:
+        names[t] = f"- {t}"
+        probe = detail_for.get(t, t)
         try:
-            parts.append(db.describe_table(t))
+            cols = [c for c, _, _ in db._columns(probe)]
+            columns[t] = f"{t}: {', '.join(cols)}"
+        except Exception:
+            pass
+        if t in families:
+            blocks[t] = _family_note(t, families[t])
+            continue
+        try:
+            blocks[t] = db.describe_table(t)
         except Exception as e:
-            parts.append(f"table: {t} (describe failed: {e})")
-    text = "\n\n".join(parts)
-    if len(text) > char_cap:
-        text = text[:char_cap] + "\n[schema dump truncated]"
-    return "\nFull database schema:\n" + text
+            blocks[t] = f"table: {t} (describe failed: {e})"
+
+    # tier 1 is mandatory: the only tier that guarantees the agent can name every
+    # table and ask about it. Family notes ride along in the floor, because a
+    # collapsed `x_*` name is useless without the _TABLE_SUFFIX syntax beside it.
+    floor = "\n".join(names[t] for t in tables)
+    fam_notes = "\n\n".join(blocks[t] for t in tables if t in families)
+    budget = char_cap - len(floor) - len(fam_notes)
+
+    def fit(src: dict, remaining: int) -> list[str]:
+        kept, used = [], 0
+        for t in tables:
+            body = src.get(t)
+            if body is None:
+                continue
+            if used + len(body) + 2 > remaining:
+                break
+            kept.append(t)
+            used += len(body) + 2
+        return kept
+
+    full = fit(blocks, budget)
+    if len(full) == len(tables):
+        body = "\n\n".join(blocks[t] for t in tables)
+        note = ""
+    else:
+        # no room for every full block: give columns to as many as possible, and
+        # fall back to the bare list for the remainder
+        with_cols = fit(columns, budget)
+        if len(with_cols) >= len(full):
+            shown = with_cols
+            body = "\n".join(columns[t] for t in shown if t not in families)
+            kind = "columns"
+        else:
+            shown = full
+            body = "\n\n".join(blocks[t] for t in shown if t not in families)
+            kind = "full detail"
+        if fam_notes:
+            body = fam_notes + "\n\n" + body
+        shown = set(shown) | set(families)
+        rest = [t for t in tables if t not in shown]
+        note = (f"\n\n[{len(shown)} of {len(tables)} tables shown with {kind}; "
+                f"the remaining {len(rest)} are listed by name below and "
+                f"describe_table works on every one of them]\n"
+                + "\n".join(names[t] for t in rest))
+
+    head = "\nFull database schema"
+    if families:
+        head += (f" ({len(families)} date-sharded table "
+                 f"{'family' if len(families) == 1 else 'families'} collapsed to a "
+                 f"wildcard)")
+    return f"{head}:\n{body}{note}"
 
 
 def main():
@@ -223,6 +383,19 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--output", default="../results/v2_run.csv")
     ap.add_argument("--trace-dir")
+    ap.add_argument("--run-tag", default="",
+                    help="tags Snowflake QUERY_TAG so credits are "
+                         "attributable per run; defaults to the output stem")
+    ap.add_argument("--max-bytes-per-query", type=float, default=0,
+                    help="BigQuery: GiB a single query may scan (dry-run "
+                         "enforced; default 50)")
+    ap.add_argument("--max-bytes-per-episode", type=float, default=0,
+                    help="BigQuery: GiB one question may scan in total "
+                         "(default 200)")
+    ap.add_argument("--describe-cache", metavar="DIR",
+                    help="cache describe_table output per table (the Snowflake "
+                         "databases are static, so this is a once-ever cost; "
+                         "share the dir across shards and lanes)")
     ap.add_argument("--context-mode", choices=["search", "full", "oracle"],
                     default="search")
     ap.add_argument("--schema-overview", action="store_true",
@@ -242,13 +415,26 @@ def main():
                          "tool training (e.g. Arctic as actor)")
     ap.add_argument("--resume", action="store_true",
                     help="skip instances already in --output and append to it")
+    ap.add_argument("--thinking", action="store_true",
+                    help="let the model reason before each step (Qwen "
+                         "enable_thinking); slower, reasoning is kept in the trace")
+    ap.add_argument("--rubric-dir",
+                    help="directory of per-question output-shape rubrics from "
+                         "scripts/run_rubric.py; appended to the system prompt")
+    ap.add_argument("--rubric-confident-only", action="store_true",
+                    help="use a question's rubric only when it states an exact row "
+                         "count with high confidence; otherwise add nothing")
     ap.add_argument("--source", default="spider2",
                     help="comma-separated source(s) to load questions from: "
-                         f"{', '.join(sorted(DATA_SOURCES))}, or 'all'")
+                         f"{', '.join(sorted(DATA_SOURCES))}, or 'all' (every "
+                         "local-SQLite source; snow/dbt must be named explicitly)")
     args = ap.parse_args()
 
     if args.source == "all":
-        sources = list(DATA_SOURCES.values())
+        # 'all' keeps its original meaning -- the local-SQLite sources. The snow
+        # and dbt sources need a different backend and runner, so sweeping them in
+        # here would just emit db_not_found rows.
+        sources = [d for d in DATA_SOURCES.values() if d.dialect == "duckdb_sqlite"]
     else:
         names = args.source.split(",")
         unknown = [n for n in names if n not in DATA_SOURCES]
@@ -257,6 +443,43 @@ def main():
                              f"choose from {sorted(DATA_SOURCES)} or 'all'")
         sources = [DATA_SOURCES[n] for n in names]
 
+    dialects = {d.dialect for d in sources}
+    if "duckdb" in dialects:
+        raise SystemExit(
+            "spider2_dbt is a repo-level dbt task, not one-shot SQL. "
+            "Use scripts/run_dbt_benchmark.py.")
+    if len(dialects) > 1:
+        raise SystemExit(f"mixing dialects in one run is not supported: "
+                         f"{sorted(dialects)} - run them as separate lanes.")
+    snow_cfg = bq_cfg = None
+    if args.draft_endpoint and dialects - {"duckdb_sqlite"}:
+        raise SystemExit("--draft-model builds its schema prompt from a SQLite "
+                         "file and emits SQLite SQL; it is not wired for the "
+                         f"warehouse lanes {sorted(dialects)}. Drop the flag.")
+    if dialects == {"snowflake"}:
+        from nl2sql.snowflake_db import SnowflakeConfig
+        snow_cfg = SnowflakeConfig.load(
+            describe_cache_dir=(Path(args.describe_cache) if args.describe_cache
+                                else None))
+        print(f"snowflake: {snow_cfg.redacted()}")
+    if dialects == {"bigquery"}:
+        from nl2sql.bigquery_db import BigQueryConfig
+        GiB = 1024 ** 3
+        over = {}
+        if args.max_bytes_per_query:
+            over["max_bytes_per_query"] = int(args.max_bytes_per_query * GiB)
+        if args.max_bytes_per_episode:
+            over["max_bytes_per_episode"] = int(
+                args.max_bytes_per_episode * GiB)
+        bq_cfg = BigQueryConfig.load(**over)
+        print(f"bigquery: {bq_cfg.redacted()}")
+    if (snow_cfg or bq_cfg) and args.context_mode == "search":
+        # there is no DCE enrichment for the warehouse databases, and retrieval
+        # measured as vestigial on the local split; say so instead of silently
+        # running every episode with a dead search_context (the 457-call bug).
+        print("warehouse lane: search_context unavailable (no DCE enrichment) - "
+              "running with schema overview + describe_table only")
+
     base_url = read_endpoint(args.endpoint)
     client = OpenAI(base_url=base_url, api_key=os.environ.get("VLLM_API_KEY", "EMPTY"))
     model = args.model or client.models.list().data[0].id
@@ -264,8 +487,11 @@ def main():
 
     llm = LLMConfig(base_url=base_url, model=model,
                     temperature=args.temperature,
-                    chat_template_kwargs={"enable_thinking": False}
+                    chat_template_kwargs={"enable_thinking": args.thinking}
                     if "qwen" in model.lower() else {})
+    if args.thinking:
+        # reasoning tokens count against the completion budget
+        llm.max_tokens, llm.timeout = 12_000, 900.0
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
                       text_sql_fallback=args.text_sql_fallback)
@@ -289,16 +515,26 @@ def main():
         oracle = json.loads(oracle_path.read_text())
         questions = [q for q in questions if q["instance_id"] in oracle]
         print(f"oracle mode: restricted to {len(questions)} instances with gold SQL")
-    standards = load_eval_standards()
+    # one standards file per source: lite and snow ship different eval jsonls
+    _standards: dict[str, dict] = {}
+
+    def standards_for(q):
+        key = q.get("_source", "spider2")
+        if key not in _standards:
+            _standards[key] = load_eval_standards(q.get("_eval_jsonl"))
+        return _standards[key]
+    run_tag = args.run_tag or Path(args.output).stem
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
     if trace_dir:
         trace_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # sf_queries/sf_seconds are the Snowflake spend per instance: an all-zero
+    # column means nothing actually ran, which is how a dead connection looks.
     fieldnames = ["instance_id", "db", "score", "score_detail", "status", "steps",
                   "critic_rounds", "search_calls", "draft_calls", "wall_seconds",
-                  "sql"]
+                  "sf_queries", "sf_seconds", "scan_bytes", "sql"]
     correct = 0
     if args.resume and out_path.exists():
         prior = list(csv.DictReader(open(out_path)))
@@ -318,14 +554,33 @@ def main():
             iid, db_name = q["instance_id"], q["db"]
             print(f"[{i + 1}/{len(questions)}] {iid} ({db_name}) ... ",
                   end="", flush=True)
-            db_path = q["_db_dir"] / f"{db_name}.sqlite"
-            if not db_path.exists():
-                writer.writerow({"instance_id": iid, "db": db_name, "score": 0,
-                                 "score_detail": "db_not_found"})
-                print("db_not_found")
-                continue
-
-            db = Database(db_path)
+            db_path = None
+            if snow_cfg is None and bq_cfg is None:
+                db_path = q["_db_dir"] / f"{db_name}.sqlite"
+                if not db_path.exists():
+                    writer.writerow({"instance_id": iid, "db": db_name, "score": 0,
+                                     "score_detail": "db_not_found"})
+                    print("db_not_found")
+                    continue
+                db = Database(db_path)
+            else:
+                try:
+                    if snow_cfg is not None:
+                        from nl2sql.snowflake_db import SnowflakeDatabase
+                        db = SnowflakeDatabase(db_name, snow_cfg, instance_id=iid,
+                                               run_tag=run_tag)
+                    else:
+                        from nl2sql.bigquery_db import BigQueryDatabase
+                        db = BigQueryDatabase(db_name, bq_cfg, SPIDER2_LITE,
+                                              instance_id=iid, run_tag=run_tag)
+                except Exception as e:
+                    # a missing database grant would otherwise score as a wrong
+                    # answer for every instance using it
+                    writer.writerow({"instance_id": iid, "db": db_name, "score": 0,
+                                     "score_detail": f"connect_failed: {e}"})
+                    f.flush()
+                    print(f"connect_failed: {e}")
+                    continue
             doc = None
             if q.get("external_knowledge") and q["_docs_dir"]:
                 p = q["_docs_dir"] / q["external_knowledge"]
@@ -346,7 +601,18 @@ def main():
             elif args.context_mode == "oracle":
                 extra = oracle_context(db, oracle[iid])
             if args.schema_overview and args.context_mode == "search":
-                extra += schema_overview(db, datasource=resolve_datasource(db_name))
+                extra += schema_overview(
+                    db, datasource=resolve_datasource(db_name),
+                    report_truncation=snow_cfg is not None)
+
+            if args.rubric_dir:
+                rubric = load_rubric(args.rubric_dir, iid)
+                if rubric and args.rubric_confident_only and not (
+                        rubric.get("rows_confidence") == "high"
+                        and rubric.get("exact_rows") is not None):
+                    rubric = None
+                if rubric:
+                    extra += "\n" + render_rubric(rubric)
 
             draft = None
             if args.draft_endpoint and args.draft_model:
@@ -377,10 +643,17 @@ def main():
             finally:
                 db.close()
 
+            budget = getattr(db, "budget", None)
             if result.pred_df is not None:
-                score, detail = score_against_gold(result.pred_df, iid, standards)
+                score, detail = score_against_gold(
+                    result.pred_df, iid, standards_for(q), q.get("_gold_exec_dir"))
             else:
                 score, detail = 0, result.error or result.status
+                if budget and budget.timeouts:
+                    # never fold an execution failure into result_mismatch:
+                    # a timeout-dominated run measures the warehouse size,
+                    # not the model.
+                    detail = f"sf_timeout x{budget.timeouts}: {detail}"
             correct += score
             writer.writerow({
                 "instance_id": iid, "db": db_name, "score": score,
@@ -389,6 +662,9 @@ def main():
                 "search_calls": result.search_calls,
                 "draft_calls": session.draft_calls,
                 "wall_seconds": round(result.wall_seconds, 1),
+                "sf_queries": budget.queries if budget else "",
+                "sf_seconds": round(budget.seconds, 1) if budget else "",
+                "scan_bytes": getattr(db, "bytes_scanned", "") or "",
                 "sql": (result.sql or "").replace("\n", "\\n")})
             f.flush()
             print(f"{'✓' if score else '✗'} {detail} "

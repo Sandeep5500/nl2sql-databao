@@ -6,11 +6,12 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from .config import AgentConfig
-from .db import Database
+from .dbbase import DatabaseLike
 
 
 def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
-                       has_draft: bool = False) -> list[dict]:
+                       has_draft: bool = False, dialect: str = "DuckDB",
+                       has_find_value: bool = True) -> list[dict]:
     def fn(name, desc, props, required):
         return {"type": "function", "function": {
             "name": name, "description": desc,
@@ -19,20 +20,22 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
 
     tools = [
         fn("run_sql_query",
-           "Run one DuckDB SELECT query against the database. Returns a CSV preview "
+           f"Run one {dialect} SELECT query against the database. Returns a CSV preview "
            f"(default {cfg.preview_rows_default} rows, max {cfg.preview_rows_max}) plus a "
            "query_id you can pass to submit_result. The full result (up to "
            f"{cfg.result_rows_max} rows) is stored for submission.",
-           {"sql": {"type": "string", "description": "A single DuckDB SELECT statement."},
+           {"sql": {"type": "string",
+                     "description": f"A single {dialect} SELECT statement."},
             "preview_rows": {"type": "integer",
                              "description": f"Rows to show (1-{cfg.preview_rows_max}). "
                                             f"Default {cfg.preview_rows_default}."}},
            ["sql"]),
-        fn("list_tables", "List all table names in the database.", {}, []),
+        fn("list_tables", "List all table and view names in the database.", {}, []),
         fn("describe_table",
-           "Exact schema of one table: columns with types, nullability, distinct/null "
-           "counts, row count, and 5 sample rows. Use this to verify columns before "
-           "writing SQL — it is ground truth, unlike search results.",
+           "Everything known about one table: columns with types, nullability, "
+           "distinct/null counts, row count, what one row is (primary or unique key), "
+           "foreign keys, 5 sample rows, and generated column notes. Use this to "
+           "verify columns and keys before writing SQL.",
            {"table": {"type": "string"}}, ["table"]),
         fn("get_column_values",
            "Top distinct values of a column with occurrence counts. Use before writing "
@@ -40,14 +43,6 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
            {"table": {"type": "string"}, "column": {"type": "string"},
             "limit": {"type": "integer", "description": "Max values (default 20)."}},
            ["table", "column"]),
-        fn("find_value",
-           "Find which table/column contains a given text value (case-insensitive "
-           "substring search across text columns). Use when the question mentions a "
-           "name/code/label and you don't know where it lives or how it is spelled.",
-           {"term": {"type": "string"},
-            "table": {"type": "string", "description": "Optional: restrict to one table."},
-            "column": {"type": "string", "description": "Optional: restrict to one column."}},
-           ["term"]),
         fn("submit_result",
            "Submit the stored result of a previous run_sql_query as the final answer. "
            "Must be your only tool call in the message.",
@@ -56,6 +51,21 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
                                    "description": "One-sentence summary of the answer."}},
            ["query_id", "result_description"]),
     ]
+    if has_find_value:
+        # Omitted entirely rather than left to fail: on BigQuery a cross-table LIKE
+        # sweep is ruinous, so the backend refuses it -- and advertising a tool that
+        # always errors cost 89 calls across 63 of 204 episodes in bq_v2.
+        tools.append(fn(
+            "find_value",
+            "Find which table/column contains a given text value (case-insensitive "
+            "substring search across text columns). Use when the question mentions a "
+            "name/code/label and you don't know where it lives or how it is spelled.",
+            {"term": {"type": "string"},
+             "table": {"type": "string",
+                       "description": "Optional: restrict to one table."},
+             "column": {"type": "string",
+                        "description": "Optional: restrict to one column."}},
+            ["term"]))
     if has_search:
         tools.append(fn(
             "search_context",
@@ -71,7 +81,7 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
             "schema and your request, and returns SQL. Call it EARLY with the full "
             "question (or a precise sub-question) to get a strong starting draft — "
             "then verify the draft with run_sql_query and refine it yourself. The "
-            "draft is written in SQLite dialect and may need small DuckDB fixes.",
+            f"draft is written in SQLite dialect and may need small {dialect} fixes.",
             {"request": {"type": "string",
                          "description": "The question or precise instruction for the "
                                         "specialist, including any needed definitions "
@@ -88,9 +98,10 @@ def build_tool_schemas(cfg: AgentConfig, has_docs: bool, has_search: bool,
 
 @dataclass
 class ToolSession:
-    db: Database
+    db: DatabaseLike
     cfg: AgentConfig
     search: object | None = None          # SearchContext
+    table_context: object | None = None   # TableContext (keys + notes in describe_table)
     doc_text: str | None = None
     draft: object | None = None           # DraftSQL (specialist model client)
     query_results: dict = field(default_factory=dict)  # query_id -> (sql, df)
@@ -116,9 +127,10 @@ class ToolSession:
             self.query_results[qid] = (args["sql"], df)
             return f"query_id='{qid}'\n{csv}"
         if name == "list_tables":
-            return "\n".join(self.db.list_tables())
+            views = self.db.list_views()
+            return "\n".join(self.db.list_tables() + [f"{v} (view)" for v in views])
         if name == "describe_table":
-            return self.db.describe_table(args["table"])
+            return self.db.describe_table(args["table"], context=self.table_context)
         if name == "get_column_values":
             return self.db.get_column_values(args["table"], args["column"],
                                              int(args.get("limit") or 20))

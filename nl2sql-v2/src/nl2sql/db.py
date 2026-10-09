@@ -1,10 +1,34 @@
 """DuckDB wrapper over a Spider2 local SQLite database, plus deterministic
 schema/value inspection used by the dbtools."""
 
+import os
 from pathlib import Path
 
 import duckdb
 import pandas as pd
+
+MEMORY_LIMIT = os.environ.get("NL2SQL_DUCKDB_MEMORY", "3GB")
+
+
+def _configure(con) -> None:
+    """Engine settings applied to every connection.
+
+    - cte_inlining off: with it on, DuckDB's sqlite scanner fails valid queries
+      that join over CTEs and end in LIMIT ("INTERNAL Error: Attempted to access
+      index 0 within vector of size 0").
+    - memory_limit: a runaway query returns an error to the agent instead of
+      getting the whole benchmark process killed by the job's memory cgroup.
+    """
+    con.execute("SET disabled_optimizers='cte_inlining'")
+    con.execute(f"SET memory_limit='{MEMORY_LIMIT}'")
+
+
+def _run(con, sql: str) -> pd.DataFrame:
+    rel = con.execute(sql)
+    if rel is None or rel.description is None:
+        raise ValueError("The SQL contained no statement that returns rows "
+                         "(empty or comment-only query).")
+    return rel.df()
 
 
 def _decode_bytes(df: pd.DataFrame) -> pd.DataFrame:
@@ -30,12 +54,20 @@ def _trim_cell(value, limit: int):
 
 
 class Database:
+    # keys into prompts.DIALECTS; see dbbase.DatabaseLike
+    dialect = "duckdb_sqlite"
+
     def __init__(self, sqlite_path: Path):
         self.sqlite_path = sqlite_path
         self.con = duckdb.connect(":memory:")
         self.con.execute("INSTALL sqlite; LOAD sqlite;")
+        _configure(self.con)
         self.con.execute(f"ATTACH '{sqlite_path}' AS db (TYPE sqlite, READ_ONLY)")
         self.con.execute("USE db")
+
+    @property
+    def display_name(self) -> str:
+        return self.sqlite_path.stem
 
     def close(self):
         self.con.close()
@@ -48,6 +80,7 @@ class Database:
         if getattr(self, "_av", None) is None:
             av = duckdb.connect(":memory:")
             av.execute("INSTALL sqlite; LOAD sqlite;")
+            _configure(av)
             av.execute("SET GLOBAL sqlite_all_varchar=true")
             av.execute(f"ATTACH '{self.sqlite_path}' AS db (TYPE sqlite, READ_ONLY)")
             av.execute("USE db")
@@ -56,7 +89,7 @@ class Database:
 
     # ── raw query ─────────────────────────────────────────────────────────
     def query(self, sql: str, max_rows: int = 100) -> pd.DataFrame:
-        return _decode_bytes(self.con.execute(sql).df().head(max_rows))
+        return _decode_bytes(_run(self.con, sql).head(max_rows))
 
     def query_preview(self, sql: str, preview_rows: int, max_rows: int,
                       cell_char_limit: int = 1024,
@@ -70,7 +103,7 @@ class Database:
         timer.start()
         av_note = ""
         try:
-            df = _decode_bytes(self.con.execute(sql).df())
+            df = _decode_bytes(_run(self.con, sql))
         except Exception as e:
             timer.cancel()
             if "Mismatch Type Error" not in str(e):
@@ -81,7 +114,7 @@ class Database:
             timer = threading.Timer(timeout_s, av.interrupt)
             timer.start()
             try:
-                df = _decode_bytes(av.execute(sql).df())
+                df = _decode_bytes(_run(av, sql))
                 av_note = ("\n[note: this table has mixed-typed columns; all values "
                            "were read as TEXT — use TRY_CAST(col AS DOUBLE) for math]")
             except Exception as e2:
@@ -111,6 +144,29 @@ class Database:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def list_views(self) -> list[str]:
+        """Views the agent can query like tables (e.g. complex_oracle's `profits`).
+
+        Names come from SQLite directly: asking DuckDB for the view catalog fails
+        for the whole database when any single view has a definition it cannot
+        parse (stacking, oracle_sql). Views DuckDB cannot read are left out."""
+        import sqlite3
+        try:
+            src = sqlite3.connect(f"file:{self.sqlite_path}?mode=ro", uri=True)
+            names = [r[0] for r in src.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name")]
+            src.close()
+        except Exception:
+            return []
+        readable = []
+        for name in names:
+            try:
+                self._columns(name)
+                readable.append(name)
+            except Exception:
+                continue
+        return readable
+
     def _columns(self, table: str) -> list[tuple[str, str, str]]:
         """[(name, type, is_nullable)] — raises ValueError on unknown table."""
         try:
@@ -129,7 +185,13 @@ class Database:
         return '"' + identifier.replace('"', '""') + '"'
 
     def describe_table(self, table: str, sample_rows: int = 5,
-                       stats_row_limit: int = 2_000_000) -> str:
+                       stats_row_limit: int = 2_000_000, context=None,
+                       notes: bool = True) -> str:
+        """`context` is an optional nl2sql.context.TableContext; when given, the
+        output also carries the context engine's declared keys and descriptions.
+
+        The enrichment material only exists for the SQLite databases, so the
+        warehouse backends take the argument and ignore it."""
         cols = self._columns(table)
         qt = self._q(table)
         n_rows = self.con.execute(f"SELECT COUNT(*) FROM {qt}").fetchone()[0]
@@ -155,7 +217,16 @@ class Database:
             if name in stats:
                 nd, nn = stats[name]
                 extra = f"  distinct={nd} nulls={nn}"
-            lines.append(f"  {name}  {dtype}  nullable={nullable}{extra}")
+            prof = context.profile(table, name) if context is not None else ""
+            lines.append(f"  {name}  {dtype}  nullable={nullable}{extra}"
+                         + (f"  | {prof}" if prof else ""))
+
+        if context is not None:
+            keys = context.key_lines(table)
+            fks = context.foreign_keys(table)
+            if fks:
+                keys.append("foreign keys (declared): " + "; ".join(fks))
+            lines[1:1] = keys
 
         if n_rows:
             select = ", ".join(f"CAST({self._q(c)} AS VARCHAR) AS {self._q(c)}"
@@ -218,3 +289,58 @@ class Database:
                 if len(hits) >= limit:
                     return "\n".join(hits[:limit]) + "\n[hit limit; refine the term]"
         return "\n".join(hits) if hits else f"no cell values matching {term!r} found"
+
+
+class DuckDBFile(Database):
+    """A native .duckdb file -- the database a dbt project reads and writes.
+
+    Reuses Database's describe_table/get_column_values/find_value/query_preview
+    wholesale; only the catalog lookups differ, because those go through SQLite's
+    scanner (sqlite_master, pragma_table_info) in the parent. dbt projects here are
+    small, so none of the Snowflake-style cost guards are needed.
+    """
+
+    dialect = "duckdb"
+
+    def __init__(self, path: Path, read_only: bool = True):
+        # the parent's helpers read .sqlite_path; keep it set so they keep working
+        self.sqlite_path = Path(path)
+        self.read_only = read_only
+        self.con = duckdb.connect(str(path), read_only=read_only)
+
+    def _all_varchar_con(self):
+        # SQLite's loose typing is what that fallback is for; a native DuckDB file
+        # has real types, so there is nothing to retry and silently re-reading
+        # everything as text would hide a genuine type error.
+        raise RuntimeError(
+            "all-varchar retry does not apply to a native DuckDB database; "
+            "fix the query's types (TRY_CAST) instead")
+
+    def list_tables(self) -> list[str]:
+        rows = self.con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
+            "AND table_type = 'BASE TABLE' ORDER BY table_name"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def list_views(self) -> list[str]:
+        """A native DuckDB file has a readable view catalog, unlike the attached
+        SQLite scanner the base class works around."""
+        rows = self.con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
+            "AND table_type = 'VIEW' ORDER BY table_name"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _columns(self, table: str) -> list[tuple[str, str, str]]:
+        rows = self.con.execute(
+            "SELECT column_name, data_type, CASE WHEN is_nullable THEN 'YES' "
+            "ELSE 'NO' END FROM duckdb_columns() WHERE table_name = ? "
+            "ORDER BY column_index", [table],
+        ).fetchall()
+        if not rows:
+            raise ValueError(f"Unknown table: {table!r}. "
+                             f"Use list_tables() to see valid names.")
+        return rows

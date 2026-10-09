@@ -10,12 +10,22 @@ from openai import OpenAI
 
 from . import critic as critic_mod
 from .config import AgentConfig, CriticConfig, LLMConfig
-from .prompts import (DOC_HINT, MEMORY_PREFIX, SEARCH_HINT_FULL,
+from .prompts import (DIALECTS, DOC_HINT, MEMORY_PREFIX, SEARCH_HINT_FULL,
                       SEARCH_HINT_SEARCH, SUMMARIZE_PROMPT, SYSTEM_PROMPT,
+                      VALUE_HINT_FIND, VALUE_HINT_LOOP_FIND,
+                      VALUE_HINT_LOOP_PLAIN, VALUE_HINT_PLAIN,
                       USER_START)
 from .tools import ToolSession, build_tool_schemas, parse_tool_args
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+class _PromptFacts(dict):
+    """Leaves a placeholder the backend did not supply visible in the prompt,
+    so a missing fact shows up in a trace instead of raising mid-episode."""
+
+    def __missing__(self, key):
+        return "{" + key + "}"
 
 
 @dataclass
@@ -118,14 +128,37 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                                api_key=llm.api_key, timeout=llm.timeout)
 
     has_search = session.search is not None and cfg.context_mode == "search"
-    tools = build_tool_schemas(cfg, has_docs=session.doc_text is not None,
-                               has_search=has_search,
-                               has_draft=session.draft is not None)
-    system = SYSTEM_PROMPT.format(
+    # a session may define its own toolset and prompt (the dbt lane does);
+    # the SQL lanes take neither branch and are unaffected.
+    # A backend that refuses find_value (BigQuery: a cross-table LIKE sweep is
+    # ruinous there) must not have it advertised; see tools.build_tool_schemas.
+    has_find_value = getattr(session.db, "find_value_enabled", True)
+    if hasattr(session, "tool_schemas"):
+        tools = session.tool_schemas()
+    else:
+        tools = build_tool_schemas(cfg, has_docs=session.doc_text is not None,
+                                   has_search=has_search,
+                                   has_draft=session.draft is not None,
+                                   dialect=DIALECTS[getattr(
+                                       session.db, "dialect",
+                                       "duckdb_sqlite")].name,
+                                   has_find_value=has_find_value)
+    dialect = DIALECTS[getattr(session.db, "dialect", "duckdb_sqlite")]
+    # a backend may expose prompt_facts to fill placeholders in its rules (e.g. the
+    # Snowflake query budget); unknown placeholders are left visible, not crashed on.
+    dialect_rules = dialect.sql_rules.format_map(
+        _PromptFacts(getattr(session.db, "prompt_facts", None) or {}))
+    system = session.system_prompt(question, cfg, extra_context) if hasattr(
+        session, "system_prompt") else SYSTEM_PROMPT.format(
+        dialect_header=dialect.header,
+        dialect_rules=dialect_rules,
         search_hint=SEARCH_HINT_SEARCH if has_search else SEARCH_HINT_FULL,
+        value_hint=VALUE_HINT_FIND if has_find_value else VALUE_HINT_PLAIN,
+        value_hint_loop=(VALUE_HINT_LOOP_FIND if has_find_value
+                         else VALUE_HINT_LOOP_PLAIN),
         doc_hint=DOC_HINT if session.doc_text else "",
         max_steps=cfg.max_steps,
-        db_name=session.db.sqlite_path.stem,
+        db_name=session.db.display_name,
         question=question,
         extra_context=extra_context,
     )
@@ -155,6 +188,16 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
             result.status, result.error = "error", f"llm_call: {e}"
             break
 
+        if not hasattr(resp, "choices"):
+            # A proxy or a still-warming server can return a body the SDK
+            # hands back as a plain string. Classify it as an infra error so
+            # the runner retries the question, instead of letting one bad
+            # response end a 68-instance run with a traceback.
+            result.status = "error"
+            result.error = ("llm_call: Connection error - malformed response "
+                            f"({type(resp).__name__}): {str(resp)[:200]}")
+            break
+
         msg = resp.choices[0].message
         assistant: dict = {"role": "assistant",
                            "content": _strip_think(msg.content) or ""}
@@ -166,7 +209,12 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                               "arguments": tc.function.arguments}}
                 for tc in tool_calls]
         messages.append(assistant)
-        result.trace.append({"step": step, "assistant": assistant})
+        entry = {"step": step, "assistant": assistant}
+        reasoning = (msg.model_dump().get("reasoning")
+                     or msg.model_dump().get("reasoning_content"))
+        if reasoning:  # kept for analysis only; never sent back to the model
+            entry["reasoning"] = reasoning
+        result.trace.append(entry)
 
         if not tool_calls:
             if cfg.text_sql_fallback:

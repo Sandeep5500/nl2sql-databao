@@ -64,7 +64,8 @@ def trace_to_messages(t: dict) -> list:
 
 
 def convert(trace_dir: Path, csv_path: Path | None = None,
-            model: str = "unknown", out_dir: Path = INSPECT_LOG_DIR) -> Path:
+            model: str = "unknown", out_dir: Path = INSPECT_LOG_DIR,
+            dataset: str = "spider2-lite-local") -> Path:
     rows = {}
     if csv_path and Path(csv_path).exists():
         rows = {r["instance_id"]: r for r in csv.DictReader(open(csv_path))}
@@ -95,8 +96,8 @@ def convert(trace_dir: Path, csv_path: Path | None = None,
         version=2, status="success",
         eval=EvalSpec(
             created=datetime.now(timezone.utc).isoformat(),
-            task=f"spider2-lite-local/{run_name}",
-            dataset=EvalDataset(name="spider2-lite-local", samples=len(samples)),
+            task=f"{dataset}/{run_name}",
+            dataset=EvalDataset(name=dataset, samples=len(samples)),
             model=model,
             config=EvalConfig(),
         ),
@@ -117,8 +118,11 @@ def main():
     ap.add_argument("--csv", type=Path, help="results CSV (adds scores/status)")
     ap.add_argument("--model", default="Qwen/Qwen3.5-9B")
     ap.add_argument("--out-dir", type=Path, default=INSPECT_LOG_DIR)
+    # without this every lane's Inspect log claims to be the SQLite split
+    ap.add_argument("--dataset", default="spider2-lite-local",
+                    help="e.g. spider2-dbt, spider2-lite-bq, spider2-lite-sf")
     args = ap.parse_args()
-    convert(args.trace_dir, args.csv, args.model, args.out_dir)
+    convert(args.trace_dir, args.csv, args.model, args.out_dir, args.dataset)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,10 @@
-"""Spider2-lite scoring, ported unchanged from scripts/spider2_benchmark.py."""
+"""Spider2 scoring, ported unchanged from scripts/spider2_benchmark.py.
+
+The comparison itself is dialect-agnostic (pandas frame vs gold CSV), so the
+same code scores Snowflake results; only the gold directory and the per-instance
+standards file differ, and both are injectable. Defaults keep the lite lane
+byte-identical for existing call sites.
+"""
 
 import json
 import math
@@ -7,12 +13,14 @@ import re
 
 import pandas as pd
 
+from pathlib import Path
+
 from .config import EVAL_JSONL, GOLD_EXEC_DIR
 
 
-def load_eval_standards() -> dict:
+def load_eval_standards(eval_jsonl: Path | None = None) -> dict:
     standards = {}
-    with open(EVAL_JSONL) as f:
+    with open(eval_jsonl or EVAL_JSONL) as f:
         for line in f:
             row = json.loads(line)
             standards[row["instance_id"]] = row
@@ -81,10 +89,12 @@ def _csv_roundtrip(df):
         return df  # e.g. zero-column frame; compare as-is
 
 
-def score_against_gold(pred_df, instance_id: str, standards: dict) -> tuple[int, str]:
+def score_against_gold(pred_df, instance_id: str, standards: dict,
+                       gold_exec_dir: Path | None = None) -> tuple[int, str]:
+    gold_dir = Path(gold_exec_dir or GOLD_EXEC_DIR)
     pred_df = _csv_roundtrip(pred_df)
     pattern = re.compile(rf"^{re.escape(instance_id)}(_[a-z])?\.csv$")
-    gold_files = sorted(GOLD_EXEC_DIR / f for f in os.listdir(GOLD_EXEC_DIR)
+    gold_files = sorted(gold_dir / f for f in os.listdir(gold_dir)
                         if pattern.match(f))
     if not gold_files:
         return 0, "no_gold_files"

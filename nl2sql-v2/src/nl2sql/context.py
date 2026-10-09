@@ -175,3 +175,85 @@ class SearchContext:
         if not chunks:
             return "no matching context found"
         return "\n\n---\n\n".join(chunks)
+
+# ── retrieval over a prebuilt catalog index (the warehouse lanes) ────────────
+
+_ENCODERS: dict = {}
+
+
+def _encoder(model_id: str):
+    """One SentenceTransformer per process, cached: loading is seconds and every
+    episode on a shard embeds queries against the same model."""
+    if model_id not in _ENCODERS:
+        from sentence_transformers import SentenceTransformer
+        _ENCODERS[model_id] = SentenceTransformer(model_id, trust_remote_code=True)
+    return _ENCODERS[model_id]
+
+
+class _Hit:
+    """The one field SearchContext._fused and rank_tables read off a result."""
+    __slots__ = ("context_result", "score")
+
+    def __init__(self, context_result: str, score: float):
+        self.context_result = context_result
+        self.score = score
+
+
+class CatalogSearchContext(SearchContext):
+    """search_context over an index built by scripts/build_bq_context.py.
+
+    Same public surface as SearchContext (search / rank_tables), same table cards and
+    join hops, but the chunk search is a cosine scan over vectors on disk instead of
+    a DCE DuckDB query. A warehouse database here is at most a few thousand chunks,
+    so a brute-force matmul is well under a millisecond and needs no index format.
+    """
+
+    def __init__(self, index_dir, db_name: str, expansion_client=None,
+                 expansion_model: str | None = None, group_tables: bool = True,
+                 join_hops: bool = True):
+        # deliberately not super().__init__(): that imports databao_context_engine
+        # and opens the DCE project, neither of which exists for these databases.
+        self.expansion_client = expansion_client
+        self.expansion_model = expansion_model
+        self.group_tables = group_tables
+        self.join_hops = join_hops
+        self.datasource_id = db_name
+        self.engine = None
+
+        import numpy as np
+
+        base = Path(index_dir)
+        yml = base / f"{db_name}.yaml"
+        npz = base / f"{db_name}.npz"
+        if not yml.exists() or not npz.exists():
+            raise FileNotFoundError(
+                f"no catalog index for {db_name!r} in {base} "
+                f"(expected {yml.name} and {npz.name}); "
+                f"run scripts/build_bq_context.py --db {db_name}")
+
+        doc = yaml.safe_load(yml.read_text(encoding="utf-8"))
+        self.tables = {t["name"]: t for t in
+                       doc["context"]["catalogs"][0]["schemas"][0]["tables"]}
+
+        blob = np.load(npz, allow_pickle=False)
+        self.chunks = [str(c) for c in blob["chunks"]]
+        mat = blob["vecs"].astype("float32")
+        # stored normalised, but renormalise so a hand-built index cannot skew scores
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        self.vecs = mat / np.where(norms == 0, 1.0, norms)
+        self.model_id = str(blob["model_id"][0]) if "model_id" in blob else ""
+        self.query_prefix = str(blob["query_prefix"][0])             if "query_prefix" in blob else ""
+
+    def _search(self, text: str, limit: int):
+        import numpy as np
+
+        enc = _encoder(self.model_id)
+        # The prefix the index was BUILT with, carried in the index itself. nomic's
+        # task prefixes are not optional-but-harmless: an index embedded with
+        # "search_document: " must be queried with "search_query: ", and mixing them
+        # degrades retrieval quietly rather than failing. See
+        # scripts/dce_patches/0001-fk-text-and-nomic-prefixes.patch.
+        q = enc.encode([self.query_prefix + text], normalize_embeddings=True)
+        sims = self.vecs @ np.asarray(q, dtype="float32")[0]
+        top = np.argsort(-sims)[:limit]
+        return [_Hit(self.chunks[i], float(sims[i])) for i in top]
