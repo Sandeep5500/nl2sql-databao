@@ -356,8 +356,7 @@ def bq_shard(instances: list, shard_ix: int, tag: str, endpoint: str,
              retrieval: bool = False):
     argv = ["scripts/run_benchmark.py",
             "--source", "spider2_lite_bq",
-            "--schema-overview",
-            "--context-mode", "search" if retrieval else "full",
+            "--schema-overview", "--context-mode", "full",
             "--instances", ",".join(instances),
             "--output", f"/results/{tag}/shard{shard_ix:02d}.csv",
             "--trace-dir", f"/results/{tag}/traces",
@@ -365,6 +364,9 @@ def bq_shard(instances: list, shard_ix: int, tag: str, endpoint: str,
             "--model", model, "--max-steps", str(max_steps),
             "--temperature", str(temperature), "--resume",
             "--endpoint", serve_url(model, endpoint)]
+    if retrieval:
+        # additive, not instead of the dump: see run_benchmark.py --retrieval
+        argv.append("--retrieval")
     if rubric_dir:
         argv += ["--rubric-dir", rubric_dir]
         if confident_only:

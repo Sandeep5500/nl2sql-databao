@@ -426,6 +426,12 @@ def main():
     ap.add_argument("--rubric-dir",
                     help="directory of per-question output-shape rubrics from "
                          "scripts/run_rubric.py; appended to the system prompt")
+    ap.add_argument("--retrieval", action="store_true",
+                    help="warehouse lanes: offer search_context from the index built "
+                         "by scripts/build_bq_context.py, IN ADDITION to whatever "
+                         "--context-mode already puts in the prompt. The dump now "
+                         "keeps every table name but drops descriptions for about "
+                         "half the episodes, and the table cards carry those.")
     ap.add_argument("--rubric-confident-only", action="store_true",
                     help="use a question's rubric only when it states an exact row "
                          "count with high confidence; otherwise add nothing")
@@ -605,7 +611,8 @@ def main():
                 doc = p.read_text() if p.exists() else None
             search = None
             extra = ""
-            if args.context_mode == "search" and (snow_cfg or bq_cfg):
+            if (args.retrieval or args.context_mode == "search") and (
+                    snow_cfg or bq_cfg):
                 # cached per database: the larger indexes are ~150 MiB of float32
                 # (fec is 52,357 chunks) and shards are grouped by database, so
                 # rebuilding this per episode would re-read the same file for every
@@ -619,10 +626,15 @@ def main():
                     except FileNotFoundError:
                         warehouse_search[db_name] = None
                 search = warehouse_search[db_name]
-                if search is None:
+                if search is None and args.context_mode == "search":
                     print(f"[warn: no retrieval index for {db_name}; "
                           f"falling back to the schema dump] ", end="")
                     extra = full_schema_dump(db)
+                elif search is None:
+                    print(f"[warn: no retrieval index for {db_name}] ", end="")
+            if args.retrieval and args.context_mode == "full":
+                # additive: the dump as bq_v3 sent it, plus search_context
+                extra = full_schema_dump(db)
             elif args.context_mode == "search":
                 ds = resolve_datasource(db_name)
                 if ds:

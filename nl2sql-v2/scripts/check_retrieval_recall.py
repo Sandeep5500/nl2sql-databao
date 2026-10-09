@@ -22,6 +22,7 @@ first thing to check is that the .npz query_prefix matches how it was built.
 """
 
 import argparse
+import json
 import re
 import sys
 from collections import Counter
@@ -70,6 +71,9 @@ def main():
     ap.add_argument("-k", type=int, default=8, help="tables retrieved per query")
     ap.add_argument("--verbose", action="store_true",
                     help="list the questions where retrieval missed")
+    ap.add_argument("--json", type=Path, default=None,
+                    help="write the report here as well as printing it; defaults to "
+                         "recall_report.json beside the index")
     args = ap.parse_args()
 
     src = DATA_SOURCES[args.source]
@@ -121,6 +125,26 @@ def main():
     if no_index:
         print(f"\n{sum(no_index.values())} question(s) had no index, across "
               f"{len(no_index)} database(s): {', '.join(sorted(no_index))}")
+    report = {
+        "source": args.source, "k": args.k, "index": str(idx),
+        "questions_with_gold": len(with_gold), "questions_scored": scored,
+        "gold_tables": n_tab, "gold_tables_found": n_hit,
+        "recall_per_table_pct": round(100.0 * n_hit / max(n_tab, 1), 1),
+        "all_tables_questions": n_all,
+        "all_tables_pct": round(100.0 * n_all / scored, 1),
+        "no_index_questions": sum(no_index.values()),
+        "no_index_databases": sorted(no_index),
+        "misses": [{"instance": i, "db": d, "missed": m, "top": g}
+                   for i, d, m, g in misses],
+    }
+    out = args.json or (idx / "recall_report.json")
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+        print(f"\nreport written to {out}")
+    except OSError as e:
+        print(f"\ncould not write the report to {out}: {e}")
+
     if misses:
         print(f"\n{len(misses)} question(s) missed at least one gold table")
         if args.verbose:
