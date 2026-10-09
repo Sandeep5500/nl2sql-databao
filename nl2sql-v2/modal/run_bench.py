@@ -43,9 +43,18 @@ image = (
     # PYTHONUNBUFFERED: without it a script's prints only reach the Modal log
     # when it exits, so a long run looks hung when it is merely working.
     .env({"NL2SQL_DATA_ROOT": "/data", "NL2SQL_SCRATCH": "/tmp/nl2sql-scratch",
+          # the retrieval index goes on the results volume: /data is populated once
+          # by stage_data, while this is written by bq_index and read by every shard
+          "NL2SQL_CONTEXT_DIR": "/results/context",
           "PYTHONUNBUFFERED": "1"})
     .add_local_dir("nl2sql-v2", REPO)
 )
+
+# The index builder needs torch + sentence-transformers, which the benchmark
+# containers have no use for, so it is its own layer. einops is required by nomic's
+# remote code (see build_bq_context.py --embedder); the default bge needs none of it,
+# but installing it keeps the flag usable.
+embed_image = image.uv_pip_install("sentence-transformers>=3.0", "einops>=0.8")
 
 # Spider2 questions/gold/dbt projects; the big downloads happen inside a container
 spider2_data = modal.Volume.from_name("spider2-data", create_if_missing=True)
@@ -256,6 +265,32 @@ def smoke(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
 
 
 # ─────────────────────────── Snowflake ───────────────────────────────────
+@app.function(image=embed_image, volumes=VOLUMES, gpu="L4",
+              timeout=4 * 60 * 60)
+def bq_index(source: str = "spider2_lite_bq", embedder: str = "bge",
+             force: bool = False, db: str = ""):
+    """Synthesise the retrieval index for a warehouse lane onto /results.
+
+    Free of warehouse cost and of LLM calls: every field comes from the catalog
+    spider2-lite ships. See scripts/build_bq_context.py for why that is enough on
+    BigQuery but not on SQLite.
+    """
+    # --out is left off: NL2SQL_CONTEXT_DIR already points both the builder and
+    # the benchmark shards at the same place
+    argv = ["scripts/build_bq_context.py", "--source", source,
+            "--embedder", embedder]
+    if db:
+        for one in db.split(","):
+            argv += ["--db", one]
+    else:
+        argv.append("--all")
+    if force:
+        argv.append("--force")
+    rc = _run(argv)
+    results.commit()
+    return rc
+
+
 @app.function(image=image, volumes=VOLUMES, secrets=BQ_SECRETS, timeout=60 * 60)
 def bq_preflight(source: str = "spider2_lite_bq", limit_dbs: int = 0):
     """Which BigQuery databases can we actually reach? All probes are dry runs,
@@ -294,10 +329,12 @@ def bq_rubric(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
               timeout=24 * 60 * 60)
 def bq_shard(instances: list, shard_ix: int, tag: str, endpoint: str,
              model: str, max_steps: int, temperature: float,
-             rubric_dir: str = "", confident_only: bool = True):
+             rubric_dir: str = "", confident_only: bool = True,
+             retrieval: bool = False):
     argv = ["scripts/run_benchmark.py",
             "--source", "spider2_lite_bq",
-            "--schema-overview", "--context-mode", "full",
+            "--schema-overview",
+            "--context-mode", "search" if retrieval else "full",
             "--instances", ",".join(instances),
             "--output", f"/results/{tag}/shard{shard_ix:02d}.csv",
             "--trace-dir", f"/results/{tag}/traces",
@@ -319,7 +356,8 @@ def bq_shard(instances: list, shard_ix: int, tag: str, endpoint: str,
 def bq(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
        tag: str = "bq_run", shards: int = 1, limit: int = 0,
        max_steps: int = 60, temperature: float = 0.0,
-       rubric_dir: str = "", confident_only: bool = True):
+       rubric_dir: str = "", confident_only: bool = True,
+       retrieval: bool = False):
     """The spider2-lite BigQuery lane (bq###/ga###). `limit` takes a stratified
     slice for calibration; `shards` fans out, split by database so the catalog and
     BigQuery query cache stay warm within a shard."""
@@ -345,7 +383,7 @@ def bq(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
     # a guaranteed-zero bucket, not a budget.
     codes = list(bq_shard.starmap(
         [(b, i, tag, endpoint, model, max_steps, temperature, rubric_dir,
-          confident_only)
+          confident_only, retrieval)
          for i, b in enumerate(buckets)]))
     results.commit()
     print(f"merged {_merge_shards(tag)} rows into /results/{tag}/all.csv", flush=True)

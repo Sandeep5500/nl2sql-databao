@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import yaml
 
-from nl2sql.config import DATA_SOURCES, SPIDER2_LITE
+from nl2sql.config import CONTEXT_DIR, DATA_SOURCES, SPIDER2_LITE
 from nl2sql.lite_catalog import LiteCatalog
 
 # The SQLite index uses nomic-embed-text v1.5, but through Ollama, which ships its
@@ -171,6 +171,12 @@ def chunk_texts(tables: list[dict]) -> list[str]:
     It yaml-loads each chunk and looks for a "table_name" key (a column chunk) or a
     dict under "table" (a table chunk), so these have to be real YAML with those
     keys -- not prose that merely mentions the table.
+
+    A table chunk is always emitted and lists every column name, so names stay
+    searchable. A column chunk is emitted only when the column has a description:
+    without one it repeats what the table chunk already says, and adds a
+    near-identical vector per column for the fusion to wade through. On the databases
+    that ship no descriptions at all that was every column chunk.
     """
     out = []
     for t in tables:
@@ -179,6 +185,8 @@ def chunk_texts(tables: list[dict]) -> list[str]:
                        "columns": [c["name"] for c in t["columns"]]}},
             sort_keys=False, allow_unicode=True, width=10_000))
         for c in t["columns"]:
+            if not (c["description"] or "").strip():
+                continue
             out.append(yaml.safe_dump(
                 {"table_name": t["name"],
                  "column": {"name": c["name"], "type": c["type"],
@@ -297,8 +305,7 @@ def main():
         raise SystemExit(f"--source {args.source} is {src.dialect}; this builds "
                          f"indexes for the warehouse lanes only")
 
-    out_dir = Path(args.out) if args.out else (
-        Path(__file__).resolve().parents[2] / "spider2-dce" / "output" / engine)
+    out_dir = Path(args.out) if args.out else CONTEXT_DIR / engine
 
     if args.db:
         dbs = args.db

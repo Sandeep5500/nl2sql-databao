@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from openai import OpenAI
 
 from nl2sql.agent import run_episode
-from nl2sql.config import (AgentConfig, CriticConfig, DATA_SOURCES,
+from nl2sql.config import (CONTEXT_DIR, AgentConfig, CriticConfig, DATA_SOURCES,
                            DCE_PROJECT_DIR, SPIDER2_LITE,
                            LLMConfig, VLLM_ENDPOINT_FILE)
 from nl2sql.context import CatalogSearchContext, SearchContext
@@ -167,9 +167,8 @@ def resolve_datasource(db_name: str) -> str | None:
 
 
 def warehouse_index_dir(dialect: str) -> Path:
-    """Where build_bq_context.py writes <db>.yaml and <db>.npz."""
-    return DCE_PROJECT_DIR / "output" / ("bigquery" if dialect == "bigquery"
-                                         else "snowflake")
+    """Where build_bq_context.py writes <db>.npz (and the companion YAML)."""
+    return CONTEXT_DIR / ("bigquery" if dialect == "bigquery" else "snowflake")
 
 
 def oracle_context(db: Database, info: dict) -> str:

@@ -18,6 +18,13 @@ GOLD_EXEC_DIR = SPIDER2_LITE / "evaluation_suite/gold/exec_result"
 GOLD_SQL_DIR = SPIDER2_LITE / "evaluation_suite/gold/sql"
 EVAL_JSONL = SPIDER2_LITE / "evaluation_suite/gold/spider2lite_eval.jsonl"
 
+# Retrieval indexes for the warehouse lanes, written by scripts/build_bq_context.py
+# as <CONTEXT_DIR>/<engine>/<db>.npz. Defaults beside the DCE artifacts; on Modal it
+# is set to the results volume, which is the writable one the builder commits and the
+# benchmark shards read.
+CONTEXT_DIR = Path(os.environ.get("NL2SQL_CONTEXT_DIR",
+                                  REPO_ROOT / "spider2-dce/output"))
+
 # Spider 2.0-Snow: the same 547 questions as lite, every database re-hosted on
 # Snowflake. instance_ids are namespaced by origin -- sf_local### are twins of our
 # local### SQLite questions, sf_bq### came from BigQuery (the enterprise-scale
