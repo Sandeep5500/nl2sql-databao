@@ -426,6 +426,11 @@ def main():
     ap.add_argument("--rubric-dir",
                     help="directory of per-question output-shape rubrics from "
                          "scripts/run_rubric.py; appended to the system prompt")
+    ap.add_argument("--search-limit", type=int, default=None,
+                    help="tables returned per search_context call (default 8). "
+                         "Measured against gold SQL on the BigQuery catalog, "
+                         "all-tables recall is 61.7%% at 8 and 70.3%% at 16, because "
+                         "28 of the 49 failures at 8 missed exactly one table.")
     ap.add_argument("--retrieval", action="store_true",
                     help="warehouse lanes: offer search_context from the index built "
                          "by scripts/build_bq_context.py, IN ADDITION to whatever "
@@ -517,6 +522,8 @@ def main():
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
                       text_sql_fallback=args.text_sql_fallback)
+    if args.search_limit:
+        cfg.search_limit = args.search_limit
     critic = CriticConfig(enabled=bool(args.critic_model),
                           base_url=args.critic_endpoint, model=args.critic_model,
                           chat_template_kwargs={"enable_thinking": False}

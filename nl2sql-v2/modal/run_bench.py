@@ -353,7 +353,7 @@ def bq_rubric(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
 def bq_shard(instances: list, shard_ix: int, tag: str, endpoint: str,
              model: str, max_steps: int, temperature: float,
              rubric_dir: str = "", confident_only: bool = True,
-             retrieval: bool = False):
+             retrieval: bool = False, search_limit: int = 16):
     argv = ["scripts/run_benchmark.py",
             "--source", "spider2_lite_bq",
             "--schema-overview", "--context-mode", "full",
@@ -365,8 +365,10 @@ def bq_shard(instances: list, shard_ix: int, tag: str, endpoint: str,
             "--temperature", str(temperature), "--resume",
             "--endpoint", serve_url(model, endpoint)]
     if retrieval:
-        # additive, not instead of the dump: see run_benchmark.py --retrieval
-        argv.append("--retrieval")
+        # additive, not instead of the dump: see run_benchmark.py --retrieval.
+        # 16 rather than the default 8: all-tables recall against gold SQL is
+        # 61.7% at 8 and 70.3% at 16 on this catalog.
+        argv += ["--retrieval", "--search-limit", str(search_limit)]
     if rubric_dir:
         argv += ["--rubric-dir", rubric_dir]
         if confident_only:
@@ -382,7 +384,7 @@ def bq(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
        tag: str = "bq_run", shards: int = 1, limit: int = 0,
        max_steps: int = 60, temperature: float = 0.0,
        rubric_dir: str = "", confident_only: bool = True,
-       retrieval: bool = False):
+       retrieval: bool = False, search_limit: int = 16):
     """The spider2-lite BigQuery lane (bq###/ga###). `limit` takes a stratified
     slice for calibration; `shards` fans out, split by database so the catalog and
     BigQuery query cache stay warm within a shard."""
@@ -408,7 +410,7 @@ def bq(endpoint: str = "", model: str = "Qwen/Qwen3.6-35B-A3B",
     # a guaranteed-zero bucket, not a budget.
     codes = list(bq_shard.starmap(
         [(b, i, tag, endpoint, model, max_steps, temperature, rubric_dir,
-          confident_only, retrieval)
+          confident_only, retrieval, search_limit)
          for i, b in enumerate(buckets)]))
     results.commit()
     print(f"merged {_merge_shards(tag)} rows into /results/{tag}/all.csv", flush=True)
