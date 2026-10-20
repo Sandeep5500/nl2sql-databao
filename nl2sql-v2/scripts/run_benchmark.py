@@ -199,6 +199,11 @@ def main():
     ap.add_argument("--thinking", action="store_true",
                     help="let the model reason before each step (Qwen "
                          "enable_thinking); slower, reasoning is kept in the trace")
+    ap.add_argument("--explored-notes", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="use the notes from scripts/explore_notes.py in describe_table, "
+                         "plus a short guide to the database in the system prompt "
+                         "(default on; --no-explored-notes turns it off)")
     ap.add_argument("--plain-describe", action="store_true",
                     help="describe_table without the context engine's keys and "
                          "notes (the behaviour before Oct 2026)")
@@ -291,7 +296,8 @@ def main():
             if args.context_mode == "search":
                 ds = resolve_datasource(db_name)
                 if ds and not args.plain_describe:
-                    table_context = TableContext(DCE_PROJECT_DIR, ds)
+                    table_context = TableContext(DCE_PROJECT_DIR, ds,
+                                                 explored=args.explored_notes)
                 if ds:
                     search = SearchContext(DCE_PROJECT_DIR, ds,
                                            expansion_client=client,
@@ -305,6 +311,10 @@ def main():
                 extra = oracle_context(db, oracle[iid])
             if args.schema_overview and args.context_mode == "search":
                 extra += schema_overview(db)
+            if table_context is not None and table_context.database_note():
+                extra += ("\n\nHow this database is organised (written by an LLM "
+                          "from the tables' notes and keys):\n"
+                          + table_context.database_note())
 
             if args.rubric_dir:
                 rubric = load_rubric(args.rubric_dir, iid)

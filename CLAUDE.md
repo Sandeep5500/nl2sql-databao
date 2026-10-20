@@ -46,6 +46,7 @@ Key runner flags: `--resume` (skip done, append), `--temperature` (pass@K sampli
 `--rubric-dir <dir> [--rubric-confident-only]` (output-shape rubric from
 `scripts/run_rubric.py`; the gated form shows it only when it states an exact row count
 with high confidence), `--plain-describe` (describe_table without DCE keys/notes),
+`--no-explored-notes` (turn off the explored enrichment, which is on by default),
 `--thinking` (Qwen reasoning on; no gain measured, a few questions run away).
 Single-shot lane: `scripts/run_single_shot.py`. Long runs: wrap with
 `../logs/bench/run_lane.sh <tag> <command...>` for auto-restart (up to 15 attempts).
@@ -88,6 +89,29 @@ Table keys (`spider2-dce/output/keys/<db>.json`, tracked) feed describe_table's
 (data only: smallest unique column sets), then the same with
 `--choose --endpoint http://<node>:<port>/v1 --model <model>` (the model proposes the
 intended key; it is kept only if the data confirms it is unique).
+
+Explored enrichment (Oct 2026; all outputs under `spider2-dce/output/`, tracked). From repo
+root, with `E="--endpoint http://<node>:<port>/v1 --model <model>"`:
+1. `scripts/compute_profile.py --out-dir spider2-dce/output/profile` — per-column facts
+   from the data, no LLM (ranges, value lists, value formats).
+2. `scripts/explore_notes.py --datasources <a,b> $E` — one SQL-only agent episode per table
+   (8 turns) writes notes, each citing a query; plus a short guide per database → `notes/`.
+3. `scripts/verify_notes.py --datasources <a,b> $E` — drops a note when its cited query
+   does not show the claim.
+4. `scripts/rewrite_notes.py $E` — reduces each note to facts, **no advice** (advice such
+   as "deduplicate by tree_id" took modern_data from 15 correct runs to 0).
+5. `scripts/apply_notes_to_dce.py --write`, then `DCE_OLLAMA_HOST=<node> ... --index` —
+   writes profile + notes into `databases/*.yaml` and re-embeds `dce.duckdb` (~30 min).
+   **A fresh clone must run the `--index` step**: the index is gitignored and the tracked
+   records no longer match an index built before Oct 8.
+describe_table shows profile, keys and notes; the guide goes in the system prompt.
+Measured effect is small (see below); it is kept because it removes wrong descriptions.
+
+Results on the 135 local questions (Qwen3.6-35B, temp 0.7, 4 lanes; pass@1 / pass@4 / pass^4):
+baseline 47.4% / 94 / 32 · new describe_table 51.1% / 94 / 41 · + gated rubric 51.3% / 94 / 45 ·
+fresh control with profile+keys+gated rubric 51.1% / 92 / 39 · + explored enrichment 53.7% / 92 / 45
+(old index) and 50.2% / 92 / 41 (rebuilt index). Two runs of one configuration differ by
+about this much, so effects under ~3 points are not resolved by 4 lanes.
 
 ## Known result baselines (Sept 2026, Qwen3.5-9B)
 
