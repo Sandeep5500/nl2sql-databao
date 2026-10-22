@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--with-sql", action="store_true",
                     help="also give the rubric agent run_sql_query")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--shard", help="I/N, round-robin, so lanes can run in parallel")
     args = ap.parse_args()
 
     base_url = read_endpoint(args.endpoint)
@@ -51,6 +52,12 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     questions = load_questions(set(args.instances.split(",")) if args.instances else None)
+    if isinstance(questions, tuple):      # loader returns (questions, overrides)
+        questions = questions[0]
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        questions = [q for k, q in enumerate(questions) if k % n == i]
+        print(f"shard {i}/{n}: {len(questions)} questions")
     ollama_host = None if args.no_search else os.environ.get("DCE_OLLAMA_HOST")
 
     n_ok = 0

@@ -33,8 +33,13 @@ What to work out
 1. Row grain — what one row of the final result stands for ("one row per customer", \
 "a single row holding the answer").
 2. Row count — only what the question itself fixes: exactly 1, exactly N (when the \
-question states N), or one per <entity>. For "one per entity", say whether entities with \
-no matching data still need a row. You may use the tools to see how many such entities \
+question states N), or one per <entity>. Read to the END of the question before deciding. \
+A question often names a SET and then asks for a single figure over it: "the five cities \
+with the lowest payments, then the average of their totals", "the average for products \
+4160 and 7790", "which category appears most often". There the set is a FILTER, not the \
+grain, and the answer is exactly 1 row — not one per member. Only say "one per <entity>" \
+when the question asks to see each entity separately. For "one per entity", say whether \
+entities with no matching data still need a row. You may use the tools to see how many such entities \
 exist; report that as context, not as a target, because the analyst's filters may \
 legitimately change it.
 3. Columns — every quantity or attribute the question asks to see gets its own column, \

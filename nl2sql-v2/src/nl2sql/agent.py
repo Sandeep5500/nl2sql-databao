@@ -25,6 +25,8 @@ class EpisodeResult:
     status: str                      # submitted | fallback | no_sql | error
     steps: int = 0
     critic_rounds: int = 0
+    shape_refusals: int = 0
+    refused_qid: str = ""
     search_calls: int = 0
     error: str | None = None
     trace: list = field(default_factory=list)
@@ -109,7 +111,7 @@ def _compact_memory(messages: list[dict], cfg: AgentConfig, client, llm: LLMConf
 
 def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                 cfg: AgentConfig, critic_cfg: CriticConfig | None = None,
-                extra_context: str = "") -> EpisodeResult:
+                extra_context: str = "", rubric_rows: int | None = None) -> EpisodeResult:
     t0 = time.time()
     client = OpenAI(base_url=llm.base_url, api_key=llm.api_key, timeout=llm.timeout)
     critic_client = None
@@ -221,6 +223,31 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                                             f"first and use its query_id."})
                 continue
             sql, df = sub
+            # The planner said how many rows the question asks for, and it never saw a
+            # result, so this expectation is independent of whatever the analyst has in
+            # hand. Where the planner's count was right and the analyst submitted a
+            # different one anyway, every such episode failed (13 for 13), and the
+            # prompt's "compare your result with this" was simply skipped. Refuse
+            # instead of asking. Capped, overridable, and silent near the step cap, so
+            # a refusal can never turn a submission into a step-cap death.
+            if (cfg.rubric_enforce and rubric_rows is not None
+                    and not args.get("confirm_shape")
+                    and len(df) != rubric_rows
+                    and result.shape_refusals < cfg.max_shape_refusals
+                    and cfg.max_steps - step >= cfg.shape_check_reserve):
+                result.shape_refusals += 1
+                complaint = (
+                    f"SUBMISSION REFUSED. The planner read the question as asking for "
+                    f"exactly {rubric_rows} row(s), with high confidence; this result "
+                    f"has {len(df)}.\nEither fix the query so it returns "
+                    f"{rubric_rows} row(s), or, if you are certain the planner is wrong, "
+                    f"call submit_result again with confirm_shape=true.")
+                result.trace.append({"step": step, "shape_refusal": complaint,
+                                     "rubric_rows": rubric_rows, "got_rows": len(df)})
+                result.refused_qid = str(args.get("query_id", ""))
+                messages.append({"role": "tool", "tool_call_id": submit_call.id,
+                                 "content": complaint})
+                continue
             if critic_client and result.critic_rounds < critic_cfg.max_rounds:
                 verdict = critic_mod.review(
                     critic_client, critic_cfg, question, sql,
@@ -268,7 +295,9 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
             if df_q is None or len(df_q) == 0:
                 continue
             clusters.setdefault(sig(df_q), []).append((int(qid[1:]), qid))
-        if clusters:
+        if result.refused_qid and result.refused_qid in session.query_results:
+            qid = result.refused_qid          # it chose this; only the gate stopped it
+        elif clusters:
             best = max(clusters.values(), key=lambda v: (len(v), max(x[0] for x in v)))
             qid = max(best)[1]
         else:

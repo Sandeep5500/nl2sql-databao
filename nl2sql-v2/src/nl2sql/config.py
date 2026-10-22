@@ -60,5 +60,10 @@ class AgentConfig:
     keep_recent_turns: int = 5           # turns kept verbatim by memory compaction
     summary_max_tokens: int = 700        # [MEMORY] note budget
     find_value_max_columns: int = 200
+    # Refuse a submission whose row count contradicts a high-confidence rubric.
+    # The planner never saw a result, so this check is independent of the analyst.
+    rubric_enforce: bool = False        # opt in with --rubric-enforce
+    max_shape_refusals: int = 2         # then accept, so it cannot eat the budget
+    shape_check_reserve: int = 6        # never refuse with fewer steps left than this
     context_mode: str = "search"        # search | full | oracle  (ablation arms A/B/C)
     text_sql_fallback: bool = False     # execute ```sql blocks from non-tool models

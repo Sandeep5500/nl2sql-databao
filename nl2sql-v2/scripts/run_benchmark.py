@@ -207,6 +207,9 @@ def main():
     ap.add_argument("--plain-describe", action="store_true",
                     help="describe_table without the context engine's keys and "
                          "notes (the behaviour before Oct 2026)")
+    ap.add_argument("--rubric-enforce", action="store_true",
+                    help="refuse a submission whose row count contradicts a "
+                         "high-confidence rubric, instead of only advising")
     ap.add_argument("--rubric-confident-only", action="store_true",
                     help="use a question's rubric only when it states an exact row "
                          "count with high confidence; otherwise add nothing")
@@ -229,7 +232,8 @@ def main():
         llm.max_tokens, llm.timeout = 12_000, 900.0
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
-                      text_sql_fallback=args.text_sql_fallback)
+                      text_sql_fallback=args.text_sql_fallback,
+                      rubric_enforce=args.rubric_enforce)
     critic = CriticConfig(enabled=bool(args.critic_model),
                           base_url=args.critic_endpoint, model=args.critic_model,
                           chat_template_kwargs={"enable_thinking": False}
@@ -316,14 +320,20 @@ def main():
                           "from the tables' notes and keys):\n"
                           + table_context.database_note())
 
+            rubric_rows = None
             if args.rubric_dir:
                 rubric = load_rubric(args.rubric_dir, iid)
-                if rubric and args.rubric_confident_only and not (
-                        rubric.get("rows_confidence") == "high"
-                        and rubric.get("exact_rows") is not None):
+                confident = bool(rubric
+                                 and rubric.get("rows_confidence") == "high"
+                                 and rubric.get("exact_rows") is not None)
+                if rubric and args.rubric_confident_only and not confident:
                     rubric = None
                 if rubric:
                     extra += "\n" + render_rubric(rubric)
+                    # Only a confident, exact count is worth enforcing: 4 of 73 rubrics
+                    # had the wrong row count, and a wrong one halves the solve rate.
+                    if confident:
+                        rubric_rows = int(rubric["exact_rows"])
 
             draft = None
             if args.draft_endpoint and args.draft_model:
@@ -344,7 +354,7 @@ def main():
                                           table_context=table_context,
                                           doc_text=doc, draft=draft)
                     result = run_episode(q["question"], session, llm, cfg, critic,
-                                         extra_context=extra)
+                                         extra_context=extra, rubric_rows=rubric_rows)
                     if not is_infra_error(result.error):
                         break
                     print("[infra error, retrying question] ", end="", flush=True)
