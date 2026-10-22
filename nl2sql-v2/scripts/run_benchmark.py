@@ -207,6 +207,8 @@ def main():
     ap.add_argument("--plain-describe", action="store_true",
                     help="describe_table without the context engine's keys and "
                          "notes (the behaviour before Oct 2026)")
+    ap.add_argument("--shard",
+                    help="I/N round-robin, so lanes can share one server")
     ap.add_argument("--rubric-enforce", action="store_true",
                     help="refuse a submission whose row count contradicts a "
                          "high-confidence rubric, instead of only advising")
@@ -244,6 +246,10 @@ def main():
         set(args.instances.split(",")) if args.instances else None,
         set(args.skip_instances.split(",")) if args.skip_instances else None,
         args.limit)
+    if args.shard:
+        _i, _n = (int(x) for x in args.shard.split("/"))
+        questions = [q for k, q in enumerate(questions) if k % _n == _i]
+        print(f"shard {_i}/{_n}: {len(questions)} questions")
 
     oracle = {}
     if args.context_mode == "oracle":
