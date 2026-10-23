@@ -260,7 +260,8 @@ def main():
                   "critic_rounds", "search_calls", "draft_calls", "wall_seconds",
                   "sql"]
     correct = 0
-    if args.resume and out_path.exists():
+    # an empty file (a lane killed before its first question) has no header yet
+    if args.resume and out_path.exists() and out_path.stat().st_size > 0:
         prior = list(csv.DictReader(open(out_path)))
         done_ids = {r["instance_id"] for r in prior}
         correct = sum(1 for r in prior if r.get("score") == "1")
