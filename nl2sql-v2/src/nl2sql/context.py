@@ -131,7 +131,7 @@ class TableContext:
             return ""
 
         def text(x):
-            if x.get("verdict") == "no":
+            if x.get("verdict") == "no" or x.get("excluded"):
                 return ""
             return " ".join(str(x.get("fact", x.get("note", ""))).split())
 

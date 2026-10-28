@@ -43,7 +43,7 @@ def rewrite(dest: Path) -> None:
                     n_tables += 1
                     rec = explored.get(t["name"].lower()) or {}
                     def text(x):  # the fact left by the checking and rewriting passes
-                        if x.get("verdict") == "no":
+                        if x.get("verdict") == "no" or x.get("excluded"):
                             return ""
                         return " ".join(str(x.get("fact", x.get("note", ""))).split())
                     parts = [" ".join(str(rec.get("table_fact",
