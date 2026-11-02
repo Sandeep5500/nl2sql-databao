@@ -31,10 +31,13 @@ import argparse
 import hashlib
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import random
 import re
 import sqlite3
+import zlib
 import sys
 from pathlib import Path
 
@@ -43,6 +46,18 @@ from openai import OpenAI
 # ── failure-mode templates ────────────────────────────────────────────────
 # Stratified from the measured taxonomy (plan §3.2). Each bucket teaches the
 # judge a different discrimination; counts are lane-failures on the 135.
+
+def stable_hash(s: str) -> int:
+    """A process-independent digest.
+
+    str.__hash__ is salted per interpreter (PYTHONHASHSEED), so seeding an RNG
+    from hash() silently made --seed non-reproducible: the same seed produced a
+    different combination order on every run, which also meant --resume did not
+    reproduce the plan it was resuming.
+    """
+    return zlib.crc32(s.encode())
+
+
 TEMPLATES = {
     "multi_clause": (
         "Compose THREE stages that must happen in order: first restrict to a set of "
@@ -78,6 +93,50 @@ TEMPLATES = {
         "Same row count either way; only the values differ."),
 }
 
+# Measured against Spider 2.0's own gold SQL (232 non-local + 24 local files):
+# median 105-123 words, 2-3 CTEs, 2-3 aggregates, 0 CASE, 0 window functions.
+# Buckets that stayed at or below that scored 67-100% per-candidate accuracy;
+# buckets above it scored 0-8% and produced NO usable training pairs:
+#   enumerated_columns 177 words / 10 aggs / 3 CASE -> 0%
+#   metric_definition  136 words /  4 aggs / 2 CASE -> 0%
+#   multi_clause       128 words /  5 aggs / 5 subq -> 8%
+# So the budget is stated explicitly rather than left to the model.
+BUDGET = ("Complexity budget, matched to this benchmark's own gold queries: aim "
+          "for about {words} words, {aggs} aggregate calls, at most {case} CASE "
+          "expression(s) and {win} window function(s). Real gold queries in this "
+          "benchmark use a median of 2-3 aggregates and NO CASE and NO window "
+          "functions -- do not exceed the budget to look sophisticated. A query "
+          "nobody can reproduce teaches nothing.")
+
+# A share of items targets the shape of what we CANNOT solve. Measured over all
+# 42 never-solved vs 49 always-solved questions (gold result CSVs exist for all
+# 135, so this is the whole set, not a subsample):
+#     results with >=5 columns   26% never-solved   vs  12% always-solved
+#     question length            56 words           vs  36 words
+# NOT aggregate count: that looked like 5.0 vs 2.0, but gold SQL exists for only
+# 24 of the 135 locals, so it rested on 7 never-solved queries whose range
+# ([1,3,4,5,6,7,8]) overlaps the always-solved range ([0,0,1,2,2,2,2,4,5,6]).
+# Retracted rather than built on.
+HARD_BUDGETS = {
+    b: dict(words=170, aggs=6, case=1, win=1)
+    for b in ("multi_clause", "set_then_aggregate", "enumerated_columns",
+              "boundary", "fanout", "metric_definition")
+}
+HARD_NOTE = ("This item targets the HARD end of the distribution. The answer must "
+             "have AT LEAST 5 output columns, and the question will be long "
+             "(55+ words) because it has that many things to name. Questions of "
+             "this shape are the ones the benchmark's hardest instances look "
+             "like -- do not simplify toward the median.")
+
+BUDGETS = {
+    "multi_clause":       dict(words=120, aggs=3, case=1, win=1),
+    "set_then_aggregate": dict(words=95,  aggs=3, case=0, win=0),
+    "enumerated_columns": dict(words=130, aggs=4, case=1, win=0),
+    "boundary":           dict(words=110, aggs=3, case=1, win=0),
+    "fanout":             dict(words=110, aggs=3, case=0, win=0),
+    "metric_definition":  dict(words=115, aggs=3, case=1, win=0),
+}
+
 # Forced variety on the headline measure, so items do not all collapse into
 # "count of rows per entity". At n=10 without this, two of six buckets produced
 # near-identical station/trip-count queries.
@@ -93,6 +152,55 @@ MEASURES = [
     "a label assigned by thresholds on a computed quantity",
     "a running or cumulative total over an ordering",
 ]
+
+
+def load_hard_sql_exemplars(gold_dir: Path, limit: int = 60) -> list[str]:
+    """Gold SQL from the hard end, for the targeted share of items.
+
+    114 of the 232 non-local gold queries carry >=5 aggregates or >=4
+    subqueries; their median is 156 words against 80 in the ordinary pool, which
+    filters those out. Non-local only, so no test question or test gold SQL is
+    involved -- same authors and benchmark, different databases.
+    """
+    out = []
+    if not gold_dir.exists():
+        return out
+    for f in sorted(gold_dir.glob("*.sql")):
+        if f.stem.startswith("local"):
+            continue                      # our test set
+        s = " ".join(f.read_text().split())
+        aggs = len(re.findall(r"\b(sum|avg|count|min|max)\s*\(", s, re.I))
+        subs = len(re.findall(r"\(\s*select\b", s, re.I))
+        if (aggs >= 5 or subs >= 4) and len(s.split()) <= 400:
+            out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def load_sql_exemplars(gold_dir: Path, limit: int = 120) -> list[str]:
+    """Real gold SQL from this benchmark, for stage A.
+
+    Stage B got question exemplars and mechanism tells went from 6/10 to 0/30.
+    Stage A had no benchmark input at all, so its complexity came only from my
+    templates -- and three buckets overshot Spider 2.0 badly enough to yield no
+    training pairs. Same remedy, applied to the query rather than the prose.
+
+    LEAKAGE GUARD: local* files are the 24 gold queries for our test set and are
+    excluded unconditionally.
+    """
+    out = []
+    if not gold_dir.exists():
+        return out
+    for f in sorted(gold_dir.glob("*.sql")):
+        if f.stem.startswith("local"):
+            continue                      # our test set
+        s = " ".join(f.read_text().split())
+        if 40 <= len(s.split()) <= 180:
+            out.append(s)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def load_exemplars(path: Path) -> list[str]:
@@ -167,6 +275,11 @@ Requirement for this item:
 {tables}
 
 **The headline measure must be of this kind:** {measure}
+
+{budget}
+
+Real gold queries from this benchmark, to match in shape and complexity:
+{sql_exemplars}
 
 Rules:
 - It must run on SQLite as written and return at least 1 row.
@@ -289,6 +402,43 @@ def fk_graph(db: sqlite3.Connection) -> dict[str, set[str]]:
     return g
 
 
+def has_fk_gap(path: Path) -> bool:
+    """True if some FK parent has rows no child references.
+
+    `boundary` traps need exactly this. A fully saturated schema makes LEFT and
+    INNER JOIN agree, so the naive variant always matches the gold and every
+    retry is wasted. 77% of sampled SynSQL databases pass before population;
+    populate_db.py holds rows back so filled ones pass by construction.
+    """
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        ts = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for t_ in ts:
+            for r in con.execute(f'PRAGMA foreign_key_list("{t_}")'):
+                par, pc, cc = r[2], r[4], r[3]
+                if par not in ts:
+                    continue
+                if not pc:
+                    pk = [x[1] for x in con.execute(f'PRAGMA table_info("{par}")') if x[5]]
+                    pc = pk[0] if pk else None
+                if not pc:
+                    continue
+                try:
+                    if con.execute(
+                            f'SELECT 1 FROM "{par}" p WHERE NOT EXISTS (SELECT 1 FROM '
+                            f'"{t_}" c WHERE c."{cc}"=p."{pc}") LIMIT 1').fetchone():
+                        return True
+                except sqlite3.Error:
+                    pass
+        return False
+    finally:
+        con.close()
+
+
 def connected_subsets(graph: dict[str, set[str]], k: int) -> list[tuple[str, ...]]:
     """Every connected k-subset of the FK graph, deduplicated.
 
@@ -375,16 +525,23 @@ def run_sql(db: sqlite3.Connection, sql: str, limit: int = 15):
 
 
 USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+# Per stage, so we can see which one to economise on. Stage A's output is
+# execution-verified, stage B's is not -- a cheaper model is far safer on A.
+BY_STAGE: dict[str, dict] = {}
 
 
-def ask(client, model, prompt, temperature, max_tokens=1600):
+def ask(client, model, prompt, temperature, max_tokens=1600, stage="?"):
     r = client.chat.completions.create(
         model=model, temperature=temperature, max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}])
+    s = BY_STAGE.setdefault(stage, {"in": 0, "out": 0, "calls": 0, "model": model})
     if r.usage:                     # recorded so spend is auditable from the data
         USAGE["prompt_tokens"] += r.usage.prompt_tokens
         USAGE["completion_tokens"] += r.usage.completion_tokens
+        s["in"] += r.usage.prompt_tokens
+        s["out"] += r.usage.completion_tokens
     USAGE["calls"] += 1
+    s["calls"] += 1
     return r.choices[0].message.content or ""
 
 
@@ -428,11 +585,24 @@ def git_commit() -> str | None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", required=True)
+    ap.add_argument("--db", help="one database")
+    ap.add_argument("--db-dir", help="directory of .sqlite files; items rotate "
+                                     "round-robin so coverage stays even")
+    ap.add_argument("--require-fk-gap", action="store_true",
+                    help="skip databases where every FK parent is fully "
+                         "referenced. Measured: on such a schema LEFT and INNER "
+                         "JOIN agree, so `boundary` burns every retry -- 18 of 21 "
+                         "attempts failed that way on a saturated database.")
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--out", required=True)
     ap.add_argument("--base-url", default=None, help="omit for api.openai.com")
-    ap.add_argument("--model", default="gpt-5.4")
+    ap.add_argument("--model", default="gpt-5.4",
+                    help="stage B (question phrasing). Quality here is NOT "
+                         "verifiable -- a bad question is ambiguous, the gate "
+                         "rejects it, and the stage-A spend is wasted.")
+    ap.add_argument("--sql-model", default=None,
+                    help="stage A (gold SQL); defaults to --model. Safe place "
+                         "to economise: the output is execution-verified.")
     ap.add_argument("--gate-base-url", default=None, help="default: same as --base-url")
     ap.add_argument("--gate-model", default=None, help="default: --model (NOT recommended)")
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -441,6 +611,12 @@ def main():
                     default="../Spider2/spider2-lite/spider2-lite.jsonl",
                     help="question file for style exemplars; local* are always excluded")
     ap.add_argument("--n-exemplars", type=int, default=3)
+    ap.add_argument("--hard-share", type=float, default=0.30,
+                    help="fraction of items generated against the HARD budget, "
+                         "targeting the >=5-column shape that is 2.2x "
+                         "over-represented among questions we never solve")
+    ap.add_argument("--sql-exemplars", type=int, default=2,
+                    help="real gold queries shown to stage A (0 disables)")
     ap.add_argument("--buckets", help="comma-separated subset of "
                     + ",".join(TEMPLATES) + " (default: cycle all)")
     ap.add_argument("--seed", type=int, default=0)
@@ -448,6 +624,10 @@ def main():
                     help="abort once this key's CUMULATIVE spend (as the gateway "
                          "reports it) reaches this many dollars. 0 disables.")
     ap.add_argument("--spend-check-every", type=int, default=5)
+    ap.add_argument("--workers", type=int, default=16,
+                    help="items in flight. The three stages are sequential "
+                         "within an item but items are independent; serialising "
+                         "them turned 1,000 questions into a 6-hour job.")
     ap.add_argument("--resume", action="store_true",
                     help="keep items already in --out and generate only what is "
                          "missing, so a rerun never pays for the same item twice")
@@ -463,37 +643,71 @@ def main():
     gate_client = (client if not args.gate_base_url
                    else OpenAI(base_url=args.gate_base_url, api_key=key))
     gate_model = args.gate_model or args.model
+    sql_model = args.sql_model or args.model
     if gate_model == args.model and args.gate_base_url is None:
         print("WARNING: gate uses the same model that phrased the question -- "
               "agreement will be self-confirming. Pass --gate-model/--gate-base-url.",
               file=sys.stderr)
 
-    db = sqlite3.connect(args.db)
-    schema, profile = schema_text(db), profile_text(db)
-    graph = fk_graph(db)
+    if args.db_dir:
+        db_paths = sorted(Path(args.db_dir).glob("*.sqlite"))
+    elif args.db:
+        db_paths = [Path(args.db)]
+    else:
+        raise SystemExit("pass --db or --db-dir")
+    if not db_paths:
+        raise SystemExit(f"no .sqlite files under {args.db_dir}")
+
     rng = random.Random(args.seed)
-    focus_sets = connected_subsets(graph, 3)
-    combos = {}          # bucket -> shuffled queue of (measure, focus) pairs
-    for b in TEMPLATES:
-        pool_b = [(m, f) for f in focus_sets for m in MEASURES]
-        random.Random(args.seed * 977 + hash(b) % 977).shuffle(pool_b)
-        combos[b] = pool_b
-    print(f"combination space: {len(focus_sets)} connected 3-table sets x "
-          f"{len(MEASURES)} measures = {len(focus_sets)*len(MEASURES)} per bucket")
+    from nl2sql.config import GOLD_SQL_DIR
+    sqlpool = load_sql_exemplars(Path(GOLD_SQL_DIR)) if args.sql_exemplars else []
+    hardpool = load_hard_sql_exemplars(Path(GOLD_SQL_DIR)) if args.sql_exemplars else []
+    print(f"gold-SQL exemplars for stage A: {len(sqlpool)} ordinary, "
+          f"{len(hardpool)} hard (both non-local; 0 from the 24 local gold files)")
+    print(f"hard share: {args.hard_share:.0%} of items target the >=5-column profile")
     pool = load_exemplars(Path(args.exemplars)) if args.exemplars else []
     print(f"style exemplars: {len(pool)} non-local questions from "
           f"{Path(args.exemplars).name} (0 from the 135 local test set)")
 
-    # Provenance: enough to reproduce an item without keeping the database.
-    # The schema hash identifies the schema however it was built; db_note says
-    # how to rebuild it; the seeds make generation deterministic.
-    prov = {
-        "db_file": Path(args.db).name,
-        "db_note": args.db_note,
-        "db_sha256": sha256_file(Path(args.db)),
-        "schema_sha256": hashlib.sha256(schema.encode()).hexdigest(),
+    if args.require_fk_gap:
+        keep = [p_ for p_ in db_paths if has_fk_gap(p_)]
+        print(f"FK-gap screen: {len(keep)}/{len(db_paths)} databases have an "
+              f"unreferenced-parent gap; the rest are skipped")
+        db_paths = keep or db_paths
+    print(f"{len(db_paths)} database(s)")
+
+    # Per-database state, built on first use: a 300-database run should not pay
+    # for profiling all of them up front.
+    cache: dict[Path, dict] = {}
+
+    def db_state(path: Path) -> dict:
+        if path not in cache:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            sch = schema_text(con)   # read once; workers open their own handles
+            graph = fk_graph(con)
+            fsets = connected_subsets(graph, 3) or [tuple(sorted(graph))[:3]]
+            cb = {}
+            for b in TEMPLATES:
+                q = [(m, f) for f in fsets for m in MEASURES]
+                random.Random(args.seed * 977
+                              + (stable_hash(f"{b}|{path.name}") % 977)).shuffle(q)
+                cb[b] = q
+            prof = profile_text(con)
+            con.close()
+            cache[path] = {
+                "schema": sch, "profile": prof,
+                "focus_sets": fsets, "combos": cb,
+                "prov": {"db_file": path.name, "db_note": args.db_note,
+                         "db_sha256": sha256_file(path),
+                         "schema_sha256": hashlib.sha256(sch.encode()).hexdigest()},
+            }
+        return cache[path]
+
+    # Run-level provenance; the per-database half is merged in per item.
+    run_prov = {
         "synth_seed": args.seed,
         "model": args.model,
+        "sql_model": sql_model,
         "gate_model": gate_model,
         "exemplar_file": Path(args.exemplars).name if args.exemplars else None,
         "n_exemplars": args.n_exemplars if pool else 0,
@@ -528,37 +742,55 @@ def main():
             raise SystemExit(f"unknown bucket {b!r}; choose from {list(TEMPLATES)}")
     kept = 0
     recs_seen = []
-    with out_path.open("a" if args.resume else "w") as f:
-        for i in range(args.n):
-            if f"syn{i:04d}" in done:
-                continue
-            if (args.max_spend and i and i % args.spend_check_every == 0):
-                now = key_spend(args.base_url, key)
-                if now is not None and now >= args.max_spend:
-                    print(f"\nSTOPPING at item {i}: key spend ${now:.4f} reached the "
-                          f"${args.max_spend:.2f} cap. Rerun with --resume to continue.")
-                    break
-            bucket = names[i % len(names)]
-            irng = random.Random(args.seed * 100_003 + i)   # per item, so --resume
-            queue = combos[bucket]                          # reproduces exactly
-            if not queue:                                   # space exhausted
-                print(f"  (combination space for {bucket} exhausted; reshuffling)")
-                queue.extend([(m, f) for f in focus_sets for m in MEASURES])
-                irng.shuffle(queue)
-            measure, focus_t = queue.pop()
-            focus = list(focus_t)
-            rec = {"id": f"syn{i:04d}", "bucket": bucket,
-                   "focus_tables": focus, "measure": measure,
-                   "provenance": prov}
+    # Pre-assign every deterministic choice BEFORE going concurrent, so the
+    # combination queues are drained in index order and --resume still
+    # reproduces the same items.
+    plan = []
+    for i in range(args.n):
+        if f"syn{i:04d}" in done:
+            continue
+        bucket = names[i % len(names)]
+        dbp = db_paths[i % len(db_paths)]
+        st = db_state(dbp)
+        queue = st["combos"][bucket]
+        if not queue:
+            queue.extend([(m, f_) for f_ in st["focus_sets"] for m in MEASURES])
+            random.Random(args.seed + i).shuffle(queue)
+        measure, focus_t = queue.pop()
+        is_hard = (i % 10) < round(args.hard_share * 10) and bool(hardpool)
+        plan.append(dict(i=i, bucket=bucket, dbp=dbp, measure=measure,
+                         focus=list(focus_t), is_hard=is_hard))
+    print(f"{len(plan)} items to generate, {args.workers} workers")
 
-            # ── stage A: gold SQL (correct by execution, retried if it fails)
+    write_lock, tally_lock = threading.Lock(), threading.Lock()
+    stop = threading.Event()
+
+    def work(job):
+        i, bucket, dbp = job["i"], job["bucket"], job["dbp"]
+        st = db_state(dbp)
+        schema, profile = st["schema"], st["profile"]
+        focus, measure, is_hard = job["focus"], job["measure"], job["is_hard"]
+        irng = random.Random(args.seed * 100_003 + i)
+        budget_d = (HARD_BUDGETS if is_hard else BUDGETS)[bucket]
+        ex_pool = hardpool if is_hard else sqlpool
+        rec = {"id": f"syn{i:04d}", "bucket": bucket, "focus_tables": focus,
+               "measure": measure, "hard": is_hard,
+               "provenance": {**run_prov, **st["prov"]}}
+        db = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)   # per thread
+        try:
             sql = nrows = ncols = preview = gdig = None
-            for attempt in range(args.retries + 1):
-                raw = ask(client, args.model, SQL_PROMPT.format(
+            for _ in range(args.retries + 1):
+                raw = ask(client, sql_model, SQL_PROMPT.format(
                     schema=schema, profile=profile, template=TEMPLATES[bucket],
                     tables=", ".join(focus), measure=measure,
+                    budget=BUDGET.format(**budget_d)
+                            + ("\n\n" + HARD_NOTE if is_hard else ""),
+                    sql_exemplars="\n\n".join(
+                        f"-- example {j+1}\n{q}" for j, q in
+                        enumerate(irng.sample(ex_pool, min(args.sql_exemplars, len(ex_pool)))))
+                    or "(none)",
                     trap_ask=TRAP_ASK if bucket in TRAP_BUCKETS else ""),
-                    args.temperature, 2400)
+                    args.temperature, 2400, stage="A_sql")
                 blocks = fences(raw)
                 cand = blocks[0] if blocks else fence(raw)
                 try:
@@ -570,8 +802,6 @@ def main():
                             f"gold returns >{MAX_GOLD_ROWS} rows ({nrows}+); "
                             "a blown-up join, not an analyst question")
                     if bucket in TRAP_BUCKETS:
-                        # Verify the trap instead of trusting it: execute the naive
-                        # variant and require a genuinely different result.
                         if len(blocks) < 2:
                             raise ValueError("no naive variant returned")
                         nr, nc, _, _, ndig = run_sql(db, blocks[1])
@@ -587,24 +817,17 @@ def main():
                         {"sql": cand[:400], "error": f"{type(e).__name__}: {e}"[:200]})
             if sql is None:
                 rec["status"] = "sql_failed"
-                f.write(json.dumps(rec) + "\n"); f.flush()
-                print(f"{rec['id']} [{bucket}] SQL FAILED"); continue
+                return rec
             rec.update(gold_sql=sql, gold_rows=nrows, gold_cols=ncols,
                        gold_columns=cols, gold_preview=preview)
-
-            # ── stage B: the question
             ex = pick_exemplars(pool, bucket, irng, args.n_exemplars) if pool else "(none)"
             rec["question"] = " ".join(ask(client, args.model, QUESTION_PROMPT.format(
                 exemplars=ex, schema=schema, sql=sql, nrows=nrows, ncols=ncols,
                 preview=preview, wmin=40, wmax=75,
-                bucket_rule=BUCKET_RULES.get(bucket, "")), args.temperature).split())
-
-            # ── stage C: the gate -- intent agreement, blind to the gold SQL
-            # 2500, not 800: the gate must enumerate one entry per column, and a
-            # 12-column answer truncates mid-JSON at 800, which reads as a
-            # rejection rather than as the bug it is.
+                bucket_rule=BUCKET_RULES.get(bucket, "")), args.temperature,
+                1600, stage="B_question").split())
             graw = ask(gate_client, gate_model, GATE_PROMPT.format(
-                schema=schema, question=rec["question"]), 0.0, 2500)
+                schema=schema, question=rec["question"]), 0.0, 2500, stage="C_gate")
             try:
                 g = json.loads(fence(graw, "json"))
             except Exception:
@@ -616,26 +839,58 @@ def main():
             rec["gate_committed"] = g.get("rows") is not None
             rec["status"] = ("pass" if rows_ok and cols_ok and not g.get("ambiguous")
                              else "gated_out")
-            kept += rec["status"] == "pass"
-            recs_seen.append(rec)
-            f.write(json.dumps(rec) + "\n"); f.flush()
-            print(f"{rec['id']} [{bucket:19s}] {nrows:5d}x{ncols} gold | "
-                  f"gate rows={g.get('rows')} cols={len(g.get('columns') or [])} "
-                  f"amb={g.get('ambiguous')} -> {rec['status']}")
+            return rec
+        finally:
+            db.close()
+
+    kept = 0
+    with out_path.open("a" if args.resume else "w") as f:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex_pool_:
+            futs = {ex_pool_.submit(work, j): j for j in plan}
+            for k, fut in enumerate(as_completed(futs)):
+                if stop.is_set():
+                    break
+                try:
+                    rec = fut.result()
+                except Exception as e:
+                    print(f"  syn{futs[fut]['i']:04d}: {type(e).__name__}: {str(e)[:90]}")
+                    continue
+                with write_lock:
+                    recs_seen.append(rec)
+                    f.write(json.dumps(rec) + "\n"); f.flush()
+                with tally_lock:
+                    if rec["status"] == "pass":
+                        kept += 1
+                if rec["status"] == "sql_failed":
+                    print(f"{rec['id']} [{rec['bucket']}] SQL FAILED")
+                else:
+                    g = rec.get("gate") or {}
+                    print(f"{rec['id']} [{rec['bucket']:19s}]{'H' if rec['hard'] else ' '}"
+                          f"{rec['gold_rows']:6d}x{rec['gold_cols']} gold | "
+                          f"gate rows={g.get('rows')} cols={len(g.get('columns') or [])} "
+                          f"amb={g.get('ambiguous')} -> {rec['status']}")
+                if args.max_spend and k % args.spend_check_every == 0 and k:
+                    now = key_spend(args.base_url, key)
+                    if now is not None and now >= args.max_spend:
+                        print(f"\nSTOPPING: key spend ${now:.4f} reached the "
+                              f"${args.max_spend:.2f} cap. Rerun with --resume.")
+                        stop.set()
 
     strict = sum(1 for r in recs_seen if r.get("gate_committed") and r["status"] == "pass")
     print(f"\nwrote {out_path}: {kept}/{args.n} passed the gate ({kept/max(args.n,1):.0%})")
     spend1 = key_spend(args.base_url, key)
     print(f"  tokens: {USAGE['prompt_tokens']:,} in / {USAGE['completion_tokens']:,} out "
           f"over {USAGE['calls']} calls")
+    for st_ in sorted(BY_STAGE):
+        s = BY_STAGE[st_]
+        print(f"    {st_:12s} {s['model']:26s} {s['calls']:4d} calls  "
+              f"{s['in']:8,d} in / {s['out']:7,d} out")
     if spend0 is not None and spend1 is not None:
         n_new = len([r for r in recs_seen])
         print(f"  spend: ${spend1-spend0:.4f} this run (${spend1:.4f} cumulative)"
               + (f" = ${(spend1-spend0)/n_new:.4f}/item" if n_new else ""))
     print(f"  of those, {strict} are STRICT passes (the gate committed to a row count "
           f"and matched); the rest matched on column count alone")
-    db.close()
-
 
 if __name__ == "__main__":
     main()

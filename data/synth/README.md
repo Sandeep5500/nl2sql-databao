@@ -24,6 +24,80 @@ them:
   printed banner states how many exemplars loaded and that 0 came from the
   test set.
 
+## The 1,000-question run (the training set)
+
+`main1k.jsonl` and `main1k_negatives.jsonl` are the dataset the judge is
+actually trained on. Everything else here is pilot work that produced them.
+
+| file | records | what it holds |
+|---|---|---|
+| `main1k.jsonl` | 1,000 | questions + gold SQL over 300 populated SynSQL databases; `status` is `pass` or `gated_out` |
+| `main1k_negatives.jsonl` | 861 | one record per gate-passing question, each with up to 2 **execution-verified wrong** queries |
+
+Generated 2026-11-01 on Babel (job `11001600`, 1 h 13 m wall clock) by
+`synth_questions.py` piped into `synth_negatives.py` in `--watch` mode, so
+negatives were constructed as questions appeared.
+
+| | |
+|---|---|
+| questions generated | 1,000 (300 hard tier, buckets even at 166-167) |
+| passed the ambiguity gate | 861 (86%) |
+| questions with >=1 verified wrong answer | **771 (90% of gated-in)** |
+| **preference pairs** | **1,313** (542 questions x2, 229 x1) |
+| rejected as not-actually-wrong | 1,823 (58% of attempts) |
+| cost | $13.89 questions + $3.69 negatives |
+
+### Why the negatives are constructed, not sampled
+
+A DPO triple needs a *wrong* answer, and the gold already supplies the right
+one -- so there is no need to run agent episodes hoping for a mix. One episode
+re-processes ~200k tokens of prefill; a constructed negative is one API call.
+Each is templated on the measured failure taxonomy and then **executed and
+graded with the benchmark's own scorer**, so "wrong" means wrong the way our
+evaluation means it. 1,823 of 3,136 attempts still graded *correct* and were
+discarded; without that check more than half the dataset would be mislabelled.
+
+### The number that matters
+
+59% of the 1,313 negatives return **exactly gold's (rows, cols)**:
+
+| error type | negatives | same shape as gold |
+|---|---|---|
+| `wrong_values` | 641 | 93% |
+| `fanout` | 78 | 79% |
+| `missing_filter` | 116 | 66% |
+| `boundary` | 68 | 38% |
+| `set_vs_grain` | 98 | 6% |
+| `missing_column` | 312 | 2% |
+
+Our best judge prompt is shape-based (76/135), and 67% of mixed Spider 2.0
+questions have a wrong result group sharing a correct group's exact shape. At
+59% this set sits in the same regime, so it trains on the cases where shape
+carries no signal. The corollary: `missing_column` is 24% of the data and 98%
+shape-detectable, so the discriminative signal is nearer 1,000 pairs than 1,313.
+
+### Splitting
+
+**Split by `item_id`, never by row.** 542 questions contribute two pairs that
+share an identical prompt and identical gold; a row-wise split puts siblings on
+both sides and inflates validation through memorization. 771 distinct questions
+is the number that governs what the judge can learn.
+
+### Reproducibility caveat
+
+These records were generated **before** the `stable_hash` fix. `str.__hash__`
+is salted per interpreter (`PYTHONHASHSEED`), and three scripts seeded RNGs
+from it, so `--seed` did not determine the output: `populate_db.py` (the 300
+databases), `synth_negatives.py` (error-type choice) and `synth_questions.py`
+(combination order, which also meant `--resume` did not reproduce the plan it
+resumed). Measured: `hash("store_1.sqlite") & 0xFFFF` gave 14513, 33050 and
+28089 across three processes.
+
+So `provenance.synth_seed` on these records is **not sufficient to rebuild
+them**, and the 300 populated databases (840 MB, Babel `~/synsql_filled/`) are
+not in git. Runs made after the fix are reproducible; to put this set on a
+reproducible footing it has to be regenerated.
+
 ## Files
 
 | file | items | what changed |
