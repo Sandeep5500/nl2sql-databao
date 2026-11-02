@@ -77,32 +77,81 @@ asset rather than a cost.
 
 ## 2. Task definition
 
-Input is a pair, output is one token.
+Output is **one token**. Input is a question and two candidate **answers**.
 
 ```
 INPUT
-  question                      (natural language)
-  schema                        (union of tables either candidate references)
-  A: sql  +  result preview     (first 15 rows, CSV)
-  B: sql  +  result preview
+  question                        (natural language)
+  schema                          (compact column list -- see arms below)
+  ANSWER A: executed result        (first 15 rows, CSV)
+  ANSWER B: executed result
 OUTPUT
   one token: "A" or "B"
 ```
 
-Confidence is **not** emitted by the model — it is read off the logits:
+The unit being judged is the **executed result, not the query**. That is what
+the deployed judge is actually asked to do -- `validator_select.py` says "Pick
+the ONE candidate whose RESULT correctly answers the question. Judge the
+result, not the style" -- and three of our own measurements say the training
+input should match that framing rather than hand the model the SQL and append
+an instruction not to look at it:
+
+1. **SQL invites a shortcut that an instruction does not close.** On our 1,313
+   pairs, "pick the longer SQL" alone scores **61.3%**, against the judge's
+   measured 65.64%. It is not diffuse: it is 99.7% within `missing_column` and
+   49.1% on `wrong_values` (see 3.7).
+2. **Our SQL is from the wrong distribution.** Training golds are written by
+   `gpt-5.4-mini` from a template; real candidates come from Qwen3.6-35B inside
+   a tool loop. Style learned on the former does not transfer. A result is a
+   result.
+3. **It agrees with 1(d).** Showing the judge more of *how* an answer was
+   produced made it monotonically worse (51 -> 48 across five reasoning modes).
+
+There is also a structural reason: we collapse identical execution results into
+groups (median 12 per question at N=16), and a group holds many SQLs, so "which
+SQL do you show" has no principled answer at serving time. Results are the
+natural unit.
+
+### 2.1 Two independent ablation axes
+
+Dropping SQL and dropping schema are **separate decisions** and must not be
+bundled. Measured on one representative item, the full-evidence prompt is 4,369
+characters of content, and of what a results-only prompt removes, the schema
+DDL is **56.6%** and the two SQLs are 44.4% together.
+
+| arm | SQL | schema | what it tells us |
+|---|---|---|---|
+| **A** | out | compact column list | deployment-faithful; the one we expect to serve |
+| **B** | in | compact column list | more evidence, but shortcut-exposed |
+| **C** | in | out | **the control** |
+
+**Arm C is the diagnostic.** If C lands near B, then B's advantage is SQL style
+rather than judgement, and because our SQL distribution differs from real
+candidates that advantage is fictional. C is cheap and is the only way to learn
+whether B is honest.
+
+Keep a schema in arms A and B: our scorer is asymmetric -- **a missing gold
+column fails, extra predicted columns pass** -- so deciding whether an answer
+omits a column requires knowing which columns existed to ask for. Stripping the
+schema removes the evidence for `missing_column`, which is 312 of our pairs.
+Use a compact column list, not full DDL with per-column comments.
+
+### 2.2 Confidence and order symmetry
+
+Confidence is **not** emitted by the model -- it is read off the logits:
 
 ```
-P(A ≻ B) = softmax([logprob("A"), logprob("B")])[0]
+P(A > B) = softmax([logprob("A"), logprob("B")])[0]
 ```
 
 vLLM's OpenAI-compatible API already returns `top_logprobs`, so this needs no
 serving change. Self-reported confidence is poorly calibrated and costs output
 tokens; the logit is free and real.
 
-**Order-symmetric scoring** — the fix for (b):
+**Order-symmetric scoring** -- the fix for 1(b):
 
 ```
-s(A,B) = ½ · [ P(A≻B | A first) + (1 − P(B≻A | B first)) ]
+s(A,B) = 1/2 * [ P(A>B | A first) + (1 - P(B>A | B first)) ]
 ```
 
 Averaging two calibrated probabilities makes an order flip structurally
@@ -110,15 +159,29 @@ impossible, rather than hoping training washes it out. It also yields a margin
 for breaking Copeland ties, replacing the current fallback to largest
 result-group (= majority voting, measured at 75, *below* the judge).
 
-Schema and result preview are both in the input because of (c): the result
-*values* are the only signal that separates the 67% of shape-colliding pairs.
-CHASE-SQL's own training tuple also carries the union of the two candidates'
-schemas.
+Group sizes stay **out** of the model input -- that is majority voting smuggled
+into the prompt, and it is near-worthless on this pool. Judge groups on their
+merits and apply any group-size prior outside the model where it can be ablated.
 
-Group sizes stay **out** of the model input — that is majority voting smuggled
-into the prompt, and it is near-worthless on this pool. Collapse to distinct
-result groups for efficiency, judge groups on their merits, and apply any
-group-size prior outside the model where it can be ablated.
+### 2.3 The decidability risk, stated plainly
+
+In arm A some pairs may be genuinely undecidable. A real example: two answers
+both 5x3, both led by the same row, totals differing 6%, where the only thing
+separating them is that the wrong query counted NULL energy as zero -- a fact
+not present anywhere in a results-only prompt.
+
+This cuts both ways and both readings matter:
+
+- If an answer is not decidable from the output, **our judge is being asked to
+  do something impossible**, and no amount of training fixes it.
+- If we train on undecidable pairs, we fit **label noise** and teach the model
+  to guess confidently.
+
+The risk concentrates on the **31% of our questions whose gold is a single
+row**, often a single scalar. So measure it before training: have a strong model
+attempt arm A on ~100 held-out pairs and report accuracy split by gold row
+count. Then either exclude the undecidable slice or keep it and accept a known
+noise floor -- rather than meeting it later as a mysteriously capped accuracy.
 
 ---
 
@@ -459,9 +522,139 @@ gets right.
 
 ---
 
+### 3.7 What was actually built (2026-11-01)
+
+Generated on Babel (job `11001600`, 1 h 13 m) by `synth_questions.py` piped into
+`synth_negatives.py` in `--watch` mode. Committed as `data/synth/main1k.jsonl`
+and `data/synth/main1k_negatives.jsonl`.
+
+| | |
+|---|---|
+| questions generated | 1,000 (300 hard tier, buckets even) |
+| passed the ambiguity gate | 861 (86%) |
+| questions with >=1 verified wrong answer | **771 (90%)** |
+| **preference pairs** | **1,313** (542 questions x2, 229 x1) |
+| rejected as not-actually-wrong | 1,823 (58% of attempts) |
+| cost | $13.89 questions + $3.69 negatives |
+
+**Negatives are constructed, not sampled.** A pair needs a wrong answer and the
+gold already supplies the right one, so there is no need to run episodes hoping
+for a mix -- one episode re-processes ~200k tokens of prefill, a constructed
+negative is one API call. Each is templated on the measured failure taxonomy,
+then executed and graded with the benchmark's own scorer. That 1,823 of 3,136
+attempts still graded *correct* is the load-bearing number: without execution
+checking, more than half this dataset would be mislabelled.
+
+**Where the 229 unusable questions went:** 139 failed at question time (119
+`gated_out` by the blind gate, 20 `sql_failed`), and 90 passed the gate but
+could not be broken -- every variant still graded correct. The second group is
+explained by output width: **61% have a 1-row gold** against 31% of the usable
+set, and a single scalar gives the error templates nowhere to go.
+
+**59% of negatives return exactly gold's (rows, cols)** -- the regime where
+shape carries no signal, matching the 67% collision rate measured on real
+Spider 2.0 pairs in 1(c):
+
+| error type | pairs | same shape as gold | "pick longer" |
+|---|---|---|---|
+| `wrong_values` | 641 | 93% | 49.1% |
+| `missing_column` | 312 | 2% | **99.7%** |
+| `missing_filter` | 116 | 66% | 67.7% |
+| `set_vs_grain` | 98 | 6% | 25.5% |
+| `fanout` | 78 | 79% | 33.3% |
+| `boundary` | 68 | 38% | 73.5% |
+| **all** | **1,313** | **59%** | **61.3%** |
+
+The last column is why 4.0.1 drops most of `missing_column`.
+
+**Distribution check against the benchmark.** Spider 2.0's 135 locals: median 3
+rows, 33% single-row. Our 771 usable: **31% single-row** -- well matched at the
+floor. The mismatch is the tail: our median is 17 rows (p90 69), and questions
+run 69 words against the benchmark's 46. If judge accuracy on the 135 lags what
+held-out accuracy predicts, this gap is the first place to look.
+
+### 3.8 Reproducibility bug (fixed, but after this dataset)
+
+`str.__hash__` is salted per interpreter (`PYTHONHASHSEED`), and three scripts
+seeded RNGs from it, so `--seed` did not determine output and `--resume` did not
+reproduce the plan it resumed. Measured: `hash("store_1.sqlite") & 0xFFFF` gave
+14513, 33050 and 28089 across three processes.
+
+Affected: `populate_db.py` (the 300 databases), `synth_negatives.py` (error-type
+choice), `synth_questions.py` (combination order). All three now use a
+crc32-based `stable_hash()`.
+
+**This dataset predates the fix.** `provenance.synth_seed` on these records is
+not sufficient to rebuild them, and the 300 populated databases (840 MB, Babel
+`~/synsql_filled/`) are not in git and cannot be regenerated. Treat them as
+irreplaceable until the set is regenerated under the fix.
+
+---
+
 ## 4. Training
 
 **Base model: `Qwen/Qwen3.6-35B-A3B`** (the bf16 base, not the AWQ repo).
+
+### 4.0 Data assembly (`scripts/build_judge_pairs.py`, to write)
+
+The dataset as committed is **not** in trainable form. Two gaps:
+
+- **No result values for negatives.** `main1k.jsonl` carries `gold_preview`,
+  but `main1k_negatives.jsonl` stores only `rows`/`cols` per negative. Every
+  negative SQL must be **re-executed** to produce its 15-row CSV. This needs
+  `~/synsql_filled/` on Babel -- the only copy, since 3.8's hash bug means the
+  databases cannot be rebuilt from their recorded seed.
+- **No schema.** Derivable from `db_file`; emit a compact column list, and
+  resolve table references by parsing rather than substring match (a table
+  named `user` must not drag in `users`).
+
+One record per pair, side-agnostic so the loader owns position balance:
+
+```json
+{
+  "pair_id": "syn0186#0", "item_id": "syn0186",
+  "question": "...", "schema": "songs(song_id, name, genre, ...) ...",
+  "chosen":   {"rows": 5, "cols": 3, "result_csv": "...", "sql": "..."},
+  "rejected": {"rows": 5, "cols": 3, "result_csv": "...", "sql": "...",
+               "error_type": "wrong_values"},
+  "bucket": "multi_clause", "hard": false, "split": "train"
+}
+```
+
+`chosen`/`rejected` name the **answer**, not the query. Each record renders to
+**two** training examples -- `(chosen, rejected) -> "A"` and
+`(rejected, chosen) -> "B"` -- so the model never sees a label attached to a
+position. ~1,100 pairs become ~2,200 examples.
+
+**Report real token lengths, not a heuristic.** Tokenize with the actual Qwen
+tokenizer and print p50/p90/max per arm. `chars/3.6` is calibrated on English
+prose and under-counts a mostly-numeric prompt badly -- `504075` is 2-3 tokens,
+not 1.7. Sequence length drives both the memory ceiling and the GPU hours.
+
+### 4.0.1 Training-set composition
+
+Drop most of `missing_column`. It is simultaneously the length shortcut (99.7%
+"pick longer") and 98% shape-detectable, so it contributes little but a cheat:
+
+| | pairs | "pick longer" |
+|---|---|---|
+| all pairs | 1,313 | 61.3% |
+| **excluding `missing_column`** | **1,001** | **49.4% (chance)** |
+
+| training set | pairs |
+|---|---|
+| all non-`missing_column` | 1,001 |
+| `missing_column`, length-balanced sample | ~100 |
+| **total** | **~1,100** |
+
+Keep a little: `missing_column` is 45 measured lane-failures, so the judge must
+not go blind to it. Capping it keeps the length baseline near chance.
+
+**Split by `item_id`, never by pair.** 542 questions contribute two pairs
+sharing an identical question and gold; a pair-wise split puts siblings on both
+sides and inflates held-out accuracy through memorisation. Reserve ~15% of
+*questions*, stratified by bucket and hard/normal. 771 distinct questions is the
+number that governs what the judge can learn.
 
 ### 4.1 Why 35B and not the 9B
 
@@ -522,44 +715,50 @@ Sequence length ~3K (question + schema + 2 SQLs + 2 result previews).
 **Wall clock: ~3 days**, of which ~20 h is GPU. Generation dominates, and shards
 cleanly.
 
-### 4.4 Data scaling curve — the gate on a second round
+### 4.4 Data scaling curve -- the gate on a second round
 
-Do not decide up front whether ~3,600 pairs is enough. Train on nested subsets
-and read the curve.
+Do not decide up front whether the data is enough. Train on nested subsets and
+read the curve. With ~1,100 pairs and 15% of questions held out, ~935 pairs are
+trainable:
 
-| pairs | what it answers |
-|---|---|
-| 500 | does the single-token format train at all |
-| 1,000 | first real signal on held-out pair accuracy |
-| 2,000 | is the curve still climbing |
-| 3,600 | the full set |
+| rung | pairs | what it answers |
+|---|---|---|
+| 1 | 250 | does the single-token format train at all |
+| 2 | 500 | first real signal on held-out pair accuracy |
+| 3 | ~935 | is the curve still climbing |
 
-**Split the held-out set by QUESTION, not by pair.** With 2.7–5.3 pairs per
-question, a random pair split puts pairs from the same question on both sides
-and inflates held-out accuracy badly. Reserve ~15% of *questions* and every
-pair they generated.
+**Establish the origin first.** The measured **65.64%** baseline comes from real
+Spider 2.0 candidates, not synthetic pairs, and is *not* this curve's zero
+point. Run the untuned 35B over the held-out set and report it alongside two
+reference baselines: "pick longer" (~50% by construction, see 4.0.1) and
+"always A" (50% once position-balanced). If untuned accuracy on held-out pairs
+is already ~85%, the pairs are too easy and every later number is hollow.
 
-Report two numbers at each point:
+Report two numbers at each rung:
 
-1. **Held-out pairwise binary accuracy** — the direct training metric. Baseline
-   is our measured untuned **65.64%**.
-2. **End-to-end on the 135** via the Copeland tournament. §5.1's simulation maps
-   pair accuracy to questions correct, so this also *validates the simulation* —
+1. **Held-out pairwise binary accuracy** -- the direct training metric.
+2. **End-to-end on the 135** via the Copeland tournament. 5.1's simulation maps
+   pair accuracy to questions correct, so this also *validates the simulation*:
    if measured end-to-end tracks the predicted column, the independence
-   assumption in §5.2 holds; if it falls short, judge errors are correlated and
-   every projection in §5 is optimistic.
+   assumption in 5.2 holds; if it falls short, judge errors are correlated and
+   every projection in 5 is optimistic.
 
 **Decision rules:**
 
 | curve shape | reading | action |
 |---|---|---|
-| flat by 1,000 pairs | data is not the lever; the discriminating information is probably not in the input | **stop.** Revisit the input representation (arm B, §6 step 3) before spending more |
-| still climbing at 2,000 | more data pays | generate a second ~$50 round of questions |
-| plateaus between 2,000 and 3,600 | at the data ceiling | spend the effort on candidate count (§1e) or input representation instead |
+| flat by 500 pairs | data is not the lever; the discriminating information is probably not in the input | **stop.** Fix the input representation (2.1's arms) before spending more |
+| still climbing at ~935 | more data pays | generate a second round: ~1,300 more pairs for ~$18 of the $28.49 left, ~1.25 h on a proven pipeline |
 
-**Cost of the curve:** training time scales with pairs, so 500 + 1,000 + 2,000 +
-3,600 ≈ 0.8 + 1.7 + 3.3 + 6 ≈ **12 GPU-hours**, against 6 for the full run
-alone. Six extra hours on free GPU to avoid guessing — take it.
+**What this curve cannot resolve.** Our top rung (~935) is the plan's *second*
+rung. If accuracy is still climbing there -- the likely outcome -- that says
+more data helps but not how much, and cannot separate "a lot" from "a little".
+The curve's real value is the opposite result: **flat by 500 is decisive** and
+saves the $18.
+
+**Cost:** at ~350-400 tokens per example in arm A rather than the ~3K the
+original estimate assumed, 250 + 500 + 935 pairs x 3 arms is a few GPU-hours,
+not the 12 projected for the 3.6K ladder.
 
 ### 4.5 Serving risk
 
@@ -663,20 +862,20 @@ unresolvable. A 3-question judge difference is measurable.
 
 Cheap things that might obviate the expensive thing come first.
 
-| # | step | cost | why first |
-|---|---|---|---|
-| 1 | Email BIRD team for LiveSQLBench `sol_sql`; request BEAVER | 0 | long lead, blocks clean eval |
-| 2 | **Generate 12–16 single-config lanes; rerun the current judge** | ~GPU hours, no training | predicted **+13 questions (76 → 89)** with no model change, and it is the decisive test of §5.2's independence assumption |
-| 3 | **Run arm B** — judge sees the tool trace | ~30 min, already coded | tests whether execution evidence breaks the 67% shape-collision wall *before* spending on training |
-| 4 | Port `eval.py` scorer for synthesized gold | 0.5 day | prerequisite for all labelling |
-| 5 | Pair builder (collapse, pair, shuffle, hard-filter) | 0.5 day | settles the data format |
-| 6 | **100-item pilot**: tune to p ≈ 0.5, fix K from the mixed rate | ~1 h, $1.58 | sets the yield of everything downstream |
-| 7 | **Synthesize ~3,700 stratified items + blind gate** | ~1.5–3 h, ≈$59 | contamination-free training data by construction |
-| 8 | Candidate generation, K=6, 13,333 episodes | ~9 h GPU sharded ×4 | |
-| 9 | **QLoRA pairwise SFT on 35B, as a scaling curve** (500 / 1k / 2k / 3.6k pairs) | ~12 h GPU | §4.4 — decides whether a second $50 round is worth it, and validates §5.1's simulation |
-| 10 | Evaluate: 135 + LiveSQLBench + BEAVER | ~2 h | |
+| # | step | status | cost | why here |
+|---|---|---|---|---|
+| 1 | Email BIRD team for LiveSQLBench `sol_sql`; request BEAVER | open | 0 | long lead, blocks clean eval |
+| 2 | **Synthesize ~1,000 questions + construct verified negatives** | **DONE 2026-11-01** | $17.57 | 3.7 — 771 questions, 1,313 pairs |
+| 3 | **Generate 12–16 single-config lanes; rerun the current judge** | open | GPU hours, no training | predicted **+13 questions (76 → 89)** with no model change, and the decisive test of 5.2's independence assumption |
+| 4 | **Run arm B** — judge sees the tool trace | open | ~30 min, coded | tests whether execution evidence breaks the 67% shape-collision wall *before* training |
+| 5 | **`build_judge_pairs.py`** — re-execute negatives for previews, compact schema, 3 arms, question-level split | next | ~0.5 day | 4.0; needs Babel `~/synsql_filled/` |
+| 6 | **Decidability probe**: strong model on arm A, ~100 held-out pairs, split by gold row count | next | ~$1 | 2.3 — do we have label noise on the 31% single-row slice |
+| 7 | **Untuned baseline on the held-out set** (all 3 arms) | next | ~1 h GPU | 4.4 — the curve has no origin without it; 65.64% is from a different distribution |
+| 8 | **QLoRA pairwise SFT, scaling curve** (250 / 500 / ~935 pairs × 3 arms) | next | a few GPU-h | 4.4 — decides the second $18 round, and validates 5.1's simulation |
+| 9 | Deploy the winning arm into `validator_select.py`, re-score the 135 | | ~2 h | train/serve consistency is non-negotiable |
+| 10 | Evaluate: 135 + LiveSQLBench + BEAVER | | ~2 h | |
 
-Steps 2 and 3 may move more than 6–10. Resolve them before committing to the
+Steps 3 and 4 may move more than 5–10. Resolve them before committing to the
 training run.
 
 **Not recommended: DPO.** Our preference pair is `chosen="A"` vs `rejected="B"` —
