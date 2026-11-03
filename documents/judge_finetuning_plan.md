@@ -183,6 +183,92 @@ attempt arm A on ~100 held-out pairs and report accuracy split by gold row
 count. Then either exclude the undecidable slice or keep it and accept a known
 noise floor -- rather than meeting it later as a mysteriously capped accuracy.
 
+### 2.4 Measured: untuned baselines and the artifact controls (2026-11-03)
+
+Run on the 173 held-out pairs with **Qwen3.5-9B**, order-symmetric scoring
+(§2.2). The holdout is position-balanced, so "always A" scores exactly 0.5000.
+
+| arm | what the judge sees | accuracy |
+|---|---|---|
+| A | results only + compact schema | **0.5087** / 0.5549 |
+| B | results + SQL + compact schema | **0.7052** |
+| C | question + SQL, no results | **0.8497** / 0.8382 |
+
+Two numbers where the same arm was measured twice on different nodes. Arm A
+moved 0.5087 -> 0.5549 with identical data and seed: at 173 pairs the 95%
+interval around 0.5 is about +/-7.5 points, so **differences under ~8 points
+are not resolved by this holdout.** Arm C reproduced to within 1.2 points,
+which is the behaviour to expect away from the degenerate region.
+
+**Raw argmax is degenerate.** Per-rendering accuracy was exactly 0.5000 for
+arms B and C and 0.5029 for arm A -- the model emits the same letter on all
+346 renderings. Every point of the 0.705 and 0.850 lives in the probability
+margin that order-symmetrisation recovers; greedy decoding throws it away.
+`validator_select.py:217` decodes text at temperature 0 and never reads
+logprobs, so margin-based selection is a candidate win with no training at
+all. Caveat: the deployed prompt differs and scores 65.64% on real pairs, so
+the degeneracy figure does not transfer -- only the mechanism does.
+
+#### The controls: how much of arm C is an artifact?
+
+Arm C beating arm B was the anomaly: strictly more evidence, 14.5 points
+worse. The first hypothesis was that the negatives, being mutations of gold
+SQL, are identifiable *as mutations* without reference to the question. Three
+controls, same holdout, same model:
+
+| control | construction | accuracy |
+|---|---|---|
+| C | real question | 0.8497 |
+| **D** | question deleted entirely | **0.6416** |
+| **E** | another pair's question pasted in | **0.5780** |
+
+**E is the better control**: it holds prompt length and format fixed and
+breaks only the question<->SQL correspondence. By E, the question-independent
+artifact is worth about **+8 points** over chance and genuine
+question-conditional judgement about **+27**. D is looser (deleting the
+question also shortens the prompt) and brackets the artifact at +14. That E
+falls *below* D is consistent -- a wrong question supplies a misleading
+criterion rather than none. The `gold=1row` slice shows it sharply:
+0.891 (C) -> 0.630 (D) -> 0.478 (E).
+
+So the hypothesis was **wrong as a full explanation**. Arm C is roughly
+three-quarters genuine. The dataset is contaminated, not disqualified, and
+replacing it with negatives harvested from real rollouts is not urgent.
+
+#### Surface features explain none of it
+
+A GPU-free probe over all 1,101 pairs: for each of twelve surface features,
+score "the SQL with the larger value is the gold one" (ties = coin flip).
+
+| feature | holdout | all pairs |
+|---|---|---|
+| chars | 0.5434 | 0.5395 |
+| lines | 0.5376 | 0.5468 |
+| commas | 0.5318 | 0.5259 |
+| joins / wheres / parens / selects / aggs / ctes / cases / distincts / groupbys | 0.47-0.50 | 0.47-0.50 |
+
+Best is 0.5434, and **0.4936 once `missing_column` is excluded** -- chance.
+The earlier "pick the longer SQL" shortcut (61.3% uncapped) is fully
+neutralised by the cap of 100 such pairs: that slice is still 17/17 separable
+by length, but it is 17 of 173 holdout pairs. Whatever the +8-point artifact
+is, it is subtler than any of these counts. Script: `scripts/probe_artifact.py`.
+
+#### The live hypothesis: result CSVs crowd out the SQL
+
+With the shortcut story mostly dead, arm C > arm B needs another explanation.
+Arm A's result CSVs run a median ~770 tokens at 2.63 chars/token, so in arm B
+the SQL sits far from the `ANSWER:` cue. If that is the cause, this is a
+**representation** problem, not a data problem, and the fix is to show SQL
+with results compacted to shape plus a few sample rows. It is testable on the
+real 135 with no training. It also cuts with §1: 67% of mixed questions have a
+wrong result group sharing a correct group's exact (rows, cols), so results
+alone are often insufficient in principle -- consistent with arm A at chance.
+
+**Consequence for the data-scaling gate (§4.4).** Arm A untuned is at chance
+and the holdout cannot resolve less than ~8 points, so a modest arm A gain is
+undetectable here. Before reading the curve as "data does not help", enlarge
+the holdout or widen the margin being measured.
+
 ---
 
 ## 3. Data
