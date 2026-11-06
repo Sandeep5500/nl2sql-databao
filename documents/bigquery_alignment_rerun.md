@@ -1,47 +1,49 @@
-# Spider 2.0-Lite BigQuery, second round: aligning the harness with SQLite and re-measuring
+# Spider 2.0-Lite BigQuery: Aligning the harness with SQLite and re-measuring
 
-**What this is.** In October we scored all 204 BigQuery questions of Spider 2.0-Lite for the first time, using four configurations of the same agent and the model `Qwen/Qwen3.6-35B-A3B`; the best configuration answered 47.5% correctly ([bigquery_lane_analysis.md](bigquery_lane_analysis.md)). 
+In October we scored all 204 BigQuery questions of Spider 2.0-Lite for `Qwen/Qwen3.6-35B-A3B`. The best configuration answered 47.5% correctly. 
 
 The work produced four results and two corrections to our own earlier conclusions.
 
 1. **Adding table statistics to the schema tools did not change accuracy.** The run with statistics and the run without it both answered 86 of 204 questions correctly (Section 7.2).
-2. **October's "gated rubric" lane never showed the rubric to the model.** All 200 of its prompts are identical, character for character, to the prompts of the lane it was compared against, so the reported gain of 8.1 points was run-to-run variation between two identical setups (Section 7.3).
-3. **A small new check on the number of rows in a submitted answer raised accuracy from 43.1% to 47.5%.** The check fired on 18 questions and produced a net nine additional right answers. The evidence comes from one replicate and a split by whether the check could act, so we treat it as suggestive and describe the steps that would confirm it (Sections 7.4 and 10).
-4. **Allowing four further attempts at temperature 0.7 on the 107 questions the best run got wrong brought the number of questions answered correctly at least once to 139 of 204 (68.1%).** For the same model on SQLite the team measured 69.6% for the equivalent "any of four samples" figure, so the two lanes now look similar on that measure (Sections 7.5 and 8).
 
-The corrections concern October's analysis. The rubric result in item 2 is one. The other is the table of wrong-answer shapes, which counted rows in a truncated display preview and therefore concluded that most failures had the wrong number of rows. Counting the real rows shows that most failures have the right shape and different values (Section 7.8).
+2. **The "gated rubric" lane never showed the rubric to the model** All 200 of its prompts are identical to the prompts of the lane it was compared against, so the reported gain of 8.1 points was run-to-run variation between two identical setups (Section 7.3)
 
-Everything below is reproducible from the files named beside each result, and Appendix A lists the outcome of every question in every run.
-
+3. **A small new check on the number of rows in a submitted answer raised accuracy from 43.1% to 47.5%.** The check on 18 questions, produced a net nine additional right answers. We ran this check only once, so the improvement could partly be random run-to-run variation. The pattern (gains concentrated where the check could act) support it, but it is not proven.
 ---
 
-## 1. Background for a reader new to the project
+## 1. Background
 
-### 1.1 The benchmark and the two lanes
+### 1.1 The benchmark
 
-Spider 2.0 is a benchmark of realistic text-to-SQL problems: a person asks a business or science question in English, and the system has to produce the SQL, run it against a real database, and return a table that matches a hidden reference table. Spider 2.0-Lite is the version of the benchmark with 547 questions spread over three database engines. This project works with two parts of it, which we call lanes.
+Spider 2.0 is a benchmark of realistic text-to-SQL problems: a person asks a business or science question in English, and the system has to produce the SQL, run it against a real database, and return a table that matches a hidden reference table. Spider 2.0-Lite has 547 questions spread over three database engines.
 
-- **The SQLite lane** has 135 questions over small local databases.
-- **The BigQuery lane** has 205 questions over Google's public datasets in the BigQuery cloud warehouse. One question points at a dataset our credentials cannot read, so 204 are scored. The warehouse bills by the amount of data each query reads, so every query costs real money, and the harness caps how much a question may read.
+- **SQLite** has 135 questions over small local databases.
+- **BigQuery** has 205 questions over Google's public datasets in the BigQuery cloud warehouse. One question points at a dataset our credentials cannot read, so 204 are scored. (The warehouse bills by the amount of data each query reads so every query costs real money and the harness caps how much a question may read)
 
-A question is scored as correct when every column of the reference table can be matched, value for value, to some column of our answer. Extra columns in our answer are allowed and the order of rows only matters for some questions. The scoring code is `nl2sql/eval.py` and follows the official Spider 2.0 comparison.
+Scoring: A question is scored as correct when every column of the reference table can be matched, value for value, to some column of our answer. Extra columns in our answer are allowed and the order of rows only matters for some questions. The scoring code is `nl2sql/eval.py` and follows the official Spider 2.0 comparison.
 
 ### 1.2 The agent
 
-The system under test is a language model driven by a loop. At each step the model may call a tool and read the result; it ends by calling `submit_result` with the identifier of a query it ran. The tools are: `list_tables`, `describe_table` (columns, descriptions and a few sample rows), `get_column_values` (the distinct values of a column), `run_sql_query`, `read_documentation` (for the 42 BigQuery questions that come with a reference document), and `submit_result`. Before the first step the model receives a prompt containing the question and a dump of the database's table list and schema, limited to 58,000 characters. The model is `Qwen/Qwen3.6-35B-A3B` served in bf16 precision on one H200 GPU through vLLM, hosted on Modal.
+The system under test is a language model driven by a loop. At each step the model may call a tool and read the result; it ends by calling `submit_result` with the identifier of a query it ran. The tools are: `list_tables`, `describe_table` (columns, descriptions and a few sample rows), `get_column_values` (the distinct values of a column), `run_sql_query`, `read_documentation` (for the 42 BigQuery questions that come with a reference document) and `submit_result`. 
+
+Before the first step the model receives a prompt containing the question and a dump of the database's table list and schema, limited to 58000 characters. 
+
+The model is `Qwen/Qwen3.6-35B-A3B` served in bf16 precision on one H200 GPU through vLLM, hosted on Modal.
 
 ### 1.3 Terms used in this report
 
 | term | meaning |
 |---|---|
-| **greedy decoding** | The model always picks its most likely next token (temperature 0). Two greedy runs of the same setup should be identical, but in practice they differ on about one question in five, for reasons we did not investigate; Section 7.2 measures this. |
+| **greedy decoding** | The model always picks its most likely next token (temperature 0). Two greedy runs of the same setup should be identical, but in practice they differ on about one question in five. |
 | **temperature 0.7 / sampling** | The model picks tokens at random in proportion to their probability, so every attempt is different. |
+
 | **pass@1** | The probability that one attempt is correct. SQLite's team figure averages four sampled attempts per question. |
 | **pass@k, "solved by any attempt"** | A question counts as solved if at least one of k attempts is correct. |
-| **rubric** | A short planning pass before the main run. A separate model call reads the question and the catalog (not the warehouse) and writes down the expected shape of the answer: how many rows, which columns, what ordering. It also states how confident it is about the row count. |
+
+| **rubric** | A short planning pass before the main run. A separate model call reads the question and the catalog and writes down the expected shape of the answer: how many rows, which columns, what ordering. It also states how confident it is about the row count. |
 | **gate** | The rule that the rubric is added to the prompt only when it states an exact row count with high confidence. For these data the gate is open on 123 of 204 questions. |
+
 | **arm** | One complete run over all 204 questions with one configuration. |
-| **flip** | A question whose result differs between two runs. "+27 / −18" means 27 questions were wrong in the first run and right in the second, and 18 the other way around. |
 | **sign test** | A test on the flips alone, asking whether 27 against 18 is more lopsided than a fair coin would produce. |
 
 ---
@@ -52,14 +54,17 @@ Four BigQuery configurations were scored in October, all greedy, all on the same
 
 | lane | what it adds | correct | n | accuracy |
 |---|---|---:|---:|---:|
-| `bq_v2` | baseline: 40 steps, schema dump cut at 60,000 characters, a tool the warehouse refuses | 69 | 204 | 33.8% |
+| `bq_v2` | baseline: 40 steps, schema dump cut at 60000 characters| 69 | 204 | 33.8% |
 | `bq_v3` | five harness fixes and 60 steps | 84 | 204 | 41.2% |
-| `bq_v3r` | plus the gated rubric | 95 | 200 | 47.5% |
-| `bq_v3s` | plus catalog retrieval (a `search_context` tool) | 87 | 204 | 42.6% |
+| `bq_v3r` | v3 + the gated rubric | 95 | 200 | 47.5% |
+| `bq_v3s` | v3 + catalog retrieval (a `search_context` tool) | 87 | 204 | 42.6% |
 
-Three conclusions from that round matter here. First, most of the improvement from 33.8% to 41.2% came from fixing handicaps in our own harness, chiefly a schema dump that was cut off in the middle of a table list so that later tables were invisible to the model. Second, the report credited the rubric with a gain of 8.1 points over a measured noise floor. Third, retrieval added nothing once the full table list was in the prompt.
+Three conclusions:
+- First, most of the improvement from 33.8% to 41.2% came from fixing problems in our harness, mainly a schema dump that was cut off in the middle of a table list causing later tables to never reach the model. 
+- Second, the report credited the rubric with a gain of 8.1 points over a measured noise floor. 
+- Third, retrieval added nothing once the full table list was in the prompt.
 
-The SQLite lane had been measured differently. Its headline figures, from commit `49cca7d` on the team's main branch, use the same Qwen3.6-35B model at temperature 0.7 and report the **average over four sampled attempts per question**:
+The SQLite lane had been measured differently. Its headline figures (commit `49cca7d` in main branch) use the same Qwen3.6-35B model at temperature 0.7 and report the **average over four sampled attempts per question**:
 
 | SQLite lane (135 questions) | pass@1 (mean of 4) | solved by any of 4 attempts |
 |---|---:|---:|
@@ -67,21 +72,21 @@ The SQLite lane had been measured differently. Its headline figures, from commit
 | richer `describe_table` | 51.1% | 94 (69.6%) |
 | plus gated rubric | 51.3% | 94 (69.6%) |
 
-Every BigQuery number in the table above is a single greedy run, so comparing 47.5% with SQLite's 51.1% compares two different quantities. That is one of the five differences below.
+BigQuery numbers in the table above are from a single greedy run, so comparing 47.5% with SQLite's 51.1% compares two different quantities. That is one of the five differences below.
 
 ---
 
-## 3. Why a second round: 's five differences
+## 3. Why a second round
 
- compared the two harnesses and found the following. Reading the code confirmed each one.
+Compared the two harnesses and found the following:
 
 | # | Difference | What the code showed | What we did |
 |---|---|---|---|
-| 1 | **`describe_table` is thin on BigQuery.** On SQLite it runs live queries for the row count and, per column, the number of distinct values and of nulls. On BigQuery it only lists columns, descriptions and five sample rows copied from a catalog file. | Confirmed. | Built a one-time statistics pass and made the tool print its results (Section 4.3). |
-| 2 | **The `get_column_values` fallback is misleading.** When an exact distinct-value query would read too much data, the BigQuery tool returns a handful of catalog sample values instead. | Confirmed. The fallback was already labelled as a sample, but the label was easy to overlook. | Rewrote the warning so that it cannot be mistaken for the real value list (Section 4.4). |
-| 3 | **The rubric planner is blind on warehouses.** On SQLite the planner can look at column values; on BigQuery those tools are removed to avoid doubling the bill. | Confirmed. | Gave the planner the same cached statistics through `describe_table`, at no query cost, and kept the value tools removed (Section 4.3). |
-| 4 | **Time and cost limits.** BigQuery runs have a 120-second statement timeout, 60 queries and 900 seconds per question, 50 GiB per query and 200 GiB per question. SQLite has none. | Confirmed. Several October episodes already scanned more than 100 GiB. | **Not changed.** Raising limits needs a measured proposal that the project administrators see first (Section 10). |
-| 5 | **Decoding and weights.** BigQuery runs are greedy in bf16. SQLite uses temperature 0.7, according to 's comparison with quantized (AWQ) weights, and reports the mean of four samples. | Confirmed for decoding and for the metric. | Ran sampled retries at temperature 0.7 on the questions that failed (Section 7.5). We did **not** switch to quantized weights, and did not sample every question. |
+| 1 | **`describe_table` is thin on BigQuery.** On SQLite it runs live queries for the row count and per column, the number of distinct values and of nulls. On BigQuery it only lists columns, descriptions and five sample rows copied from a catalog file. | Confirmed. | Built a one-time statistics pass and made the tool print its results (Section 4.3) |
+| 2 | **The `get_column_values` fallback is misleading.** When an exact distinct-value query would read too much data, the BigQuery tool returns a handful of catalog sample values instead. | Confirmed. The fallback was already labelled as a sample, but the label was easy to overlook. | Rewrote the warning so that it cannot be mistaken for the real value list (Section 4.4) |
+| 3 | **The rubric planner is blind on warehouses.** On SQLite the planner can look at column values; on BigQuery those tools are removed to avoid doubling the bill. | Confirmed. | Gave the planner the same cached statistics through `describe_table`, at no query cost and kept the value tools removed |
+| 4 | **Time and cost limits.** BigQuery runs have a 120-second statement timeout, 60 queries and 900 seconds per question, 50 GiB per query and 200 GiB per question. SQLite has none. | Confirmed. Several October episodes already scanned more than 100 GiB. | **Not changed.** Raising limits needs a measured proposal that the project administrators see first |
+| 5 | **Decoding and weights.** BigQuery runs are greedy in bf16. SQLite uses temperature 0.7, according to the comparison with quantized (AWQ) weights and reports the mean of four samples. | Confirmed for decoding and for the metric. | Ran sampled retries at temperature 0.7 on the questions that failed (Section 7.5). We did **not** switch to quantized weights and did not sample every question. |
 
 ---
 
@@ -89,27 +94,30 @@ Every BigQuery number in the table above is a single greedy run, so comparing 47
 
 ### 4.1 Access and billing
 
-The old Google Cloud project could no longer be used. The new project, `llm-systems-projects`, is shared and comes with four rules from its administrators: label every resource `cost_center=rohini`, keep usage within a $150 guideline, stop or delete resources when finished, and ask before starting expensive GPU or TPU jobs on Google Cloud. Access is through a service account that our own account impersonates, with no key file.
-
-Code changes in [bigquery_db.py](../nl2sql-v2/src/nl2sql/bigquery_db.py):
+The old Google Cloud project could no longer be used. The new project, `llm-systems-projects`, is shared and comes with four rules from its administrators: label every resource `cost_center=rohini`, keep usage within a $150 guideline, stop or delete resources when finished and ask before starting expensive GPU or TPU jobs on Google Cloud. Access is through a service account that our own account impersonates, with no key file.
 
 - `build_credentials()` creates impersonated credentials. A first version wrapped credentials that the local login had already wrapped, which the permission system rejected; it now detects that case.
 - Every query job carries the label `cost_center=rohini`.
-- `scripts/bq_spend.py` and `scripts/bigquery_preflight.py` use the same credentials, and `bq_spend.py` reads BigQuery's own job accounting, which gives spend per run label.
-- Two optional dependency groups were added to `pyproject.toml` (`bigquery` and `embed`).
 
-The model runs on Modal and no GPU was used on Google Cloud, so the rule about GPU jobs was not triggered; we still report the GPU time used (Section 9).
+- `scripts/bq_spend.py` and `scripts/bigquery_preflight.py` use the same credentials, and `bq_spend.py` reads BigQuery's own job accounting, which gives spend per run label.
+
+- Two optional dependency groups were added to `pyproject.toml` (`bigquery` and `embed`).
 
 ### 4.2 Where the code runs
 
-Credentials for the shared project stay on one machine. The agent loop, the tools and the BigQuery calls therefore run on Rohini's laptop in five parallel processes per run, and only the model calls go to the Modal H200. The `run_arm.py` script drives a full arm: first the rubric pass, then the five processes. The vLLM key was regenerated for this and stored in a Modal secret.
+Credentials for the shared project stay on one machine. 
 
-### 4.3 Statistics for `describe_table` ('s items 1 and 3)
+The agent loop, the tools and the BigQuery calls therefore run on Rohini's laptop in five parallel processes per run and only the model calls go to the Modal H200. The `run_arm.py` script drives a full arm: first the rubric pass, then the five processes. 
+
+The vLLM key was regenerated for this and stored in a Modal secret.
+
+### 4.3 Statistics for `describe_table`
 
 [enrich_bq_stats.py](../nl2sql-v2/scripts/enrich_bq_stats.py) visits each of the 69 reachable databases once and records, for every table, the exact row count and, for every column of an identifier-like type, an approximate distinct count (HyperLogLog) and the number of nulls. Floating-point columns are skipped because their distinct counts are not informative. Before spending anything the script estimates its cost with BigQuery dry runs, which are free, and it sets a byte cap on every query.
 
-The pass produced 70 files, one per database (the file for the one unreachable dataset is empty), covering 5,401 tables and 89,718 column statistics. BigQuery billed 582.5 GiB for it, about $3.60. Here is what `describe_table` now shows the model for one table; the header and the `approx_distinct` and `nulls` fields are new:
+The pass produced one file per database, about 70 files covering 5401 tables and 89718 column statistics. BigQuery billed 582.5 GiB for it so about $3.60. 
 
+Here is what `describe_table` now shows the model for one table; the header and the `approx_distinct` and `nulls` fields are new:
 ```
 table: bigquery-public-data.census_bureau_international.birth_death_growth_rates  (15019 rows)
 columns:
@@ -118,27 +126,28 @@ columns:
   net_migration FLOAT64  -- Net migration rate (net number of migrants per 1,000 population)
 ```
 
-The feature is opt-in, through `--bq-stats DIR`, so that the control arm is untouched. The rubric planner receives the same statistics when it is started with that flag.
+The feature is opt-in, through `--bq-stats DIR`, so that the control run over 204 questions is untouched. The rubric planner receives the same statistics when it is started with that flag.
 
-### 4.4 A clearer warning on the value fallback (item 2)
+### 4.4 A clearer warning on the value fallback
 
-When an exact distinct-value query would exceed the byte cap, `get_column_values` now says that the real distinct values could not be read and that the values that follow are only what happened to appear in a few catalog sample rows. The earlier text described the output as a "sample". The test in `check_bigquery_db.py` was updated to match.
+- When an exact distinct-value query would exceed the byte cap, `get_column_values` displays that the real distinct values could not be read and that the values that follow are only what happened to appear in a few catalog sample rows.
+- The earlier text described the output as a "sample".
 
 ### 4.5 A confound found in the pilot and its fix
 
-We first ran a pilot of 40 questions, chosen to cover every database family, once without statistics and once with them. In the treatment arm, the block for each table became longer, and for the `stackoverflow` database the whole dump no longer fit in the 58,000-character budget. The prompt builder then switched to a shorter format that lists only column names, dropping the descriptions and sample rows, so the treatment arm had changed in two ways at once: statistics were added and descriptions were removed. The builder now drops the statistics from the dump first and keeps every description, while `describe_table` still returns the statistics when the model asks for a table. The script `dump_mode_check.py` builds the dump for each of the 70 databases with and without statistics and reports the format chosen; after the fix, all 70 are unchanged. The partial pilot run made with the faulty builder was deleted and repeated.
+We first ran a pilot of 40 questions, chosen to cover every database family, once without statistics and once with them. In the treatment run, the block for each table became longer and for the `stackoverflow` database the whole dump no longer fit in the 58000 character budget. The prompt builder then switched to a shorter format that lists only column names, dropping the descriptions and sample rows, so the treatment run had changed in two ways at once: statistics were added and descriptions were removed. 
 
-### 4.6 The pilot's result
+The builder now drops the statistics from the dump first and keeps every description, while `describe_table` still returns the statistics when the model asks for a table. The script `dump_mode_check.py` builds the dump for each of the 70 databases with and without statistics and reports the format chosen; after the fix, all 70 are unchanged.
 
-On the 40 pilot questions the control, the treatment and October's `bq_v3r` all scored 15 of 40. The treatment read 131 GiB against the control's 208 GiB, a 37% reduction, and took fewer steps (20.2 against 23.0). The pilot was too small to say more; 36 of the 40 treatment episodes displayed at least one statistic, so the feature was reaching the model. The reduction in data read did not reappear at full scale (Section 7.2).
+On the 40 pilot questions the control, the treatment and October's `bq_v3r` all scored 15 of 40. The treatment read 131 GiB against the control's 208 GiB, a 37% reduction and took fewer steps (20.2 against 23.0).
 
 ---
 
 ## 5. Design of the runs
 
-All runs use the same model server, greedy decoding, a limit of 60 steps, and the October limits on data read. The first four arms use all 204 questions.
+All runs use the same model server, greedy decoding, a limit of 60 steps and the October limits on data read. The first four runs use all 204 questions.
 
-| arm | statistics | rubric text in prompt | row-count check | purpose |
+| run | statistics | rubric text in prompt | row-count check | purpose |
 |---|---|---|---|---|
 | `C` | no | yes (123 questions) | no | control |
 | `T` | yes | yes (128 questions, from its own planner run with statistics) | no | the change  asked for |
@@ -146,9 +155,12 @@ All runs use the same model server, greedy decoding, a limit of 60 steps, and th
 | `R` | no | yes (the same files as `C`) | **yes** | the row-count check |
 | tries 1–4 | no | yes (as `R`) | yes | temperature 0.7 retries of the 107 questions `R` got wrong |
 
-Running a control at the same time as each treatment, on the same server, means that any change in the server, the warehouse or the day affects both. This matters because comparing a new run with an October run would mix the effect of our change with four weeks of other differences, including the Google Cloud project, the code and the server. `R` differs from `C2` in exactly one setting, `--rubric-row-check`.
+Each change was tested against an unchanged control that ran at the same time on the same Modal server. If anything outside our change shifts during a run, such as the server's behaviour, the BigQuery warehouse or simply the day, it shifts the control and the changed run equally, so the difference between them reflects our change. Comparing a new run with the October run would instead mix the effect of our change with four weeks of other differences, including the new Google Cloud project, the code changes and a different server.
 
-Three kinds of statistics are used, none of them corrected for the number of comparisons made. The two-sided sign test on flips asks whether a gain is lopsided. A bootstrap interval resamples questions. Where a split by "gate open versus gate closed" is used, it divides the questions into those on which a change can act and those on which it cannot, and the second group works as an internal control.
+The comparisons use three statistical tools:
+- **Flips and the sign test.** A "flip" is a question whose result differs between two runs, either wrong to right (a gain) or right to wrong (a loss). "+27 / −18" means 27 questions were wrong in the first run and right in the second and 18 the other way around. The two-sided sign test asks whether the gains and losses are balanced enough that the differences could be random variation.
+- **Bootstrap interval.** We resample the 204 questions with replacement many times and recompute the accuracy difference each time. The spread of those results gives a range for the likely true difference; if the range includes zero, the improvement could be nothing.
+- **Gate open versus gate closed.** The row-count check can only act on questions where the rubric was confident about the number of rows (the "gate" is open). On the remaining questions the check cannot act, so they serve as an internal control. If accuracy moves on the gate-open questions and stays flat on the gate-closed ones, that points to the change as the cause rather than general run-to-run noise.
 
 ---
 
@@ -175,7 +187,7 @@ Work proceeded in four phases.
 | try 3 | 1 h 17 min | 27 / 107 | 722 GiB |
 | try 4 | 1 h 23 min | 21 / 107 | 751 GiB |
 
-No run had an infrastructure error. The harness's own counter of data scanned reads higher than BigQuery's bill (for example 1.65 TiB against 1.3 TiB for `R`); the bill is used throughout. One question (ga021) took noticeably longer than the rest in try 4, and the overall run waited for it.
+No run had an infrastructure error.
 
 ---
 
@@ -247,7 +259,11 @@ For every run, the wrong answers were classified by the real number of rows subm
 | no submission | 0 | 1 | 1 | 0 | 2 | 1 |
 | of "too many rows", the rubric's count was right | 19 | 14 | 18 | 16 | 14 | **0** |
 
-For `bq_v3` and `bq_v3r` the rubric was not in the prompt, and in every column the last row counts what the rubric of `C` would have said. The last row is the one that motivated the check. In `C` and `C2`, where the correct row count was written in the prompt, 18 and 14 answers still had too many rows. Reading them, the model had typically run an exploratory query with `LIMIT 10` or a ranking over every group, seen a plausible table, and submitted it although the rubric said one row. The rubric states the correct count on 118 of the 123 questions where the gate is open (the five exceptions are listed below).
+For `bq_v3` and `bq_v3r` the rubric was not in the prompt and in every column the last row counts what the rubric of `C` would have said. The last row is the one that motivated the check. 
+
+In `C` and `C2`, where the correct row count was written in the prompt, 18 and 14 answers still had too many rows. Reading them, the model had typically run an exploratory query with `LIMIT 10` or a ranking over every group, seen a plausible table and submitted it although the rubric said one row. 
+
+The rubric states the correct count on 118 of the 123 questions where it is confident on the row count.
 
 #### How it works
 
@@ -255,7 +271,7 @@ When the rubric's count is stated with high confidence and the model submits a q
 
 > Row-count check: q1 returned 10 row(s), but the expected output shape (confidence: high) is exactly 3 row(s). Re-read the question. If it asks for exactly 3, run a query that returns exactly that and submit its query_id. If you are confident the count should be 10, submit q1 again.
 
-It never rewrites SQL, never fires a second time on the same question, and uses no information from the answer key; the rubric is written from the question and the catalog alone. Earlier in the project the SQLite lane had a feature that silently removed `LIMIT` clauses from submissions; it was reverted (commit `cd1d20f`) because it turned correct top-N answers into wrong ones. The check described here therefore only asks the model a question and leaves the decision with the model.
+It never rewrites SQL, never fires a second time on the same question, and uses no information from the answer key; the rubric is written from the question and the catalog alone. The check described here therefore only asks the model a question and leaves the decision with the model.
 
 #### Result
 
@@ -265,9 +281,13 @@ It never rewrites SQL, never fires a second time on the same question, and uses 
 | 123 where the check can fire | 56 (45.5%) | 67 (54.5%) | +19 / −8 | p = 0.05 |
 | 81 where it cannot fire | 32 | 30 | +8 / −10 | p = 0.81 |
 
-Against the mean of both controls (`C` and `C2`, 42.6%), `R` is 4.9 points higher, with a bootstrap 95% interval of −0.5 to +10.5 points. The same split against `C` alone is +21 and −7 (p = 0.01). The 81 questions on which the check cannot fire have identical prompts and an identical loop, so their movement of −2 questions measures the noise in this comparison directly; the open-gate group moved by +11. We chose the split by gate after seeing the totals, so the p-values describe the data and carry no formal guarantee.
+Against the mean of both controls (`C` and `C2`, 42.6%), `R` is 4.9 points higher, with a bootstrap 95% interval of −0.5 to +10.5 points. 
 
-Wrong answers with too many rows fell from 27 to 11, and the number of answers that were wrong because the rubric's count was right and ignored fell from 14 to 0. Wrong answers with too few rows rose from 16 to 19. Part of that rise is a side effect of the check, as the question-level table below shows for `bq076`, where shrinking a list into a single value also dropped a column.
+The same split against `C` alone is +21 and −7 (p = 0.01). 
+
+The 81 questions on which the check cannot be applied have identical prompts and an identical loop, so their movement of −2 questions measures the noise in this comparison directly; the open-gate group moved by +11. We chose the split by gate after seeing the totals, so the p-values describe the data and carry no formal guarantee. Wrong answers with too many rows fell from 27 to 11, and the number of answers that were wrong because the rubric's count was right and ignored fell from 14 to 0. 
+
+Wrong answers with too few rows rose from 16 to 19. Part of that rise is a side effect of the check, as the question-level table below shows for `bq076`, where shrinking a list into a single value also dropped a column.
 
 #### The 18 questions on which the check fired, one by one
 
@@ -294,20 +314,25 @@ The check fired on 18 of the 123 open-gate questions in `R`. Seventeen of the 18
 | `ga011` | ga4 | 10 rows (ranking of pages) | 1 row | Kept only the second-ranked page. | **right** |
 | `ga030` | firebase | 14 cohorts | 1 row | Kept only the cohort with the highest retention. | **right** |
 
-Ten of the 18 ended right. Had the check not fired, only 1 of the 18 first submissions would have scored, and in the two controls `C2` and `C` three and two of these same 18 questions happened to come out right. The gain on these 18 questions is therefore between 7 and 9 questions, depending on which baseline is used, and 7 of the net 9 between `C2` and `R` arise here. The remaining questions, on which the check did not fire, differ between the two arms by a net 2.
+Ten of the 18 ended right. Had the check not fired, only 1 of the 18 first submissions would have scored, and in the two controls `C2` and `C` three and two of these same 18 questions happened to come out right. 
 
-Four kinds of outcome appear in the table, and each suggests a different follow-up.
+The gain on these 18 questions is therefore between 7 and 9 questions, depending on which baseline is used, and 7 of the net 9 between `C2` and `R` arise here. The remaining questions, on which the check did not fire, differ between the two arms by a net 2.
+
+Four kinds of outcome appear in the table and each suggests a different follow-up.
 
 - **The rubric was wrong (`bq130`, `bq339`, `bq462`).** The planner's row count disagrees with the answer key on 5 of the 123 open-gate questions: `bq089`, `bq130`, `bq339`, `bq360` and `bq462`. The check fired on three of them, and in one (`bq339`) it replaced a right answer with a wrong one. This is the main risk of the check, and in this sample it cost 1 question out of 18.
+
 - **The row count was fixed and a column was lost (`bq076`).** The question asks for the highest monthly count and the answer key also lists the month, so the answer needs two columns. The model satisfied the row count with a single `MAX` value.
+
 - **The row count was fixed or already right, and the values were still wrong (`bq202`, `bq229`, `bq403`).** A row count cannot influence which value a query computes, so the check had no way of helping.
+
 - **The model could not finish (`bq002`).** The question asks for several outputs and exhausted the step budget.
 
 ### 7.5 Retries of the failures: what the other 107 questions did
 
 For each of the 107 questions `R` answered wrongly, four further attempts were run at temperature 0.7, with the rubric and the row-count check still active.
 
-| | answered right in this try | newly solved (not solved by an earlier attempt) | solved by any attempt, of 204 |
+|run | answered right in this try | newly solved (not solved by an earlier attempt) | solved by any attempt, of 204 |
 |---|---:|---:|---:|
 | `R`, greedy | — | — | 97 (47.5%) |
 | + try 1 | 20 | 20 | 117 (57.4%) |
@@ -315,7 +340,13 @@ For each of the 107 questions `R` answered wrongly, four further attempts were r
 | + try 3 | 27 | 7 | 135 (66.2%) |
 | + try 4 | 21 | 4 | **139 (68.1%)** |
 
-Each try rescues roughly one failure in five, 19% to 25% of the 107, but the new questions per try fall from 20 to 4 as the easy-to-rescue ones are used up. We did not retry the 97 questions `R` answered correctly, so the final figure tells us how often a right answer lies within reach of the system, which is a separate quantity from the accuracy of a single submitted answer. Retrying only the failures gives the exact count of questions solved by any attempt, because a question that is already solved cannot change that count. It cannot give pass@1, because the answer key decided which questions were retried and some of the failures would turn right by chance alone.
+- Each try rescues roughly one failure in five, 19% to 25% of the 107, but the new questions per try fall from 20 to 4 as the easy-to-rescue ones are used up. 
+
+- We did not retry the 97 questions `R` answered correctly, so the final figure tells us how often a right answer lies within reach of the system, which is a separate quantity from the accuracy of a single submitted answer. 
+
+- Retrying only the failures gives the exact count of questions solved by any attempt, because a question that is already solved cannot change that count. 
+
+- It cannot give pass@1, because the answer key decided which questions were retried and some of the failures would turn right by chance alone.
 
 **The 42 rescued questions.** How many of the four tries produced a right answer:
 
@@ -332,7 +363,7 @@ Of the 42 rescued questions, the greedy `R` answer had the right number of rows 
 
 ### 7.6 What remains unsolved
 
-Sixty-five questions were wrong in `R` and in all four tries. They are listed in full in Appendix B. By database family, 55 are `bq###` (of 179) and 10 are `ga###` (of 25).
+Sixty-five questions were wrong in `R` and in all four tries. By database family, 55 are `bq###` (of 179) and 10 are `ga###` (of 25).
 
 | database | never solved | in benchmark |
 |---|---:|---:|
@@ -345,7 +376,8 @@ Sixty-five questions were wrong in `R` and in all four tries. They are listed in
 | ncaa_basketball | 3 | 5 |
 | new_york, nhtsa_traffic_fatalities, google_dei, CYMBAL_INVESTMENTS | 2 each | 4, 4, 3, 2 |
 
-October's list of 76 questions that no lane solved had 18 of the 25 `ga###` questions in it. Now 15 of those 25 have been solved at least once, so these questions are less closed than they looked. The three Google Analytics and Firebase databases (ga360, firebase and ga4) still account for 15 of the 65 unsolved questions.
+- October's list of 76 questions that no lane solved had 18 of the 25 `ga###` questions in it. Now 15 of those 25 have been solved at least once, so these questions are less closed than they looked. 
+- The three Google Analytics and Firebase databases (ga360, firebase and ga4) still account for 15 of the 65 unsolved questions.
 
 The greedy `R` answers to these 65 fall into the following kinds.
 
@@ -357,14 +389,14 @@ The greedy `R` answers to these 65 fall into the following kinds.
 | ran out of the 60 steps | 11 | Long multi-stage analyses, listed below. |
 | no submission | 1 | `bq096`, a date search over bird sightings. |
 
-**Right shape, different values (34).** A few examples show how the answers diverge from the key while looking plausible:
+**Right shape, different values (34)** A few examples show how the answers diverge from the key while looking plausible:
 
 - `bq009` asks for the revenue gap between a traffic source's best and worst months. The model returned the right source, `(direct)`, and a gap of 118,015.76 where the key has 4,659.15, about 25 times smaller, so the model's monthly totals or their difference were computed differently from the key's.
-- `bq022` asks for six equal-sized duration groups of Chicago taxi trips. The model's groups each hold 34,891,917 trips and the key's hold 34,655,568 and 34,655,569, a 0.7% difference that suggests the two sets of trips were filtered differently.
+- `bq022` asks for six equal-sized duration groups of Chicago taxi trips. The model's groups each hold 34,891,917 trips and the key's hold 34655568 and 34655569, a 0.7% difference that suggests the two sets of trips were filtered differently.
 - `bq024` expects numeric evaluation-group codes such as 562012 in its first column, and the model returned the descriptive text for that column.
 - `bq008` asks which page visitors most often reach next. The model answered `/home` with a maximum time of 2 seconds, where the key names a specific apparel page and 2,848 seconds.
 
-These examples suggest that many of the differences come from definitions the question leaves open, such as which trips count, how a month is totalled, or which code a column holds; we have not read all 34 individually. This is the largest category of residual failure, and the row-count check has no influence on it.
+These examples suggest that many of the differences come from definitions the question leaves open, such as which trips count, how a month is totalled or which code a column holds; we have not read all 34 individually. This is the largest category of residual failure and the row-count check has no influence on it.
 
 **Questions with an attached document (24 of the 65).** Forty-two BigQuery questions come with a reference document that is meant to supply required definitions, such as a formula or a list of fields. The model always read it: in `R`, `read_documentation` was called on all 42. Even so, these questions are much harder.
 
@@ -384,7 +416,7 @@ Questions with a document make up 21% of the benchmark and 37% (24 of 65) of the
 
 ### 7.7 Where each run lost its points
 
-The failure taxonomy (`scripts/error_taxonomy.py`) assigns each wrong episode to one cause, harness first, so that the buckets sum to the loss.
+We try to assign each wrong episode to one cause, harness first, so that the buckets sum to the loss.
 
 | wrong episodes | `bq_v3` | `bq_v3r` | `C` | `T` | `C2` | `R` |
 |---|---:|---:|---:|---:|---:|---:|
@@ -398,25 +430,11 @@ The failure taxonomy (`scripts/error_taxonomy.py`) assigns each wrong episode to
 | **total wrong** | 120 | 105 | 118 | 118 | 116 | 107 |
 | correct | 84 | 95 | 86 | 86 | 88 | 97 |
 
-Harness limits account for 10% to 22% of wrong answers in every run. Between `C2` and `R` the number of wrong answers from the model fell by 17 (101 to 84), while the number stopped by a harness limit rose by 8 (15 to 23): 14 episodes ran out of steps against 10, and 6 had a query cancelled for time against 3. A check that asks the model to re-run a query can plausibly lengthen some episodes, but a difference of this size also occurs between identical runs (`C` had 24 harness-limited failures and `C2` had 15).
+Harness limits account for 10% to 22% of wrong answers in every run. Between `C2` and `R` the number of wrong answers from the model fell by 17 (101 to 84), while the number stopped by a harness limit rose by 8 (15 to 23): 14 episodes ran out of steps against 10, and 6 had a query cancelled for time against 3. 
 
-### 7.8 Corrections to the October analysis
+A check that asks the model to re-run a query can plausibly lengthen some episodes, but a difference of this size also occurs between identical runs (`C` had 24 harness-limited failures and `C2` had 15).
 
-**The rubric.** Section 7.3: the October report attributed 8.1 points to a rubric that was not in the prompts. The report's section 4 and the commit message of `461ffcf` should be read with that correction.
-
-**The wrong-answer shape table.** The October report (section 3) stated that on the best lane, 51% of wrong answers had too many rows, 15% too few, 33% the wrong number of columns, and 1% the right shape with wrong values, and concluded that the model finds the right tables but gets the grain wrong. The script that produced the table, `wrong_answer_shapes.py`, counts the lines of the preview text stored in the trace. That text is limited to the first 12 rows by default, it ends with footer lines such as `[showing 12 of 61 rows]` and `[scanned …]`, and the script counts the footer lines as data rows. Counting the real rows (taken from the footer) and the real columns gives a different picture for the same lane, `bq_v3r`, for its 97 wrong submitted answers:
-
-| wrong submitted answers on `bq_v3r` (97) | October table | recounted |
-|---|---:|---:|
-| too many rows | 49 (51%) | 24 (25%) |
-| too few rows | 15 (15%) | 13 (13%) |
-| right number of rows, but fewer columns than the answer key | 32 (33%, "wrong column count") | 7 (7%) |
-| right number of rows and enough columns, with different values | 1 (1%) | **53 (55%)** |
-
-In the October table the "wrong column count" group also included answers with more columns than the key, which the scorer allows, so it counted answers that were not shape errors at all. The recount for the other runs is similar. In `C2` there are 56 answers with the right rows and enough columns, 27 with too many rows, 15 with too few and 5 with a column missing (one answer could not be classified). In `R` the same counts are 57, 11, 19 and 5.
-
-The majority of wrong answers therefore have the right shape and disagree with the answer key about values. The October recommendation to extend the rubric to state the expected grain still applies to the quarter of wrong answers that have too many rows and the further eighth that have too few, and it cannot reach the 55% that already have the right shape.
-
+As compared to the analyses in October, the majority of wrong answers have the right shape and disagree with the answer key about values. The recommendation to extend the rubric to state the expected grain still applies to the quarter of wrong answers that have too many rows and the further eight that have too few and it cannot reach the 55% that already have the right shape.
 ---
 
 ## 8. How this compares with SQLite
@@ -443,7 +461,7 @@ The comparison  asked for, pass@1 averaged over four samples on every question, 
 | four retries | 3.0 TiB | $18.8 |
 | **total, all work today** | **9.2 TiB** | **about $57** |
 
-After the 1 TiB monthly free allowance the charge is about $51. The $150 guideline has not been reached. Every job carried `cost_center=rohini`, and `bq_spend.py` reads the figures from BigQuery's own job history. The model ran on Modal for roughly eight hours in total with the server warm; we did not read Modal's bill. No Google Cloud resource apart from query jobs was created, so nothing on Google Cloud needs to be stopped. No Google Cloud GPU was used, and Modal's server shuts itself down after 20 minutes without traffic. We left the Modal deployment itself in place because stopping it would require redeploying for any follow-up.
+After the 1 TiB monthly free allowance the charge is about $51. Every job carried `cost_center=rohini`. The model ran on Modal for roughly eight hours in total with the server warm.
 
 ---
 
@@ -804,40 +822,3 @@ After the 1 TiB monthly free allowance the charge is about $51. The $150 guideli
 | `ga022` | firebase | 1 | 1 | 1 | 16 | T,C2 | right row count |
 | `ga028` | firebase | - | 1/5 | 5 | 60 | - | ran out of steps |
 | `ga031` | ga4 | 1 | 1 | 1 | 14 | - | right row count |
-
-## Appendix C. Files and commands
-
-**New or changed files (not committed):**
-
-| file | change |
-|---|---|
-| `nl2sql-v2/src/nl2sql/bigquery_db.py` | impersonated credentials, `cost_center` label, optional statistics, louder fallback warning |
-| `nl2sql-v2/src/nl2sql/lite_catalog.py` | reads the statistics and prints them in `describe_table` |
-| `nl2sql-v2/src/nl2sql/agent.py` | `expected_rows` parameter and the row-count check |
-| `nl2sql-v2/src/nl2sql/rubric.py` | comment only |
-| `nl2sql-v2/scripts/run_benchmark.py` | `--bq-stats`, `--rubric-row-check`, guard against an empty rubric directory, statistics yield to descriptions in the schema dump |
-| `nl2sql-v2/scripts/run_rubric.py` | `--bq-stats` |
-| `nl2sql-v2/scripts/enrich_bq_stats.py` | the one-time statistics pass |
-| `nl2sql-v2/scripts/check_row_check.py` | no-GPU test of the check |
-| `nl2sql-v2/scripts/bq_spend.py`, `bigquery_preflight.py`, `check_bigquery_db.py` | new credentials, new wording |
-| `nl2sql-v2/scripts/analysis/` | `run_arm.py` (drives one arm), `compare_arms.py` (paired comparison), `shapes_true.py` (true row shapes), `passk.py` (retry tally), and `instances/` (the question lists) |
-| `spider2-dce/output/bigquery_stats/` | the statistics, one file per database |
-
-**Reproducing the runs** (from the repository root; the endpoint is the Modal server):
-
-```bash
-# a control, a treatment, and a row-check arm over all 204 questions
-A=nl2sql-v2/scripts/analysis        # the instance lists are comma-separated question ids
-python $A/run_arm.py --tag full_C  --instances-file $A/instances/all204.txt --shards 5 --endpoint $EP
-python $A/run_arm.py --tag full_T  --instances-file $A/instances/all204.txt --shards 5 --endpoint $EP --bq-stats spider2-dce/output/bigquery_stats
-python $A/run_arm.py --tag full_R  --instances-file $A/instances/all204.txt --shards 5 --endpoint $EP --rubric-dir results/full_C/rubrics --row-check
-# four retries of the failures at temperature 0.7 (repeat with failR_s2, failR_s3, failR_s4)
-python $A/run_arm.py --tag failR_s1 --instances-file $A/instances/fail_R.txt --shards 5 --endpoint $EP --temperature 0.7 --rubric-dir results/full_C/rubrics --row-check
-
-# analysis
-uv run --project nl2sql-v2 python $A/compare_arms.py --c results/full_C2 --t results/full_R --exposure row_check --show
-uv run --project nl2sql-v2 python $A/shapes_true.py
-python $A/passk.py
-uv run --project nl2sql-v2 python nl2sql-v2/scripts/error_taxonomy.py bq_v3:logs/traces/bq_v3:results/bq_v3_run.csv full_R:results/full_R/traces:results/full_R/all.csv
-uv run --project nl2sql-v2 python nl2sql-v2/scripts/bq_spend.py --hours 72   # needs BIGQUERY_PROJECT and BIGQUERY_IMPERSONATE_SERVICE_ACCOUNT set
-```
