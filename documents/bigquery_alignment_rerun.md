@@ -1,10 +1,10 @@
 # Spider 2.0-Lite BigQuery, second round: aligning the harness with SQLite and re-measuring
 
-**What this is.** In October we scored all 204 BigQuery questions of Spider 2.0-Lite for the first time, using four configurations of the same agent and the model `Qwen/Qwen3.6-35B-A3B`; the best configuration answered 47.5% correctly ([bigquery_lane_analysis.md](bigquery_lane_analysis.md)). A teammate, Julie, then compared our BigQuery harness with the SQLite harness that scores higher and listed five differences that might explain the gap. At the same time we received new Google Cloud credentials that come with spending rules. This report covers 6 November 2026, the day we made the changes Julie asked for, re-ran every question several times side by side, and followed the results where they led.
+**What this is.** In October we scored all 204 BigQuery questions of Spider 2.0-Lite for the first time, using four configurations of the same agent and the model `Qwen/Qwen3.6-35B-A3B`; the best configuration answered 47.5% correctly ([bigquery_lane_analysis.md](bigquery_lane_analysis.md)). 
 
 The work produced four results and two corrections to our own earlier conclusions.
 
-1. **Adding table statistics to the schema tools, which was Julie's first request, did not change accuracy.** The run with statistics and the run without it both answered 86 of 204 questions correctly (Section 7.2).
+1. **Adding table statistics to the schema tools did not change accuracy.** The run with statistics and the run without it both answered 86 of 204 questions correctly (Section 7.2).
 2. **October's "gated rubric" lane never showed the rubric to the model.** All 200 of its prompts are identical, character for character, to the prompts of the lane it was compared against, so the reported gain of 8.1 points was run-to-run variation between two identical setups (Section 7.3).
 3. **A small new check on the number of rows in a submitted answer raised accuracy from 43.1% to 47.5%.** The check fired on 18 questions and produced a net nine additional right answers. The evidence comes from one replicate and a split by whether the check could act, so we treat it as suggestive and describe the steps that would confirm it (Sections 7.4 and 10).
 4. **Allowing four further attempts at temperature 0.7 on the 107 questions the best run got wrong brought the number of questions answered correctly at least once to 139 of 204 (68.1%).** For the same model on SQLite the team measured 69.6% for the equivalent "any of four samples" figure, so the two lanes now look similar on that measure (Sections 7.5 and 8).
@@ -71,9 +71,9 @@ Every BigQuery number in the table above is a single greedy run, so comparing 47
 
 ---
 
-## 3. Why a second round: Julie's five differences
+## 3. Why a second round: 's five differences
 
-Julie compared the two harnesses and found the following. Reading the code confirmed each one.
+ compared the two harnesses and found the following. Reading the code confirmed each one.
 
 | # | Difference | What the code showed | What we did |
 |---|---|---|---|
@@ -81,7 +81,7 @@ Julie compared the two harnesses and found the following. Reading the code confi
 | 2 | **The `get_column_values` fallback is misleading.** When an exact distinct-value query would read too much data, the BigQuery tool returns a handful of catalog sample values instead. | Confirmed. The fallback was already labelled as a sample, but the label was easy to overlook. | Rewrote the warning so that it cannot be mistaken for the real value list (Section 4.4). |
 | 3 | **The rubric planner is blind on warehouses.** On SQLite the planner can look at column values; on BigQuery those tools are removed to avoid doubling the bill. | Confirmed. | Gave the planner the same cached statistics through `describe_table`, at no query cost, and kept the value tools removed (Section 4.3). |
 | 4 | **Time and cost limits.** BigQuery runs have a 120-second statement timeout, 60 queries and 900 seconds per question, 50 GiB per query and 200 GiB per question. SQLite has none. | Confirmed. Several October episodes already scanned more than 100 GiB. | **Not changed.** Raising limits needs a measured proposal that the project administrators see first (Section 10). |
-| 5 | **Decoding and weights.** BigQuery runs are greedy in bf16. SQLite uses temperature 0.7, according to Julie's comparison with quantized (AWQ) weights, and reports the mean of four samples. | Confirmed for decoding and for the metric. | Ran sampled retries at temperature 0.7 on the questions that failed (Section 7.5). We did **not** switch to quantized weights, and did not sample every question. |
+| 5 | **Decoding and weights.** BigQuery runs are greedy in bf16. SQLite uses temperature 0.7, according to 's comparison with quantized (AWQ) weights, and reports the mean of four samples. | Confirmed for decoding and for the metric. | Ran sampled retries at temperature 0.7 on the questions that failed (Section 7.5). We did **not** switch to quantized weights, and did not sample every question. |
 
 ---
 
@@ -104,7 +104,7 @@ The model runs on Modal and no GPU was used on Google Cloud, so the rule about G
 
 Credentials for the shared project stay on one machine. The agent loop, the tools and the BigQuery calls therefore run on Rohini's laptop in five parallel processes per run, and only the model calls go to the Modal H200. The `run_arm.py` script drives a full arm: first the rubric pass, then the five processes. The vLLM key was regenerated for this and stored in a Modal secret.
 
-### 4.3 Statistics for `describe_table` (Julie's items 1 and 3)
+### 4.3 Statistics for `describe_table` ('s items 1 and 3)
 
 [enrich_bq_stats.py](../nl2sql-v2/scripts/enrich_bq_stats.py) visits each of the 69 reachable databases once and records, for every table, the exact row count and, for every column of an identifier-like type, an approximate distinct count (HyperLogLog) and the number of nulls. Floating-point columns are skipped because their distinct counts are not informative. Before spending anything the script estimates its cost with BigQuery dry runs, which are free, and it sets a byte cap on every query.
 
@@ -141,7 +141,7 @@ All runs use the same model server, greedy decoding, a limit of 60 steps, and th
 | arm | statistics | rubric text in prompt | row-count check | purpose |
 |---|---|---|---|---|
 | `C` | no | yes (123 questions) | no | control |
-| `T` | yes | yes (128 questions, from its own planner run with statistics) | no | the change Julie asked for |
+| `T` | yes | yes (128 questions, from its own planner run with statistics) | no | the change  asked for |
 | `C2` | no | yes (the same files as `C`) | no | a second control, run at the same time as `R` |
 | `R` | no | yes (the same files as `C`) | **yes** | the row-count check |
 | tries 1–4 | no | yes (as `R`) | yes | temperature 0.7 retries of the 107 questions `R` got wrong |
@@ -378,7 +378,7 @@ These examples suggest that many of the differences come from definitions the qu
 
 Questions with a document make up 21% of the benchmark and 37% (24 of 65) of the never-solved set. Examples are `bq441` and `bq442`, whose question text says only "as listed in the info document" or "refer to the document for all the information I want". Bringing these questions to the rate of the others would be worth up to 11 questions in a greedy run, so how the model applies the document is a promising place to look.
 
-**Ran out of steps (11).** `bq003` (ga360), `bq085` (covid19_jhu), `bq102` (gnomAD), `bq111` (mitelman), `bq200` (mlb), `bq277` (noaa_ports), `bq287` (fda), `bq354` (cms_data), `ga005`, `ga020` and `ga028` (firebase). These are long analyses, such as retention by weekly cohort, a correlation computed for each chromosome, or a spatial join. Only two of the eleven (`bq003` and `bq200`) were ever solved by another run. In the error taxonomy of Section 7.7, 22 of `R`'s 107 failures were stopped by a harness limit: 14 ran out of steps, 6 had a query cancelled for exceeding the time limit and 2 were refused for exceeding a scan cap. Those 22 are the most that Julie's fourth item, raising the limits, could address.
+**Ran out of steps (11).** `bq003` (ga360), `bq085` (covid19_jhu), `bq102` (gnomAD), `bq111` (mitelman), `bq200` (mlb), `bq277` (noaa_ports), `bq287` (fda), `bq354` (cms_data), `ga005`, `ga020` and `ga028` (firebase). These are long analyses, such as retention by weekly cohort, a correlation computed for each chromosome, or a spatial join. Only two of the eleven (`bq003` and `bq200`) were ever solved by another run. In the error taxonomy of Section 7.7, 22 of `R`'s 107 failures were stopped by a harness limit: 14 ran out of steps, 6 had a query cancelled for exceeding the time limit and 2 were refused for exceeding a scan cap. Those 22 are the most that 's fourth item, raising the limits, could address.
 
 **Seven questions were solved by another run, either in October or earlier this round, and by none of the five attempts of `R`.** They are `bq003`, `bq075`, `bq090`, `bq200`, `bq290`, `ga009` and `ga022`. Together with the 14 questions that most of the tries solved, they show that the set of questions the system can solve is larger than any single configuration reaches.
 
@@ -429,7 +429,7 @@ The majority of wrong answers therefore have the right shape and disagree with t
 
 Two points of caution apply. The SQLite figures at temperature 0.7 come from commit `49cca7d` and use the same Qwen3.6-35B model, whereas the 54.1% and 57.8% quoted in `CLAUDE.md` for September belong to a smaller model (Qwen3.5-9B) and should not be set beside the BigQuery figures. In addition, the BigQuery "any attempt" figure uses five attempts on the questions `R` got wrong and one on the rest, and SQLite's uses four attempts on every question, so the two figures are close to each other but built differently.
 
-The comparison Julie asked for, pass@1 averaged over four samples on every question, has not been run on BigQuery. From this round's data, four samples of one configuration over all 204 questions would read about 5 TiB (roughly $31) and keep the GPU busy for about three and a half hours, and a matched control would double both. It needs the team's agreement under our plan.
+The comparison  asked for, pass@1 averaged over four samples on every question, has not been run on BigQuery. From this round's data, four samples of one configuration over all 204 questions would read about 5 TiB (roughly $31) and keep the GPU busy for about three and a half hours, and a matched control would double both. It needs the team's agreement under our plan.
 
 ---
 
