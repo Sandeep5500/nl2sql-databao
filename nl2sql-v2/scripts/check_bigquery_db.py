@@ -212,8 +212,8 @@ def main():
     check("columns() carries (name, type, nullable)", cat.columns("data-to-insights.ecommerce.products")[0],
           ("SKU", "STRING", "UNKNOWN"))
     hint = cat.column_values_hint("all_sessions", "channelGrouping")
-    check_true("column value hint uses sample rows",
-               "Direct" in hint and "not the full distribution" in hint)
+    check_true("column value hint uses sample rows, loudly flagged as partial",
+               "Direct" in hint and "NOT the real distinct values" in hint)
 
     sfcat = LiteCatalog("TPCH_SF1", "snowflake", lite)
     check("one reader serves the Snowflake layout too", sfcat.list_tables(),

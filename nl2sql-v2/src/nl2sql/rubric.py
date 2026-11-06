@@ -134,9 +134,11 @@ def run_rubric(question: str, session: ToolSession, llm: LLMConfig, cfg: AgentCo
     allowed = RUBRIC_TOOLS | ({"run_sql_query"} if with_sql else set())
     # On SQLite every inspection tool is free, so the rubric agent gets all of them.
     # On a warehouse, list_tables and describe_table are served from the catalog
-    # Spider2 ships (zero queries), but get_column_values is real SQL against real
-    # data -- and this is a second pass over every question, so leaving it in would
-    # roughly double the lane's bill for a planning step that does not need it.
+    # Spider2 ships (zero queries) -- and once scripts/enrich_bq_stats.py has run
+    # for a database, that includes real row/distinct/null counts too, so the
+    # rubric already sees them here for free. get_column_values stays stripped:
+    # it is real SQL against real data, and this is a second pass over every
+    # question, so leaving it in would roughly double the lane's bill.
     if getattr(session.db, "dialect", "duckdb_sqlite") != "duckdb_sqlite":
         allowed = allowed - {"get_column_values", "find_value"}
     tools = [t for t in build_tool_schemas(cfg, has_docs=session.doc_text is not None,

@@ -67,6 +67,9 @@ def main():
                     help="also give the rubric agent run_sql_query. On a warehouse "
                          "lane this makes the pass cost real money; off by default.")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--bq-stats", metavar="DIR",
+                    help="BigQuery: show the rubric agent the one-time row/distinct/"
+                         "null stats in describe_table (see run_benchmark.py)")
     args = ap.parse_args()
 
     if args.source not in DATA_SOURCES:
@@ -122,7 +125,9 @@ def main():
             if bq_cfg is not None:
                 from nl2sql.bigquery_db import BigQueryDatabase
                 db = BigQueryDatabase(db_name, bq_cfg, SPIDER2_LITE,
-                                      instance_id=iid, run_tag="rubric")
+                                      instance_id=iid, run_tag="rubric",
+                                      stats_dir=(Path(args.bq_stats)
+                                                 if args.bq_stats else None))
             elif snow_cfg is not None:
                 from nl2sql.snowflake_db import SnowflakeDatabase
                 db = SnowflakeDatabase(db_name, snow_cfg, instance_id=iid,

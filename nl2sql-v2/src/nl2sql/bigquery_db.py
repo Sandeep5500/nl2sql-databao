@@ -34,7 +34,9 @@ class BigQueryConfig:
     project: str = ""                       # the billing project
     credentials_path: str = ""              # service-account JSON on disk
     credentials_info: dict | None = None    # ... or the key itself, from a secret
+    impersonate_service_account: str = ""   # ... or impersonate this SA via ADC
     location: str | None = None             # e.g. "US"; most public data is US
+    cost_center: str = "rohini"             # job label for billing attribution
 
     statement_timeout_s: int = 120
     max_queries_per_episode: int = 60
@@ -51,10 +53,13 @@ class BigQueryConfig:
     @classmethod
     def load(cls, path: Path | None = None, **overrides) -> "BigQueryConfig":
         """Credentials from, in order: an explicit path, GOOGLE_APPLICATION_CREDENTIALS
-        / BIGQUERY_CREDENTIAL, then ~/.nl2sql/bigquery_credential.json.
+        / BIGQUERY_CREDENTIAL, BIGQUERY_IMPERSONATE_SERVICE_ACCOUNT (no key file at
+        all -- your own `gcloud auth login` plus ADC impersonating that service
+        account), then ~/.nl2sql/bigquery_credential.json.
 
-        The JSON schema is a normal GCP service-account key, which is also what
-        Spider2's own evaluation_suite expects, so the same file serves both.
+        The JSON schema (when a key file is used) is a normal GCP service-account
+        key, which is also what Spider2's own evaluation_suite expects, so the same
+        file serves both.
         """
         # On Modal the key arrives as a secret env var holding the JSON, so
         # nothing is ever written to the container filesystem.
@@ -71,6 +76,9 @@ class BigQueryConfig:
                        source=f"env (service account "
                               f"{info.get('client_email', '?')})", **overrides)
 
+        impersonate = overrides.pop("impersonate_service_account", "") or os.environ.get(
+            "BIGQUERY_IMPERSONATE_SERVICE_ACCOUNT", "")
+
         tried, chosen = [], None
         candidates = []
         if path:
@@ -86,15 +94,29 @@ class BigQueryConfig:
                 break
             tried.append(str(cand))
 
+        if chosen is None and impersonate:
+            project = (overrides.pop("project", "")
+                       or os.environ.get("BIGQUERY_PROJECT", ""))
+            if not project:
+                raise SystemExit(
+                    "BIGQUERY_IMPERSONATE_SERVICE_ACCOUNT is set but no project; "
+                    "set BIGQUERY_PROJECT (e.g. llm-systems-projects)")
+            return cls(project=project, impersonate_service_account=impersonate,
+                       source=f"impersonated ({impersonate})", **overrides)
+
         if chosen is None:
             raise SystemExit(
                 "no BigQuery credentials found. Looked in:\n  "
                 + "\n  ".join(tried or ["(nothing configured)"])
                 + "\nOn Modal: modal secret create nl2sql-bigquery "
                   "GOOGLE_APPLICATION_CREDENTIALS=/secrets/bq.json  (and mount the "
-                  "key), or set BIGQUERY_CREDENTIAL to the key path.\nLocally: put "
-                  "the service-account key at ~/.nl2sql/bigquery_credential.json "
-                  "(chmod 600).")
+                  "key), or set BIGQUERY_CREDENTIAL to the key path.\nLocally, no key "
+                  "needed if you can impersonate a service account: `gcloud auth "
+                  "login`, `gcloud config set project <proj>`, `gcloud config set "
+                  "auth/impersonate_service_account <sa-email>`, then set "
+                  "BIGQUERY_IMPERSONATE_SERVICE_ACCOUNT=<sa-email> and "
+                  "BIGQUERY_PROJECT=<proj>.\nOtherwise put a service-account key at "
+                  "~/.nl2sql/bigquery_credential.json (chmod 600).")
 
         project = overrides.pop("project", "")
         if not project:
@@ -111,12 +133,58 @@ class BigQueryConfig:
                    source=str(chosen), **overrides)
 
     def redacted(self) -> str:
-        who = (self.credentials_info or {}).get("client_email",
-                                               self.credentials_path or "<none>")
+        who = ((self.credentials_info or {}).get("client_email")
+               or self.credentials_path
+               or (f"impersonated:{self.impersonate_service_account}"
+                   if self.impersonate_service_account else "<none>"))
         return (f"project={self.project} credentials={who} "
+                f"cost_center={self.cost_center} "
                 f"location={self.location} "
                 f"max_bytes/query={self.max_bytes_per_query / 1024 ** 3:.0f}GiB "
                 f"max_bytes/episode={self.max_bytes_per_episode / 1024 ** 3:.0f}GiB")
+
+
+def build_credentials(cfg: "BigQueryConfig"):
+    """The one place that turns a BigQueryConfig into google-auth Credentials,
+    so the benchmark driver, bq_spend.py and bigquery_preflight.py agree on how
+    (key file, inline key, or impersonation -- see BigQueryConfig.load)."""
+    if cfg.credentials_info or cfg.credentials_path:
+        from google.oauth2 import service_account
+        if cfg.credentials_info:
+            return service_account.Credentials.from_service_account_info(
+                cfg.credentials_info)
+        return service_account.Credentials.from_service_account_file(
+            cfg.credentials_path)
+    if cfg.impersonate_service_account:
+        import google.auth
+        from google.auth import impersonated_credentials
+        source_creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        # If `gcloud config set auth/impersonate_service_account` was already
+        # set when ADC was created (`gcloud auth application-default login`),
+        # google.auth.default() returns credentials that are ALREADY
+        # impersonating the target service account -- wrapping those in a
+        # second impersonated_credentials layer makes the target SA try to
+        # impersonate itself, which it has no permission to do. Use it as-is.
+        if isinstance(source_creds, impersonated_credentials.Credentials):
+            return source_creds
+        # Otherwise this is a plain user/ADC credential: clear whatever quota
+        # project it happened to have baked in (e.g. from an unrelated
+        # `gcloud auth application-default login` elsewhere) -- the caller is
+        # usually only granted Token Creator on the target service account,
+        # not serviceusage rights on cfg.project, so stamping either project
+        # onto this request as X-Goog-User-Project gets refused. With no
+        # quota project header the IAM Credentials API call bills to the
+        # target service account's own project instead, which always works.
+        if hasattr(source_creds, "with_quota_project"):
+            source_creds = source_creds.with_quota_project(None)
+        return impersonated_credentials.Credentials(
+            source_credentials=source_creds,
+            target_principal=cfg.impersonate_service_account,
+            target_scopes=["https://www.googleapis.com/auth/bigquery"])
+    raise ValueError(
+        "BigQueryConfig has no credentials_info/credentials_path/"
+        "impersonate_service_account set")
 
 
 def human_bytes(n) -> str:
@@ -142,7 +210,8 @@ class BigQueryDatabase:
     dialect = "bigquery"
 
     def __init__(self, db_name: str, cfg: BigQueryConfig, lite_root: Path,
-                 instance_id: str = "", run_tag: str = "", client=None):
+                 instance_id: str = "", run_tag: str = "", client=None,
+                 stats_dir: Path | None = None):
         self.db_name = db_name
         self.cfg = cfg
         self.instance_id = instance_id
@@ -150,7 +219,9 @@ class BigQueryDatabase:
         self.budget = QueryBudget(max_queries=cfg.max_queries_per_episode,
                                   max_seconds=cfg.max_seconds_per_episode)
         self.bytes_scanned = 0
-        self.catalog = LiteCatalog(db_name, "bigquery", lite_root)
+        # stats_dir is opt-in (run_benchmark.py --bq-stats): loading it whenever
+        # the files exist would silently hand the enrichment to a control lane too.
+        self.catalog = LiteCatalog(db_name, "bigquery", lite_root, stats_dir=stats_dir)
         if not self.catalog.available:
             raise ValueError(
                 f"no shipped catalog for BigQuery database {db_name!r} under "
@@ -172,15 +243,8 @@ class BigQueryDatabase:
     def client(self):
         if self._client is None:
             from google.cloud import bigquery
-            from google.oauth2 import service_account
-            if self.cfg.credentials_info:
-                creds = service_account.Credentials.from_service_account_info(
-                    self.cfg.credentials_info)
-            else:
-                creds = service_account.Credentials.from_service_account_file(
-                    self.cfg.credentials_path)
             self._client = bigquery.Client(project=self.cfg.project,
-                                           credentials=creds,
+                                           credentials=build_credentials(self.cfg),
                                            location=self.cfg.location)
         return self._client
 
@@ -199,12 +263,16 @@ class BigQueryDatabase:
         return self.catalog.columns(table)
 
     def describe_table(self, table: str, sample_rows: int = 5,
-                       context=None, notes: bool = True) -> str:
+                       context=None, notes: bool = True, stats: bool = True) -> str:
         # context/notes are the DCE enrichment material, which only exists for the
         # SQLite databases; the shipped BigQuery catalog carries the publishers' own
         # column descriptions instead. Accepted and ignored so tools.py never has to
         # branch on dialect.
-        return self.catalog.describe(table, sample_rows=sample_rows)
+        return self.catalog.describe(table, sample_rows=sample_rows, stats=stats)
+
+    @property
+    def has_stats(self) -> bool:
+        return self.catalog.has_stats
 
     def list_views(self) -> list[str]:
         """The shipped catalog JSON does not mark views, and one
@@ -230,7 +298,8 @@ class BigQueryDatabase:
             dry_run=dry_run,
             use_query_cache=self.cfg.use_query_cache,
             labels={"app": "nl2sql", "run": (self.run_tag or "adhoc")[:63].lower(),
-                    "instance": (self.instance_id or "none")[:63].lower()},
+                    "instance": (self.instance_id or "none")[:63].lower(),
+                    "cost_center": self.cfg.cost_center[:63].lower()},
         )
         if not dry_run:
             # server-side kill switch. Only on real runs: the API rejects the field
@@ -439,8 +508,10 @@ class BigQueryDatabase:
                     + self.catalog.column_values_hint(t.fullname, column, limit))
         if est > self.cfg.max_bytes_per_query:
             return (f"[reading {t.fullname}.{column} would scan {human_bytes(est)}, "
-                    f"over the per-query limit, so here is the catalog sample "
-                    f"instead]\n"
+                    f"over the per-query limit. The real distinct values could NOT "
+                    f"be read -- falling back to an unreliable catalog sample. If "
+                    f"getting this value right matters, add a filter that narrows "
+                    f"the scan and try get_column_values again]\n"
                     + self.catalog.column_values_hint(t.fullname, column, limit))
         df = self.query(sql, max_rows=limit)
         return df.to_csv(index=False)

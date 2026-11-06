@@ -44,7 +44,8 @@ class CatalogTable:
 class LiteCatalog:
     """The tables of one spider2-lite database, loaded from the shipped JSON."""
 
-    def __init__(self, db_name: str, engine: str, lite_root: Path):
+    def __init__(self, db_name: str, engine: str, lite_root: Path,
+                 stats_dir: Path | None = None):
         self.db_name = db_name
         self.engine = engine
         self.root = Path(lite_root) / "resource/databases" / ENGINE_DIRS.get(
@@ -54,6 +55,28 @@ class LiteCatalog:
         self._paths: dict[str, Path] = {}
         if self.db_dir is not None:
             self._load()
+        # optional one-time-enriched stats (row counts, approx distinct/null
+        # counts per column), written by scripts/enrich_bq_stats.py. Absent
+        # before that script has run for this database -- describe() just
+        # omits the stats it would have added.
+        self._stats: dict = {}
+        if stats_dir is not None:
+            self._load_stats(Path(stats_dir))
+
+    def _load_stats(self, stats_dir: Path) -> None:
+        if not stats_dir.is_dir():
+            return
+        exact = stats_dir / f"{self.db_name}.stats.json"
+        lowered = self.db_name.lower()
+        cand = exact if exact.exists() else next(
+            (p for p in stats_dir.glob("*.stats.json")
+             if p.name[:-len(".stats.json")].lower() == lowered), None)
+        if cand is None:
+            return
+        try:
+            self._stats = json.loads(cand.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._stats = {}
 
     # ── locating the database directory ──────────────────────────────────
     def _find_db_dir(self, db_name: str) -> Path | None:
@@ -183,14 +206,28 @@ class LiteCatalog:
         # carries no nullability, and saying "UNKNOWN" beats inventing "YES"
         return [(c, ty, "UNKNOWN") for c, ty in t.columns]
 
+    @property
+    def has_stats(self) -> bool:
+        return bool(self._stats)
+
     def describe(self, name: str, sample_rows: int = 5,
-                 max_nested: int = 60) -> str:
+                 max_nested: int = 60, stats: bool = True) -> str:
         t = self._detail(self.resolve(name))
-        lines = [f"table: {t.fullname}", "columns:"]
+        tstats = (self._stats.get(t.fullname) or {}) if stats else {}
+        header = f"table: {t.fullname}"
+        if "row_count" in tstats:
+            header += f"  ({tstats['row_count']} rows)"
+        lines = [header, "columns:"]
         descs = t.descriptions or []
+        col_stats = tstats.get("columns") or {}
         for i, (c, ty) in enumerate(t.columns):
             d = descs[i] if i < len(descs) else None
-            lines.append(f"  {c}  {ty}" + (f"  -- {d}" if d else ""))
+            extra = ""
+            cs = col_stats.get(c)
+            if cs:
+                extra = (f"  approx_distinct={cs.get('approx_distinct', '?')} "
+                        f"nulls={cs.get('nulls', '?')}")
+            lines.append(f"  {c}  {ty}{extra}" + (f"  -- {d}" if d else ""))
 
         # BigQuery STRUCT/ARRAY paths: without these the agent cannot address
         # nested fields, which is most of what the GA-style datasets contain
@@ -209,7 +246,13 @@ class LiteCatalog:
             lines.append(f"sample rows:\n{df.to_csv(index=False)}")
         else:
             lines.append("sample rows: none shipped for this table")
-        lines.append("[schema from the Spider2 catalog -- no warehouse query was run]")
+        if tstats:
+            lines.append("[schema from the Spider2 catalog; row/distinct/null "
+                         "counts from a one-time enrichment pass, both free to "
+                         "read now -- this call ran no warehouse query]")
+        else:
+            lines.append("[schema from the Spider2 catalog -- no warehouse query "
+                         "was run]")
         return "\n".join(lines)
 
     def column_values_hint(self, table: str, column: str, limit: int = 20) -> str:
@@ -239,8 +282,12 @@ class LiteCatalog:
             return (f"no sample values shipped for {t.fullname}.{column}; "
                     f"run a SELECT DISTINCT if you need real values")
         body = "\n".join(str(v) for v in out)
-        return (f"values seen in the catalog's {len(t.sample_rows)} sample rows "
-                f"(not the full distribution):\n{body}")
+        return (f"WARNING: these are NOT the real distinct values, just what "
+                f"happened to appear in {len(t.sample_rows)} catalog sample rows. "
+                f"Values that exist in the table but did not land in that tiny "
+                f"sample are silently missing here -- do not treat this list as "
+                f"exhaustive or as a reliable guide to spelling/casing beyond what "
+                f"it shows:\n{body}")
 
 
 def load_catalog(db_name: str, engine: str, lite_root: Path) -> LiteCatalog | None:

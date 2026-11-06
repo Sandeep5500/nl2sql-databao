@@ -119,8 +119,16 @@ def _compact_memory(messages: list[dict], cfg: AgentConfig, client, llm: LLMConf
 
 def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                 cfg: AgentConfig, critic_cfg: CriticConfig | None = None,
-                extra_context: str = "") -> EpisodeResult:
+                extra_context: str = "",
+                expected_rows: int | None = None) -> EpisodeResult:
+    """expected_rows: a high-confidence row count from the output-shape rubric. When
+    given, the first submission whose row count differs is bounced ONCE with both
+    numbers; the model either re-runs or resubmits the same query_id to keep it. The
+    submission is never rewritten (cd1d20f: silent rewriting broke real top-N
+    answers). None -- the default, and every lane without --rubric-row-check --
+    leaves the loop exactly as it was."""
     t0 = time.time()
+    row_check_done = False
     client = OpenAI(base_url=llm.base_url, api_key=llm.api_key, timeout=llm.timeout)
     critic_client = None
     if critic_cfg and critic_cfg.enabled:
@@ -270,6 +278,25 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                                             f"first and use its query_id."})
                 continue
             sql, df = sub
+            qid = str(args.get("query_id", ""))
+            if (expected_rows is not None and not row_check_done
+                    and df is not None and len(df) != expected_rows):
+                # In bq_v3/v3r/full_C, 14-19 wrong answers per run had a correct
+                # high-confidence count in the prompt and still submitted an
+                # exploratory LIMIT-10 result; the prompt hint alone did not act.
+                row_check_done = True
+                result.trace.append({"step": step, "row_check": {
+                    "query_id": qid, "rows": len(df), "expected": expected_rows}})
+                messages.append({
+                    "role": "tool", "tool_call_id": submit_call.id,
+                    "content": (
+                        f"Row-count check: {qid} returned {len(df)} row(s), but the "
+                        f"expected output shape (confidence: high) is exactly "
+                        f"{expected_rows} row(s). Re-read the question. If it asks for "
+                        f"exactly {expected_rows}, run a query that returns exactly "
+                        f"that and submit its query_id. If you are confident the "
+                        f"count should be {len(df)}, submit {qid} again.")})
+                continue
             if critic_client and result.critic_rounds < critic_cfg.max_rounds:
                 verdict = critic_mod.review(
                     critic_client, critic_cfg, question, sql,

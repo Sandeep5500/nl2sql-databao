@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nl2sql.bigquery_db import BigQueryConfig, human_bytes
+from nl2sql.bigquery_db import BigQueryConfig, build_credentials, human_bytes
 
 FREE_TIER_BYTES = 1024 ** 4          # 1 TiB of query processing per month
 # on-demand pricing after the free tier, US multi-region
@@ -37,12 +37,7 @@ def main():
 
     cfg = BigQueryConfig.load()
     from google.cloud import bigquery
-    from google.oauth2 import service_account
-    creds = (service_account.Credentials.from_service_account_info(cfg.credentials_info)
-             if cfg.credentials_info
-             else service_account.Credentials.from_service_account_file(
-                 cfg.credentials_path))
-    client = bigquery.Client(project=cfg.project, credentials=creds)
+    client = bigquery.Client(project=cfg.project, credentials=build_credentials(cfg))
 
     group = ("(SELECT value FROM UNNEST(labels) WHERE key = 'instance')"
              if args.by_instance else

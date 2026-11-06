@@ -347,6 +347,20 @@ def full_schema_dump(db, char_cap: int = 58_000) -> str:
         return kept
 
     full = fit(blocks, budget)
+    if len(full) < len(tables) and getattr(db, "has_stats", False):
+        # Stats rank below descriptions and sample rows: if the stats are what
+        # pushes the full blocks over budget, drop them from the dump (describe_table
+        # still returns them) rather than fall back to bare column names.
+        def no_stats(t, b):
+            if t in families:
+                return b
+            try:
+                return db.describe_table(t, stats=False)
+            except Exception:
+                return b
+        plain = {t: no_stats(t, b) for t, b in blocks.items()}
+        if len(fit(plain, budget)) == len(tables):
+            blocks, full = plain, list(tables)
     if len(full) == len(tables):
         body = "\n\n".join(blocks[t] for t in tables)
         note = ""
@@ -397,6 +411,11 @@ def main():
     ap.add_argument("--max-bytes-per-episode", type=float, default=0,
                     help="BigQuery: GiB one question may scan in total "
                          "(default 200)")
+    ap.add_argument("--bq-stats", metavar="DIR",
+                    help="BigQuery: fold the one-time row/distinct/null stats from "
+                         "scripts/enrich_bq_stats.py (DIR/<db>.stats.json) into "
+                         "describe_table. Off by default so a control lane never "
+                         "picks them up by accident")
     ap.add_argument("--describe-cache", metavar="DIR",
                     help="cache describe_table output per table (the Snowflake "
                          "databases are static, so this is a once-ever cost; "
@@ -440,11 +459,30 @@ def main():
     ap.add_argument("--rubric-confident-only", action="store_true",
                     help="use a question's rubric only when it states an exact row "
                          "count with high confidence; otherwise add nothing")
+    ap.add_argument("--rubric-row-check", action="store_true",
+                    help="with --rubric-dir: when the rubric states an exact row count "
+                         "with high confidence, bounce the first submission whose row "
+                         "count differs once (never rewritten; resubmitting the same "
+                         "query_id keeps it)")
     ap.add_argument("--source", default="spider2",
                     help="comma-separated source(s) to load questions from: "
                          f"{', '.join(sorted(DATA_SOURCES))}, or 'all' (every "
                          "local-SQLite source; snow/dbt must be named explicitly)")
     args = ap.parse_args()
+
+    if args.rubric_dir:
+        # load_rubric returns None for a missing file, so a rubric dir this process
+        # cannot see turns the lane into a silent no-rubric run. That is what bq_v3r
+        # was: all 200 prompts byte-identical to bq_v3's, while its write-up credited
+        # the rubric with +8.1 points. Refuse to start instead.
+        rd = Path(args.rubric_dir)
+        n_rub = len(list(rd.glob("*.json"))) if rd.is_dir() else 0
+        if not n_rub:
+            raise SystemExit(f"--rubric-dir {rd.resolve()} has no rubric files "
+                             f"(cwd {Path.cwd()}); refusing to run a silent no-rubric lane")
+        print(f"rubrics: {n_rub} files in {rd.resolve()}", flush=True)
+    if args.rubric_row_check and not (args.rubric_dir and args.rubric_confident_only):
+        raise SystemExit("--rubric-row-check needs --rubric-dir and --rubric-confident-only")
 
     if args.source == "all":
         # 'all' keeps its original meaning -- the local-SQLite sources. The snow
@@ -603,7 +641,9 @@ def main():
                     else:
                         from nl2sql.bigquery_db import BigQueryDatabase
                         db = BigQueryDatabase(db_name, bq_cfg, SPIDER2_LITE,
-                                              instance_id=iid, run_tag=run_tag)
+                                              instance_id=iid, run_tag=run_tag,
+                                              stats_dir=(Path(args.bq_stats)
+                                                         if args.bq_stats else None))
                 except Exception as e:
                     # a missing database grant would otherwise score as a wrong
                     # answer for every instance using it
@@ -663,6 +703,7 @@ def main():
                     db, datasource=resolve_datasource(db_name),
                     report_truncation=bool(snow_cfg or bq_cfg))
 
+            expected_rows = None
             if args.rubric_dir:
                 rubric = load_rubric(args.rubric_dir, iid)
                 if rubric and args.rubric_confident_only and not (
@@ -671,6 +712,10 @@ def main():
                     rubric = None
                 if rubric:
                     extra += "\n" + render_rubric(rubric)
+                    if (args.rubric_row_check
+                            and rubric.get("rows_confidence") == "high"
+                            and rubric.get("exact_rows") is not None):
+                        expected_rows = int(rubric["exact_rows"])
 
             draft = None
             if args.draft_endpoint and args.draft_model:
@@ -690,7 +735,8 @@ def main():
                     session = ToolSession(db=db, cfg=cfg, search=search,
                                           doc_text=doc, draft=draft)
                     result = run_episode(q["question"], session, llm, cfg, critic,
-                                         extra_context=extra)
+                                         extra_context=extra,
+                                         expected_rows=expected_rows)
                     if not is_infra_error(result.error):
                         break
                     print("[infra error, retrying question] ", end="", flush=True)
