@@ -58,7 +58,9 @@ All numbers are measured unless marked *(estimate)*. Short version:
 - **What is excluded:**
   - databases that copy Spider2's (BIRD movie_3, works_cycles, soccer_2016, sales, …);
   - Spider2-derived sets (deny-list in `judge_data_deny.json`, check `check_db_overlap.py`).
-- **Held out:** 15 of 63 databases at first, 25 from v2 on (`holdout.json`), plus the val split.
+- **Held out:** the 15 val-split databases throughout. From v2a on, also 10 of the 48 training
+  databases (`holdout.json`, seed 0): 25 of 63 in all.
+- **Exact losses, data rows, settings and commands:** [judge_training_methods.md](judge_training_methods.md).
 
 | source | how it was made | size | yield and label quality |
 |---|---|---|---|
