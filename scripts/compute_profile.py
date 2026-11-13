@@ -124,7 +124,10 @@ def main():
     want = set(args.datasources.split(",")) if args.datasources else None
     by_norm = {re.sub(r"[^a-z0-9]", "_", p.stem.lower()): p
                for p in SQLITE_DIR.glob("*.sqlite") if p.stat().st_size}
-    for src in sorted((DCE_PROJECT_DIR / "output" / "databases").glob("*.yaml")):
+    # every datasource, enriched or not yet (a new question set's databases)
+    stems = sorted({p.stem for d in ("output", "src")
+                    for p in (DCE_PROJECT_DIR / d / "databases").glob("*.yaml")})
+    for src in (DCE_PROJECT_DIR / "output" / "databases" / f"{s}.yaml" for s in stems):
         if (want and src.stem not in want) or src.stem not in by_norm:
             continue
         sqlite_path = by_norm[src.stem]

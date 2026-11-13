@@ -21,8 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from openai import OpenAI
 
 from nl2sql.agent import run_episode
-from nl2sql.config import (AgentConfig, CriticConfig, DCE_PROJECT_DIR, DOCS_DIR,
-                           LLMConfig, QUESTIONS_FILE, SQLITE_DIR,
+from nl2sql.config import (AgentConfig, CriticConfig, DATASET_DIR, DCE_PROJECT_DIR,
+                           DOCS_DIR, LLMConfig, QUESTIONS_FILE, SQLITE_DIR,
                            VLLM_ENDPOINT_FILE)
 from nl2sql.context import SearchContext, TableContext
 from nl2sql.db import Database
@@ -37,8 +37,8 @@ def load_questions(instances=None, skip=None, limit=None):
         for line in f:
             q = json.loads(line)
             iid = q["instance_id"]
-            if not iid.startswith("local"):
-                continue
+            if not DATASET_DIR and not iid.startswith("local"):
+                continue  # Spider2: the SQLite (local) split only
             if instances and iid not in instances:
                 continue
             if skip and iid in skip:

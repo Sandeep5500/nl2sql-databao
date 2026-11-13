@@ -19,6 +19,20 @@ EVAL_JSONL = SPIDER2_LITE / "evaluation_suite/gold/spider2lite_eval.jsonl"
 DCE_PROJECT_DIR = REPO_ROOT / "spider2-dce"
 VLLM_ENDPOINT_FILE = REPO_ROOT / "logs/vllm_endpoint.txt"
 
+# Another question set in the same layout (judge training data from
+# scripts/build_bird_dataset.py) replaces all of the Spider2 paths above:
+#   export NL2SQL_DATASET_DIR=/data/user_data/$USER/judge-data/bird_plat
+# questions.jsonl, databases/<db>.sqlite, documents/, gold/exec_result/,
+# gold/sql/, gold/eval.jsonl, and its own DCE project in dce/.
+DATASET_DIR = os.environ.get("NL2SQL_DATASET_DIR")
+if DATASET_DIR:
+    _ds = Path(DATASET_DIR)
+    SQLITE_DIR, DOCS_DIR = _ds / "databases", _ds / "documents"
+    QUESTIONS_FILE = _ds / "questions.jsonl"
+    GOLD_EXEC_DIR, GOLD_SQL_DIR = _ds / "gold/exec_result", _ds / "gold/sql"
+    EVAL_JSONL = _ds / "gold/eval.jsonl"
+    DCE_PROJECT_DIR = _ds / "dce"
+
 
 @dataclass
 class LLMConfig:

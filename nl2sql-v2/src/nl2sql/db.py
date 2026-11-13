@@ -40,10 +40,15 @@ def _configure(con) -> None:
     - cte_inlining off: with it on, DuckDB's sqlite scanner fails valid queries
       that join over CTEs and end in LIMIT ("INTERNAL Error: Attempted to access
       index 0 within vector of size 0").
+    - common_subplan off: on 1.5.5 it silently returns wrong results. It merges
+      scans of two same-shaped SQLite tables under one filter (duckdb#24781) and
+      UNION ALL arms that share a join (#25819); #26427 is still open on 1.5.6.
+      Measured over the stored agent traces: 3 wrong exploration results
+      (EU_soccer home/away league tables), no score changed, no time cost.
     - memory_limit: a runaway query returns an error to the agent instead of
       getting the whole benchmark process killed by the job's memory cgroup.
     """
-    con.execute("SET disabled_optimizers='cte_inlining'")
+    con.execute("SET disabled_optimizers='cte_inlining,common_subplan'")
     con.execute(f"SET memory_limit='{MEMORY_LIMIT}'")
 
 
@@ -101,18 +106,28 @@ class Database:
             df = _decode_bytes(_run(self.con, sql))
         except Exception as e:
             timer.cancel()
-            if "Mismatch Type Error" not in str(e):
+            mistyped = "Mismatch Type Error" in str(e)
+            # a stored value the declared type cannot hold ('1960-0-0' in a DATE
+            # column) fails the scan as a Conversion Error; one raised by the
+            # query's own text carries a "LINE n:" position and is the query's fault
+            unreadable = "Conversion Error" in str(e) and "\nLINE " not in str(e)
+            if not (mistyped or unreadable):
                 raise
-            # mistyped column (INTEGER-declared storing text): retry with all
-            # columns as text; numeric ops need TRY_CAST, which the hint says.
+            # retry with all columns as text; numeric and date ops then need
+            # TRY_CAST, which the note says.
             av = self._all_varchar_con()
             timer = threading.Timer(timeout_s, av.interrupt)
             timer.start()
             try:
                 df = _decode_bytes(_run(av, sql))
                 av_note = ("\n[note: this table has mixed-typed columns; all values "
-                           "were read as TEXT — use TRY_CAST(col AS DOUBLE) for math]")
+                           "were read as TEXT — use TRY_CAST(col AS DOUBLE) for math]"
+                           if mistyped else
+                           "\n[note: this table holds values its declared types cannot read; "
+                           "all values were read as TEXT — use TRY_CAST for math and dates]")
             except Exception as e2:
+                if not mistyped:
+                    raise e from None  # not a stored-value problem after all
                 raise RuntimeError(
                     f"{e2} [hint: this table has mixed-typed columns readable only "
                     f"as TEXT — wrap numeric columns in TRY_CAST(col AS DOUBLE)]") from e2

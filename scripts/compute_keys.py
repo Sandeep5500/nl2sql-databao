@@ -192,7 +192,11 @@ def main():
     from nl2sql.config import SQLITE_DIR
     by_norm = {re.sub(r"[^a-z0-9]", "_", p.stem.lower()): p
                for p in SQLITE_DIR.glob("*.sqlite") if p.stat().st_size}
-    for src in sorted((DCE_PROJECT_DIR / "output" / "databases").glob("*.yaml")):
+    # every datasource: enriched records where they exist, else the bare config
+    # (a new question set's databases before their DCE build)
+    stems = sorted({p.stem for d in ("output", "src")
+                    for p in (DCE_PROJECT_DIR / d / "databases").glob("*.yaml")})
+    for src in (DCE_PROJECT_DIR / "output" / "databases" / f"{s}.yaml" for s in stems):
         if want and src.stem not in want:
             continue
         # enriched yaml names are the sqlite names lowercased, non-alnum -> "_"

@@ -30,6 +30,9 @@ def main():
     ap.add_argument("--embed-host", default="127.0.0.1")
     ap.add_argument("--embed-port", type=int, default=11434)
     ap.add_argument("--dce-dir", type=Path, default=Path("."))
+    ap.add_argument("--no-index", action="store_true",
+                    help="write the enriched YAML only (parallel workers, each in its own --dce-dir, "
+                         "then one indexing pass into the main project)")
     args = ap.parse_args()
 
     from databao_context_engine.build_sources.build_runner import build
@@ -72,7 +75,7 @@ def main():
             description_provider=desc_provider)
         t0 = time.monotonic()
         results = build(project_layout=project_layout, build_service=build_service,
-                        datasource_ids=[ds_id], should_index=True,
+                        datasource_ids=[ds_id], should_index=not args.no_index,
                         should_enrich_context=True)
         logger.info("done in %.1f min: %s",
                      (time.monotonic() - t0) / 60,
