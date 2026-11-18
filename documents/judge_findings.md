@@ -3,7 +3,7 @@
 How the deployed judge works and why: [judge.md](judge.md). Details and numbers:
 [judge_results.md](judge_results.md). Spider2 scores are correct picks out of 540
 (135 questions × 4 saved run sets). BigQuery scores are out of 105 (the questions greedy got wrong),
-except in points 12–14 (all 204 questions).
+except in points 12–15 (all 204 questions).
 
 1. **The judge is close to its ceiling with the inputs it sees.**
    - The untrained thinking judge scores 296 / 540 and 26 / 105, against 261 for majority vote.
@@ -187,4 +187,21 @@ except in points 12–14 (all 204 questions).
     - Two runs of the same prompt differ by 1.6 on these 65 pools, so gaps of 1–2 are not resolved by 4
       samples.
     - Both BigQuery sets are now used, so a further prompt change has no clean BigQuery test. The 27B
-      with a larger token budget is the main lever left; it needs a decision.
+      with a larger token budget was the main lever left (tested the same afternoon, point 15).
+
+15. **A second round of BigQuery prompts, and more room for the 27B, did not help either (Nov 18).**
+    Gates fixed before any call; tested on the 68 mixed pools whose questions were not read.
+    - Three 35B prompts that change how it works through a pair: a specification written from the
+      question first, the results shown before the SQL, the doc and schema uncut. Against one run of
+      the deployed prompt: +1.5, +0.9 and +1.7, short of the +2.0 the plan asked for. Against two runs
+      pooled on both sets: +0.6, −0.1 and +0.7.
+    - The deployed prompt, run again on the earlier set, scores +1.6 [+0.3, +3.2] over its first run on
+      the same 25 pools. Twice now an unchanged prompt has had an interval that leaves out zero, so a
+      pass bar needs a margin and a baseline of more than one run.
+    - The 27B asked for short reasoning still runs out of tokens on 22% of calls and picks no better.
+      Given 16,384 tokens it runs out on 8% instead of 32%, and 72% of its answers on the comparisons it
+      used to cut off are right, yet it picks 114.0 of 204 against 115.5. A missing verdict counts half
+      for each side, which leaves the result more lanes gave ahead; once the 27B finishes, its errors
+      on the hard questions show (bq389, bq424).
+    - On BigQuery, neither prompt changes nor more reasoning tokens improve selection measurably. What is
+      left is mostly label problems and misreads of hard questions.

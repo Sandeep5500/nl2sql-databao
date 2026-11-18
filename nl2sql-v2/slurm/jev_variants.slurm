@@ -48,6 +48,7 @@ PORT=${PORT:-8796}
 STAGES=(${STAGES:-1 2})
 S2_VARIANTS=${S2_VARIANTS:-base,diff_cmp}
 S2_SAMPLES=${S2_SAMPLES:-4}
+S2_MAX_TOKENS=${S2_MAX_TOKENS:-8192}  # System 2 reply budget (16384: the 27B with room to finish, Nov 18)
 LOG=${LOG:-$HOME/joblogs/jev_var}      # readable from the login node, so progress can be watched there
 VPY=$U/.vllm031-venv/bin/python         # JEV's qwen3_5_text config needs vLLM 0.31 (see run_jev.slurm)
 PY=$M/nl2sql-v2/.venv/bin/python
@@ -132,7 +133,7 @@ for st in "${STAGES[@]}"; do
     case $st in
         1) run system1 --variants jev,jev_cmp --jev-dir "$JD" --judge-model jev-decision ;;
         2) run "system2_${S2_VARIANTS//,/_}" --variants "$S2_VARIANTS" --samples "$S2_SAMPLES" \
-               --judge-model "$REPO" --workers 128 ;;
+               --judge-model "$REPO" --max-tokens "$S2_MAX_TOKENS" --workers 128 ;;
     esac
 done
 echo "exit 0 end=$(date -Is)"

@@ -84,7 +84,7 @@ Both run with thinking, temperature 0.6, 8,192 tokens and the `diff_cmp` prompt.
 |---|---|---|
 | model | mixture of experts, about 3B parameters active per token; AWQ 4-bit | dense 27B, bf16; about 9× the compute per token |
 | reasoning per BigQuery call (median) | 3,053 tokens | 5,146 tokens |
-| calls that reach 8,192 tokens without a verdict | 1% | 16–25% SQLite, 31–32% BigQuery |
+| calls that reach 8,192 tokens without a verdict | 1% | 16–25% SQLite, 31–32% BigQuery (8% with a 16,384 budget) |
 | first-shown answer wins both orders (right-vs-wrong pairs) | 7–12% | 0–1% |
 | SQLite, 540 pools (expected correct) | 305.6 | **317.4** (+11.8 [+1.7, +22.0] on the 217 pools where lanes disagree) |
 | BigQuery, earlier set (105 pools, greedy failures only) | 27.7 | **33.3** (+5.6 [+2.1, +9.5]) |
@@ -92,10 +92,12 @@ Both run with thinking, temperature 0.6, 8,192 tokens and the `diff_cmp` prompt.
 
 - The 27B is the better judge on SQLite and ahead on both BigQuery sets, but on the full BigQuery set
   its lead is not resolved.
-- A missing verdict counts as a coin flip, so its truncated calls cost it: if every truncated call had
-  been right, it would score 119.9 of 204 on BigQuery; if every one had been wrong, 99.5. Given more room
-  to finish it stays ahead of the 35B if it gets more than about 53% of those calls right
-  *(simulation)*; the 35B gets 66% of the same comparisons right.
+- Room to finish does not help it pick. With 16,384 tokens instead of 8,192 (BigQuery, Nov 18) the 27B
+  leaves 8% of its calls without a verdict instead of 32%, and 72% of its answers on the comparisons it
+  used to cut off are right, yet it scores 114.0 of 204 against 115.5 (−1.6 [−4.2, +0.7], 3 samples).
+  A missing verdict counts half for each side, which leaves the result more lanes gave ahead; where that
+  result is right and the 27B, once it finishes, decides wrong (bq389, bq424), the pick is lost. Its
+  errors cluster in the hard questions, so finishing exposes them rather than spreading them thin.
 - Qwen3.8 has no smaller model than the 27B. Whether a dense 27B fits the project's small-model goal is
   an open decision; production stays on the 35B until it is made.
 - Other models of the same sizes did worse than the 35B: GLM-4.7-Flash (296.9 of 540) and
@@ -116,9 +118,20 @@ judge call; see below).
 | 27B judge, `diff_cmp` | 86.6 | 64.1% |
 | any lane right (pass@4) | 94 | 69.6% |
 
-On this run set alone the 27B's lead is +1.0 [−2.5, +4.6]. The newer run sets q36e and q36x (Oct 7–8,
-explored enrichment) are being judged now: pass@1 53.7% and 50.0%, pass@4 92 and 91 of 135 (q36x's
-own log says 50.2% and 92; one lane's SQL gives another result when re-run).
+On this run set alone the 27B's lead is +1.0 [−2.5, +4.6].
+
+**SQLite, newer run sets q36e and q36x** (Oct 7–8, explored enrichment; 35B judge only, the 27B was
+not run on them):
+
+| correct of 135 | q36e | q36x |
+|---|---|---|
+| one lane (pass@1, average) | 72.5 (53.7%) | 67.5 (50.0%) |
+| majority vote (ties at random) | 78.5 (58.1%) | 75.2 (55.7%) |
+| 35B judge, `diff_cmp` | 82.8 (61.3%) | 82.8 (61.3%) |
+| any lane right (pass@4) | 92 (68.1%) | 91 (67.4%) |
+
+The judge beats majority vote by +4.3 [−0.9, +9.8] and +7.5 [+1.3, +13.8] picks. q36x's own log says
+50.2% and 92; one lane's SQL gives another result when re-run.
 
 **BigQuery, 204 questions, Nov 17 run** (same agent model, bf16, 4 lanes, temperature 0.7):
 
@@ -130,8 +143,8 @@ own log says 50.2% and 92; one lane's SQL gives another result when re-run).
 | 27B judge, `diff_cmp` | 115.5 | 56.6% |
 | any lane right (pass@4) | 129 | 63.2% |
 
-The judge keeps about two thirds of the pass@1 to pass@4 gap on SQLite (16.6 of 25 picks for the 35B)
-and about half on BigQuery (15.2 of 31).
+The 35B judge keeps half to two thirds of the pass@1 to pass@4 gap on SQLite (q36rg 16.6 of 25 picks,
+q36e 10.3 of 19.5, q36x 15.3 of 23.5) and about half on BigQuery (15.2 of 31).
 
 ## Where the judge still loses
 
@@ -158,6 +171,12 @@ and about half on BigQuery (15.2 of 31).
   drops objections to how a query is written. The first fixes the filters it names and rejects
   exclusions the question implies; the second changes nothing. A clearer comparison tool and re-asking
   pairs whose two orders disagree gave +0.1 each.
+- BigQuery prompt changes to how the judge works (Nov 18, second round, 68 unread questions): writing a
+  specification from the question before reading the candidates, showing the results before the SQL,
+  and the doc and schema uncut. Against one run of the deployed prompt +1.5, +0.9 and +1.7, short of
+  the +2.0 the plan asked for; against two runs pooled +0.6, −0.1 and +0.7. For the 27B: asking for
+  short reasoning (fewer missing verdicts, 32% → 22%, but no better picks) and a 16,384-token budget
+  (above).
 - The agent's output-shape rubric as extra information (checked offline, Nov 18): on the BigQuery
   comparisons the judges miss, both answers almost always have the shape the rubric asks for.
 
@@ -165,7 +184,9 @@ and about half on BigQuery (15.2 of 31).
 
 Score changes with exp1, not with single runs: two single runs of the same judge pick differently on
 about 23 of 540 SQLite questions, and even two 4-sample runs differed by 1.6 picks on BigQuery's 65
-mixed pools.
+mixed pools. On 43 of those pools the same two runs differ by −1.3 [−2.9, −0.1]: the question bootstrap
+can leave out zero for a prompt that did not change, so a pass bar needs a margin above it (round 2
+asked for +2.0).
 
 1. Build the candidate pools: `judge_pools.py --no-judge` (SQLite: re-runs each lane's SQL, groups equal
    results, labels groups with the scorer) or `bq_judge_pools.py --no-judge` (BigQuery: reads results
@@ -185,15 +206,19 @@ and every combination of one verdict per pair is weighed. A missing verdict coun
 evaluation counts each lane in the round-robin, which differs from production's win count by under 1
 pick per stratum. Before testing a change, fix the measure and the pass bar in writing, keep part of
 the data unread, and compare against a fresh run of the baseline: comparisons picked out by the
-baseline's own samples drift back toward the average on any rerun.
+baseline's own samples drift back toward the average on any rerun. On preemptible GPUs, calls in flight
+when a job is stopped are drawn again, and those are mostly the long ones; `rejudge_pools.py` logs every
+request in `calls_<variant>.starts.jsonl`, so redrawn calls can be counted, and a sample that ran without
+a preemption is the clean one.
 
 ## Open items (Nov 18)
 
-- Running: the 35B and the 27B on the newer SQLite run sets q36e and q36x.
-- Running: a second round of BigQuery prompt tests, written before any call
-  ([bq_judge_improvement_plan.md](bq_judge_improvement_plan.md), round 2). It tests a specification
-  written before judging (`dc_spec`), results shown before the SQL (`dc_rf`), the doc and schema uncut
-  (`dc_full`; the 8,000- and 40,000-character cuts hide field definitions on GA360 and the end of wide
-  tables), and shorter reasoning for the 27B (`dc_brief`).
-- Needs a decision: the 27B with a larger token budget, starting with its 641 truncated calls on
-  BigQuery.
+- Needs a decision: whether the dense 27B fits the project's small-model goal. It is ahead on SQLite
+  (+11.8 over 540 pools, +1.0 on q36rg) and not resolved on BigQuery, and a larger token budget does not
+  change that.
+- Not run: the 27B on q36e and q36x (stopped to free GPUs for BigQuery).
+- Not read: the 27B's misses in the BigQuery questions nobody has read (2.9 picks over 43 pools).
+- Both BigQuery sets have been used for development, so a further BigQuery change needs a new test set,
+  e.g. a fresh agent run on the 204 questions.
+- About half of the BigQuery loss is label problems (gold files that contradict their SQL in 4 questions,
+  a tolerance tripped by 1.6 parts per million); these limit any judge and could be reported upstream.

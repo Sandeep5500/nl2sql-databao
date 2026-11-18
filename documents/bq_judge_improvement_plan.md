@@ -182,3 +182,47 @@ BigQuery. Round 1 added rules or a final check. Round 2 changes how the judge wo
 
 **Cost.** 35B: 3 variants × 4 samples × (506 + 280) = 9,432 calls in two sessions (bq17 6,072, earlier
 set 3,360), about 4 h. 27B pilot: 506 calls. All on preempt, next to the judging of q36e/q36x.
+
+**Amendment (Nov 18, 11:55; before any round-2 call).** The user asked to move the free GPUs from the 27B on
+SQLite to BigQuery: the 27B's q36e/q36x jobs were cancelled (the 35B's run continues).
+- The bq17 35B arm stays in one session (it had started before it could be split).
+- `dc_brief`'s samples 1–3 run next to the pilot (sample 0). They are used only if the pilot passes its bar.
+- Added: **the 27B with a 16,384-token reply budget** (`diff_cmp`, otherwise as the Nov 17 run), 4 samples on
+  bq17 (2,024 calls; the server's 49,152-token context holds the longest prompt plus 16,384). Reported on
+  bq17 mixed (65) and unread (43) against the 27B at 8,192 tokens and the 35B pooled, with its share of
+  calls without a verdict and its right-vs-wrong accuracy on answered calls. It measures how far the 27B
+  gets when it can finish (the §10 simulation put break-even with the 35B at about 53% of its truncated
+  calls right). It changes no production setting by itself.
+
+**Amendment 2 (Nov 18, 16:20; after the 35B variants were scored, before the two runs below were).**
+- No round-2 35B variant passes the gate (results below), so no Spider2 run follows.
+- Added: **the deployed `diff_cmp` judged again on the earlier set** (4 samples, 1,120 calls, the same
+  comparisons and settings as the morning session). On the earlier set every variant of both rounds
+  gains (+1.4 to +2.7 on its 25 unread pools) while on bq17 the round-2 variants lose (−1.5 to −0.7 on
+  43), and on those 43 pools two runs of `diff_cmp` already differ by −1.3 [−2.9, −0.1]. Reported: the
+  rerun minus the morning session on the 25 unread and all 37 mixed pools, and every variant against
+  both sessions pooled (8 samples per ordered pair). It changes no decision.
+- The 27B's 16,384-token jobs were preempted and requeued (samples 1–3: 5, 2 and 1 times). Calls in
+  flight at a preemption are drawn again, and the calls in flight are mostly the long ones, so the
+  redraws favour replies that finish with a verdict. Sample 0 ran without a preemption. Reported:
+  sample 0 alone as the clean estimate, then all four samples with the number of calls drawn again
+  (from the start logs, which cover every restart after the first).
+
+## Round 2 results (Nov 18, evening)
+
+Details: [judge_results.md](judge_results.md) §13; running log `results/bq17/improve/RESULTS.md`.
+
+- **35B variants: none passes the gate.** TEST (68), against the baselines fixed in the plan (98.3%):
+  `dc_spec` +1.5 [−1.5, +4.7], `dc_rf` +0.9 [−3.1, +4.9], `dc_full` +1.7 [−1.2, +5.3]; READ (34) +0.9,
+  +0.5, +0.4. All three lose on bq17's 43 (−1.1, −1.5, −0.7) and gain on the earlier set's 25 (+2.6,
+  +2.4, +2.4). No Spider2 run; production stays on `diff_cmp`.
+- **Same-prompt rerun on the earlier set (amendment 2):** +1.6 [+0.3, +3.2] over the morning session on
+  the 25 unread pools; the morning baseline was a low draw. With both runs pooled on each set, TEST is
+  +0.6 [−2.2, +3.2], −0.1 [−4.0, +3.6] and +0.7 [−1.7, +3.5].
+- **27B `dc_brief`: fails its bar** (no verdict 21.9% against a bar of 21.7%; 80.8% right on answered
+  right-vs-wrong calls); exploratory, 2 samples: −0.7 [−2.8, +1.0] on bq17's mixed pools.
+- **27B with 16,384 tokens** (samples 0, 2, 3; sample 1 cancelled after 5 preemptions): no verdict 31.7%
+  → 7.8%, answered right-vs-wrong 82.7% → 80.2%, all 204 114.0 against 115.5 (−1.6 [−4.2, +0.7] on the
+  mixed 65); sample 0 alone, which ran without a preemption, 116.0 (+0.5 [−3.7, +4.4]).
+- **Reading.** Neither prompt changes nor a larger budget improves the judge on BigQuery measurably. Both
+  BigQuery sets are now used for development.

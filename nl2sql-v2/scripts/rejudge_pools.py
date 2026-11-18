@@ -14,8 +14,11 @@ variant with the same number of samples.
 
 Output: <out-dir>/calls_<variant>.jsonl, one JSON line per call (resumable): key, first, second,
 sample, variant, verdict, p_first, reason, reasoning, completion_tokens, truncated, error, retry,
-timeouts, loose_json. A reply without a valid verdict (no JSON, truncated reasoning, bad request) is final and
-counts as a missing verdict, as in the reference runs; only server failures (retry=true) are made again.
+timeouts, loose_json. calls_<variant>.starts.jsonl gets a line when each request is sent (with the Slurm
+job and restart count): a call that starts twice was lost in flight and drawn again, and lost calls are
+the long ones more often, so their redraws can be checked apart (Nov 18, preempt sessions). A reply
+without a valid verdict (no JSON, truncated reasoning, bad request) is final and counts as a missing
+verdict, as in the reference runs; only server failures (retry=true) are made again.
 JSON that does not parse but names the winner plainly is read from its last "winner" field and marked
 loose_json (GLM-4.7-Flash can leave the reason unquoted; the Qwen arms had 0-3 such replies in 6984).
 A slow request is not given up (--timeout, 4 h): its retry would be a fresh draw, so giving up on slow
@@ -281,6 +284,11 @@ def main():
         rec = {"key": k, "first": a, "second": b, "sample": s, "variant": v, "verdict": None, "p_first": None,
                "reason": "", "reasoning": "", "completion_tokens": None, "truncated": False, "error": "",
                "retry": False, "timeouts": 0}
+        with lock:  # a call with two starts was lost in flight (preemption, restart) and drawn again
+            starts[v].write(json.dumps({"key": k, "first": a, "second": b, "sample": s, "t": round(time.time()),
+                                        "job": os.environ.get("SLURM_JOB_ID", ""),
+                                        "restart": os.environ.get("SLURM_RESTART_COUNT", "0")}) + "\n")
+            starts[v].flush()
         try:
             if args.jev_dir:
                 p = decide(i, prompt_for(v, k, a, b))
@@ -316,6 +324,7 @@ def main():
         return rec
 
     outs = {v: open(Path(args.out_dir) / f"calls_{v}.jsonl", "a") for v in variants}
+    starts = {v: open(Path(args.out_dir) / f"calls_{v}.starts.jsonl", "a") for v in variants}
     lock = threading.Lock()
     t0 = time.time()
     with ThreadPoolExecutor(args.workers) as ex:
@@ -327,7 +336,7 @@ def main():
                 outs[r["variant"]].flush()
             if n % 200 == 0:
                 print(f"{n}/{len(tasks)} calls, {(time.time() - t0) / 60:.0f} min", flush=True)
-    for f in outs.values():
+    for f in list(outs.values()) + list(starts.values()):
         f.close()
 
 

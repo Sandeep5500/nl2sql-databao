@@ -774,7 +774,128 @@ Outputs and the running log: `results/bq17/improve/` (`RESULTS.md`).
   the 27B with a larger token budget, more preview rows, or a judge that sees all distinct results at
   once.
 
-## 13. Where things are
+## 13. BigQuery, second round: what else the judge could see, and how it works through a pair (Nov 18)
+
+The plan, with its gates and two amendments, was written before the calls it covers:
+[bq_judge_improvement_plan.md](bq_judge_improvement_plan.md), "Round 2". Outputs and scripts:
+`results/bq17/anatomy/pool_losses.py`; `results/bq17/improve/` (`fetch_r2.sh`, `score_r2.py`,
+`score_16k.py`, `score_rerun.py`, `r2_movers.py`, `r2_16k_calls.py`, `RESULTS.md`).
+
+- **Where both judges lose, question by question** (bq17's 65 mixed pools; the 35B with both runs pooled,
+  8 samples per ordered pair; the 27B, 4 samples; causes from the §11 reading):
+
+  | cause (read questions) | pools | 35B loss | 27B loss |
+  |---|---|---|---|
+  | question allows the other reading, or a label artifact | 8 | 6.4 | 7.6 |
+  | misread with the deciding information in its inputs | 9 | 3.8 | 1.0 |
+  | held a hard-coded value or SQL style against the right answer | 3 | 1.1 | 0.0 |
+  | needs data the judge cannot see; a convention the gold wants | 2 | 1.9 | 2.0 |
+  | not read (round 2 tests on these) | 43 | 2.5 | 2.9 |
+  | all | 65 | 15.8 | 13.5 |
+
+  - The 27B fixes most of what better reasoning can fix (misreads 3.8 → 1.0, hard-coding 1.1 → 0), and
+    loses more on the label problems (7.6): it rejects, with reasons, answers that only the gold accepts.
+  - What a judge could still gain is about 7 picks for the 35B and about 4 for the 27B *(estimate: every
+    loss outside the label, hidden-data and convention rows)*.
+  - The 27B's own misses are mostly calls without a verdict: of its 36 right-vs-wrong comparisons with a
+    wrong majority or no verdict, 24 are §11's, and 6 of the other 12 lack a verdict in 6 to 8 of 8 calls.
+- **What else the judge could be given** (offline, no GPU):
+  - The agent's output-shape rubric: on the 21 missed comparisons that have one, it separates the right
+    answer from the wrong one once (bq268, which the 27B already gets right).
+  - Whether an answer was submitted or taken at the step limit: every miss is between two submitted
+    answers (or two step-limit ones); where the wrong answer is a step-limit one (14 comparisons), both
+    judges are right.
+  - The doc: the GA360 doc (35,736 characters, bq001–bq010) defines the nested fields only after the
+    8,000 characters the judge sees (`productRevenue` "multiplied by 10^6" at character 28,057), and the
+    GA360 schema dump lists only top-level fields. No SQLite doc reaches 8,000 characters.
+  - The schema: 61 of 204 dumps are longer than the 40,000 characters shown (up to 56,963), in 20 of the
+    65 mixed pools. Both judges are weaker there (35B 0.68 vs 0.79 per pool, 27B 0.72 vs 0.83), mostly
+    because §11's label problems sit there.
+  - Not given: how many lanes gave each result (the judge would lean to the majority, and on BigQuery
+    rescuing a wrong majority gains 3.8 picks against 1.9 for overruling a right one), and facts from the
+    answer key.
+- **Variants** (`judge_prompts.py`):
+  - `dc_spec` (35B): first a short specification from the question and the doc alone, then `diff_cmp`'s
+    steps decided against it. For misreading which quantity, period or rows the question asks for.
+  - `dc_rf` (35B): both results and the comparison come before the SQL; the judge says where the results
+    disagree and uses the SQL only to explain each disagreement. For holding how the SQL looks against
+    a right result.
+  - `dc_full` (35B): `diff_cmp` with the doc and schema uncut (up to 40,000 and 60,000 characters), so
+    the judge sees what the agent saw. Its prompt differs from `diff_cmp`'s in 26 of the 68 test pools.
+  - `dc_brief` (27B): `diff_cmp` plus an instruction to keep the reasoning short.
+  - The 27B with `diff_cmp` and a 16,384-token reply budget instead of 8,192.
+- **Sets and gate.** TEST: the 68 mixed pools whose question was not read (bq17 43, earlier set 25).
+  READ: the other 34. A 35B variant needed TEST at least +2.0 with its 98.3% interval above 0, and READ
+  at least −1.0. Baselines: the deployed 35B with `diff_cmp`, bq17 both runs pooled (8 samples per
+  ordered pair), earlier set the Nov 18 morning session (4 samples).
+- **35B results.** 4 samples per ordered pair, every arm complete; no verdict in 0.3–2.7% of calls.
+
+  | | TEST (68) | vs deployed [98.3%] | bq17 / earlier set | READ (34) | vs deployed [98.3%] |
+  |---|---|---|---|---|---|
+  | deployed `diff_cmp` | 57.8 | | | 12.8 | |
+  | `dc_spec` | 59.3 | +1.5 [−1.5, +4.7] | −1.1 / +2.6 | 13.7 | +0.9 [−1.5, +3.7] |
+  | `dc_rf` | 58.7 | +0.9 [−3.1, +4.9] | −1.5 / +2.4 | 13.3 | +0.5 [−1.9, +3.1] |
+  | `dc_full` | 59.5 | +1.7 [−1.2, +5.3] | −0.7 / +2.4 | 13.2 | +0.4 [−1.3, +2.2] |
+
+  - No variant passes, so none is proposed, no Spider2 run follows, and production stays on `diff_cmp`.
+  - The two sets disagree again: every variant loses on bq17's 43 test pools and gains on the earlier
+    set's 25. On bq17's 43, two runs of `diff_cmp` itself differ by −1.3 [−2.9, −0.1]: a same-prompt
+    difference whose interval leaves out zero, so the question bootstrap understates how far two runs
+    differ.
+  - `dc_full` has its own control: in 42 test pools its prompt is the same as `diff_cmp`'s, and there it
+    scores −0.3 (bq17, 28 pools) and +0.8 (earlier set, 14 pools), which is run-to-run spread. In the 26
+    where it shows more doc or schema: −0.4 and +1.6 (schema lengths read from bq17's traces for both
+    sets).
+  - The same pools move under every variant. On the earlier set, against the morning session, bq066
+    (0.00 → 0.56, 0.89, 1.00), bq407 (0.30 → 0.72, 0.82, 0.61) and bq123 (0.50 → 1.00, 1.00, 0.75) gain
+    under all three, as bq066 and bq023 did under round 1's rules; on bq17, ga004 (leaving out users
+    with no pageviews is right) loses under all three (0.55 → 0.00, 0.00, 0.12).
+  - GA360, `dc_full`'s own target: with the field definitions in view, bq002 rises (bq17 0.15 → 0.27,
+    earlier set 0.38 → 0.50) and bq004 falls (0.92 → 0.75); bq001 and bq010 stay at 1.00.
+  - The deployed prompt judged again on the earlier set (amendment 2) scores +1.6 [+0.3, +3.2] over the
+    morning session on the 25 unread pools (bq066 0.00 → 0.51, bq123 0.50 → 1.00): the morning baseline
+    was a low draw, and for the second time the bootstrap leaves out zero for an unchanged prompt. With
+    both runs pooled on each set (8 samples per ordered pair), round 2's variants score +0.6 [−2.2, +3.2],
+    −0.1 [−4.0, +3.6] and +0.7 [−1.7, +3.5] on TEST, and round 1's (§12) +0.8, +0.5 and +1.8 on the
+    earlier set's 25. A few pools still move beyond both runs of the deployed prompt (bq023 0.12–0.21 vs
+    0.69–0.95; bq328 0.25–0.28 vs 0.56–0.75), and losses elsewhere offset them.
+- **27B results** (bq17, 506 ordered pairs per sample; against its Nov 17 calls at 8,192 tokens, which
+  have no verdict in 31.7% of calls and are right in 82.7% of the answered right-vs-wrong ones):
+  - `dc_brief` failed its pilot bar on samples 2 and 3 (samples 0 and 1 were slowed by preemption and
+    stopped): no verdict 21.9% (the bar wanted a fall of 10 points to 21.7% or less) and 80.8% right on
+    answered right-vs-wrong calls. On those two samples it picks 114.8 of 204 against 115.5 (−0.7
+    [−2.8, +1.0] on the 65 mixed pools).
+  - `diff_cmp` with 16,384 tokens (samples 0, 2 and 3; sample 0 ran without a preemption; sample 1,
+    preempted five times, was cancelled and is left out): calls without a verdict fall from 31.7% to 7.8%, and accuracy
+    on answered right-vs-wrong calls stays close (80.2% vs 82.7%). Per right-vs-wrong call, P(right)
+    with a missing verdict counted 0.5 rises from 0.729 to 0.781: comparisons the 8,192 budget always
+    cut off are now right 0.667 of the time, those it never cut stay at 0.87. In the read questions,
+    which hold the hard comparisons, it moves only from 0.526 to 0.551.
+  - Picks do not follow: 114.0 of 204 on the three samples against 115.5 (−1.6 [−4.2, +0.7] on the 65
+    mixed pools), and 116.0 for sample 0 alone (+0.5 [−3.7, +4.4]). Single samples of the 8,192 run
+    score 114 to 118.
+  - Why: a missing verdict counts half for each side, so it leaves the larger group's head start in place,
+    and truncation deferred to the majority. Where the majority is right and the 27B, once it finishes,
+    decides wrong, the pool falls: bq389 0.81 → 0.15, bq424 0.75 → 0.21, bq103 0.77 → 0.33, bq002 0.64 →
+    0.26, ga004 0.44 → 0.00. Where the right answer is a single lane, finishing helps: bq055 0.03 → 0.36,
+    bq445 0.75 → 1.00, bq066 0.80 → 1.00. The §10 simulation put break-even at 53% of the cut calls right
+    because it let each call go right or wrong on its own; the errors cluster by question instead. In
+    bq424 the 27B picks the other debt indicator in 6 of its 7 answers (5 of 6 at 8,192), and in bq389
+    it accepts the unexplained parameter-code filter in 4 of 9, the 35B's error of §11.
+- **Reading.** Six prompt variants over two rounds change the 35B on BigQuery by no more than two runs of
+  one prompt differ, once each baseline has 8 samples per ordered pair. The 27B with room to finish
+  answers nearly every comparison but picks no better, because its remaining errors sit in the same hard
+  questions. Neither prompt changes nor a larger token budget improves BigQuery selection measurably;
+  production stays on the 35B with `diff_cmp`. What is left is mostly §11's label problems and misreads
+  of hard questions, which no round has moved.
+- **Method notes.** Two same-prompt reruns (bq17 43 pools: −1.3 [−2.9, −0.1]; earlier set 25 pools: +1.6
+  [+0.3, +3.2]) show that a 4-sample baseline can be off by 1.5 picks on a few dozen pools and that the
+  question bootstrap does not cover it; a pass bar needs a margin above the bootstrap and a baseline of
+  more than one run. On preemptible GPUs, calls in flight at a preemption are drawn again; the start log
+  (`calls_<variant>.starts.jsonl`) counts them (27B 16,384 sample 2: 79 of 506; sample 1, cancelled:
+  at least 251 of 384).
+
+## 14. Where things are
 
 - **Data pipeline.** `build_bird_dataset.py`, `build_beaver_dataset.py`, `beaver_to_sqlite.py`,
   `beaver_gold_mysql.py`, `check_db_overlap.py`, `profile_traps.py`, `sql_mutations.py`,
@@ -792,5 +913,6 @@ Outputs and the running log: `results/bq17/improve/` (`RESULTS.md`).
   `smoke_two_loss.py`.
 - **Cluster jobs.** `nl2sql-v2/slurm/`.
 - **Full BigQuery rerun.** `results/bq17/` (plan, scores, scripts); its error analysis in `anatomy/`,
-  the Nov 18 ablations in `improve/`.
+  the Nov 18 ablations in `improve/` (round 2: `score_r2.py`, `score_16k.py`, `score_rerun.py`,
+  `r2_movers.py`, `r2_16k_calls.py`, `fetch_r2.sh`).
 - **Results on Babel.** `/data/user_data/dpalagan/{judge-data,nl2sql-sel}/results/`.
