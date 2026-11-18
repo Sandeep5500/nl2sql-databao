@@ -13,6 +13,7 @@ Usage (from nl2sql-v2/):
         --judge jev_choice --judge-endpoint http://node:8796/v1 --jev-dir <JEV-27B dir> \\
         --output ../results/pools/jev27b_q36rg.jsonl --resume
     ... --judge pairwise --judge-model QuantTrio/Qwen3.6-35B-A3B-AWQ  (P(A) from logprobs)
+    ... --no-judge  (build the groups only, as bq_judge_pools.py; rejudge_pools.py judges them)
 """
 
 import argparse
@@ -42,8 +43,8 @@ def contains(big, small):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", required=True, help="comma-separated results CSVs (one per lane)")
-    ap.add_argument("--judge", choices=["jev_choice", "pairwise"], required=True)
-    ap.add_argument("--judge-endpoint", required=True)
+    ap.add_argument("--judge", choices=["jev_choice", "pairwise"])
+    ap.add_argument("--judge-endpoint")
     ap.add_argument("--judge-model", default="jev-decision")
     ap.add_argument("--jev-dir")
     ap.add_argument("--jev-inputs", default="sql_results",
@@ -63,7 +64,10 @@ def main():
                     help="store the judge's reasoning text (thinking mode) per judgment")
     ap.add_argument("--pair-workers", type=int, default=1,
                     help="judge a question's ordered pairs concurrently (pairwise judge only)")
+    ap.add_argument("--no-judge", action="store_true")
     args = ap.parse_args()
+    if not args.no_judge and not (args.judge and args.judge_endpoint):
+        ap.error("--judge and --judge-endpoint are required unless --no-judge")
     select_answer.THINKING = args.thinking
     notes = {}
     if args.notes:
@@ -93,7 +97,9 @@ def main():
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     out = open(args.output, "a")
 
-    if args.judge == "jev_choice":
+    if args.no_judge:
+        pass
+    elif args.judge == "jev_choice":
         jev = JevJudge(args.judge_endpoint, args.jev_dir, 40000)
     else:
         from openai import OpenAI
@@ -151,7 +157,7 @@ def main():
                         if a != b and groups[b]["rows"] > 0 and contains(groups[a]["df"], groups[b]["df"])}
 
         judgments = []
-        if len(groups) > 1:
+        if len(groups) > 1 and not args.no_judge:
             doc, schema = question_context(q, db)
 
             def judge(a, b):

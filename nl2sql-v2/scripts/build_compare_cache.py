@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--sqlite-dir", help="override nl2sql.config.SQLITE_DIR (local tests)")
     ap.add_argument("--shard", help="k/n: every n-th pool starting at k")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--cmp-version", type=int, default=2, help="result_compare version (3: BigQuery ablation, Nov 18)")
     args = ap.parse_args()
 
     from rejudge_pools import load_reference
@@ -109,8 +110,9 @@ def main():
         for d in dbs.values():
             d.close()
     if bq:
-        from bq_judge_pools import LANES, final_result, parse_result
+        from bq_judge_pools import final_result, lanes_of, parse_result
         base = Path(args.bq_base)
+        lanes = lanes_of(base)
         lane_sql = {}
         for k in bq:
             it, e = ref[k], ev[k]
@@ -121,9 +123,9 @@ def main():
                 full[(k, a)] = None
                 for lane in sorted(g["lanes"]):  # the first lane built the stored preview
                     if lane not in lane_sql:
-                        lane_sql[lane] = {r["instance_id"]: r for r in csv.DictReader(open(base / LANES[lane] / "all.csv"))}
+                        lane_sql[lane] = {r["instance_id"]: r for r in csv.DictReader(open(base / lanes[lane] / "all.csv"))}
                     sql = (lane_sql[lane][iid].get("sql") or "").replace("\\n", "\n").strip()
-                    tr = json.load(open(base / LANES[lane] / "traces" / f"{iid}.json"))
+                    tr = json.load(open(base / lanes[lane] / "traces" / f"{iid}.json"))
                     res = final_result(tr, sql)
                     if res is None:
                         continue
@@ -149,7 +151,8 @@ def main():
                         text = UNAVAILABLE
                         n_unavail += 1
                     else:
-                        text = compare_results(fa[0], fb[0], fa[1], fb[1], capped=fa[2] or fb[2])
+                        text = compare_results(fa[0], fb[0], fa[1], fb[1], capped=fa[2] or fb[2],
+                                               version=args.cmp_version)
                     n_pairs += 1
                     out.write(json.dumps({"key": k, "first": a, "second": b, "text": text}) + "\n")
     groups = [v for v in full.values()]

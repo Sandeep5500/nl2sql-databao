@@ -9,7 +9,9 @@
 #   sbatch ~/slurm/train_judge.slurm                       data from $D/results/judge_train/data
 #   sbatch --export=ALL,SMOKE=1,DATA=<dir>,OUT=<dir> ~/slurm/train_judge.slurm
 #       (SMOKE: a few steps of each stage on a small subset, to check size and speed)
-#   STAGES="choice merge" (verdict-only stage on $DATA/choice.jsonl, instead of SFT/DPO)
+#   STAGES="choice merge" (verdict-only stage on $DATA/choice.jsonl, instead of SFT/DPO); likewise
+#   STAGES="choice_mt merge" (choice.jsonl + sft.jsonl) and STAGES="choice_reason merge" (dpo.jsonl),
+#   with CHOICE_ARGS for their flags, e.g. CHOICE_ARGS="--weight 0.25 --vec-weight 1"
 #   STAGES="dpo merge" (DPO from the base, no SFT); SFT_ARGS / DPO_ARGS: extra
 #   train_judge_lora.py flags, e.g. DPO_ARGS="--lr 5e-5 --epochs 2"
 #
@@ -33,7 +35,10 @@ OUT=${OUT:-$D/results/judge_train/model}
 # .venv-train plus fla-core (flash-linear-attention kernels for the gated-delta layers; the
 # torch fallback made DPO ~3.4x slower in the smoke test)
 PY=${PY:-$C/.venv-train-fla/bin/python}
-export HF_HOME=$U/.cache/huggingface PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# no expandable_segments: with it, 3 of 4 two-GPU bf16 forwards on L40S returned zeros / NaN / garbage
+# (Nov 13: extraction twice, diag2); without it the same check passed with every layer finite
+export HF_HOME=$U/.cache/huggingface
+unset PYTORCH_CUDA_ALLOC_CONF
 echo "node=$(hostname) job=$SLURM_JOB_ID restarts=${SLURM_RESTART_COUNT:-0} start=$(date -Is)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 rsync -a ~/judge-code-staging/ "$C/" || exit 1
@@ -51,13 +56,20 @@ if [[ " $STAGES " == *" sft "* ]]; then
 else
     INIT=()
 fi
-if [[ " $STAGES " == *" choice "* ]]; then
-    # verdict-only training (no reasoning) on choice.jsonl; CHOICE_ARGS: extra flags
-    [ -s "$OUT/choice/final/adapter_model.safetensors" ] || \
-        "$PY" scripts/train_judge_lora.py choice --data "$DATA/choice.jsonl" --out "$OUT/choice" \
-            ${CHOICE_ARGS:-} "${EXTRA[@]}" || exit 1
-    echo "choice done $(date -Is)"
-    ADAPTER=$OUT/choice/final
+CS=""
+for s in choice choice_mt choice_reason; do [[ " $STAGES " == *" $s "* ]] && CS=$s; done
+if [ -n "$CS" ]; then
+    # verdict training: choice (no reasoning) and choice_mt read choice.jsonl (choice_mt also
+    # sft.jsonl), choice_reason dpo.jsonl; CHOICE_ARGS: extra flags
+    case $CS in
+        choice) IN=(--data "$DATA/choice.jsonl") ;;
+        choice_mt) IN=(--data "$DATA/choice.jsonl" --sft-data "$DATA/sft.jsonl") ;;
+        choice_reason) IN=(--data "$DATA/dpo.jsonl") ;;
+    esac
+    [ -s "$OUT/$CS/final/adapter_model.safetensors" ] || \
+        "$PY" scripts/train_judge_lora.py $CS "${IN[@]}" --out "$OUT/$CS" ${CHOICE_ARGS:-} "${EXTRA[@]}" || exit 1
+    echo "$CS done $(date -Is)"
+    ADAPTER=$OUT/$CS/final
 else
     [ -s "$OUT/dpo/final/adapter_model.safetensors" ] || \
         "$PY" scripts/train_judge_lora.py dpo --data "$DATA/dpo.jsonl" "${INIT[@]}" \

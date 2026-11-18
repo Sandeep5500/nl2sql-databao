@@ -7,6 +7,10 @@
 #   sbatch --export=ALL,WORKER=0,WORKERS=2 ~/slurm/extract_judge_states.slurm
 #   sbatch --export=ALL,WORKER=1,WORKERS=2 ~/slurm/extract_judge_states.slurm
 #   (LIMIT=40 OUT=<dir> for a smoke run)
+#   Stage B (diff_cmp judgments, scripts/practice_dc.py; same file layout under another directory):
+#   sbatch --export=ALL,PRACTICE=$R/practice_dc,OUT=$R/head_probe/states_dc,WORKER=0,WORKERS=2 ...
+#   Any other record files (scripts/calls_to_records.py): VERDICTS="<file> <file>" (MAXTOK= raises the
+#   16384-token limit, e.g. for BigQuery's long schema sections)
 #
 #SBATCH --job-name=judge_states
 #SBATCH --partition=preempt
@@ -24,14 +28,25 @@ U=/data/user_data/$USER
 R=$U/judge-data/results
 PY=${PY:-$U/judge-code/.venv-train-fla/bin/python}
 OUT=${OUT:-$R/head_probe/states_base}
-export HF_HOME=$U/.cache/huggingface PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+V=${PRACTICE:-$R}
+# no expandable_segments: with it, both earlier runs failed the identity check (53 and 57 of 100) on
+# L40S; without it the same forward passed with every layer finite (Nov 13)
+export HF_HOME=$U/.cache/huggingface
+unset PYTORCH_CUDA_ALLOC_CONF
 echo "node=$(hostname) job=$SLURM_JOB_ID restarts=${SLURM_RESTART_COUNT:-0} start=$(date -Is)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 EXTRA=()
-[ -n "${LIMIT:-}" ] && EXTRA=(--limit "$LIMIT")
+[ -n "${LIMIT:-}" ] && EXTRA+=(--limit "$LIMIT")
+[ -n "${MAXTOK:-}" ] && EXTRA+=(--max-tokens "$MAXTOK")
+if [ -n "${VERDICTS:-}" ]; then
+    FILES=($VERDICTS)
+else
+    FILES=("$V/judge_train/verdicts_train_v1.jsonl" "$V/judge_cplx/verdicts_cplx_v1.jsonl"
+           "$V/judge_cplx/verdicts_cplx_v2.jsonl" "$V/judge_claude/verdicts_claude_v3.jsonl"
+           "$V/judge_claude/verdicts_claude_h1.jsonl" "$V/judge_claude/verdicts_claude_h2.jsonl"
+           "$V/judge_beaver/verdicts_beaver_p1.jsonl")
+fi
+md5sum "${FILES[@]}"
 "$PY" ~/judge-tmp/extract_judge_states.py --out-dir "$OUT" --worker "${WORKER:-0}" --workers "${WORKERS:-1}" \
-    --verdicts "$R/judge_train/verdicts_train_v1.jsonl" "$R/judge_cplx/verdicts_cplx_v1.jsonl" \
-        "$R/judge_cplx/verdicts_cplx_v2.jsonl" "$R/judge_claude/verdicts_claude_v3.jsonl" \
-        "$R/judge_claude/verdicts_claude_h1.jsonl" "$R/judge_claude/verdicts_claude_h2.jsonl" \
-        "$R/judge_beaver/verdicts_beaver_p1.jsonl" "${EXTRA[@]}"
+    --verdicts "${FILES[@]}" "${EXTRA[@]}"
 echo "exit $? end=$(date -Is)"

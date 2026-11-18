@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""judge_pools.py for Rohini's BigQuery pass@k runs (bigquery_passk_nov2026). Each lane's result is
+"""judge_pools.py for Rohini's BigQuery pass@k runs: bigquery_passk_nov2026 (4 retries of the greedy
+failures + the greedy run) or bigquery_passk_nov2026_17 (4 lanes over all 204 questions; the layout is
+read from --base). Each lane's result is
 read from its trace (the preview of the submitted query) instead of re-executing the SQL on
 BigQuery, which bills per byte. The schema shown to the judge is the one in the agent's system
 prompt. Correctness comes from the run's recorded score (analysis only, never shown to the judge).
 
-Previews are complete except for large results ("[showing 50 of N rows]"); those groups are
-compared on their first 50 rows plus the total row count, and the judge sees 8 rows plus the true
-shape, as in judge_pools.py.
+Previews are complete except for large results ("[showing K of N rows]": the agent's tool shows 12
+rows unless the call sets preview_rows, up to 50). Lanes are grouped on their shown rows plus the
+total row count, so one result shown at two lengths makes two groups; the judge sees 8 rows plus the
+true shape, as in judge_pools.py.
 
 Usage (from nl2sql-v2/):
-    python scripts/bq_judge_pools.py --base <dir with 1_greedy_run_R, 2_retry_*> \\
+    python scripts/bq_judge_pools.py --base <dir with 1_greedy_run_R, 2_retry_* or lane_k1..4> \\
         --questions bq_questions.jsonl --judge pairwise --judge-endpoint http://localhost:8765/v1 \\
         --judge-model QuantTrio/Qwen3.6-35B-A3B-AWQ --thinking --max-tokens 8192 \\
         --save-reasoning --pair-workers 4 --output pools/think35_bq.jsonl --resume
@@ -37,9 +40,16 @@ import select_answer
 
 # lane order: the four temperature-0.7 retries first (so a group's representative SQL comes from
 # a retry), then the greedy run, which is wrong on every retried question
-LANES = ["2_retry_1", "2_retry_2", "2_retry_3", "2_retry_4", "1_greedy_run_R"]
+RETRY_LANES = ["2_retry_1", "2_retry_2", "2_retry_3", "2_retry_4", "1_greedy_run_R"]
+# bigquery_passk_nov2026_17: four temperature-0.7 lanes over all 204 questions, no greedy run
+FULL_LANES = ["lane_k1", "lane_k2", "lane_k3", "lane_k4"]
 SHOWING = re.compile(r"^\[showing (\d+) of (\d+) rows\]$")
 CAPPED = re.compile(r"^\[(showing \d+ rows; result exceeded|result truncated)")
+
+
+def lanes_of(base):
+    """A package's lane directories: the full pass@4 layout when it is there, else retries + greedy."""
+    return FULL_LANES if (Path(base) / FULL_LANES[0] / "all.csv").exists() else RETRY_LANES
 
 
 def norm_sql(s):
@@ -148,8 +158,9 @@ def main():
     args = ap.parse_args()
     select_answer.THINKING = args.thinking
     base = Path(args.base)
+    lane_dirs = lanes_of(base)
 
-    lanes = [{r["instance_id"]: r for r in csv.DictReader(open(base / d / "all.csv"))} for d in LANES]
+    lanes = [{r["instance_id"]: r for r in csv.DictReader(open(base / d / "all.csv"))} for d in lane_dirs]
     qmeta = {json.loads(l)["instance_id"]: json.loads(l) for l in open(args.questions)}
     done = set()
     if args.resume and Path(args.output).exists():
@@ -174,9 +185,9 @@ def main():
         for k, lane in enumerate(lanes):
             r = lane[iid]
             sql = (r.get("sql") or "").replace("\\n", "\n").strip()
-            info = {"lane": k, "run": LANES[k], "status": r.get("status", ""),
+            info = {"lane": k, "run": lane_dirs[k], "status": r.get("status", ""),
                     "recorded_score": int(r["score"]), "error": "", "rows": None, "group": None}
-            tr = json.load(open(base / LANES[k] / "traces" / f"{iid}.json"))
+            tr = json.load(open(base / lane_dirs[k] / "traces" / f"{iid}.json"))
             systems[k] = tr.get("system", "")
             df = None
             if not sql:

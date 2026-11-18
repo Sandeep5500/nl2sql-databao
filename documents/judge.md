@@ -1,0 +1,199 @@
+# Answer selection: the pairwise judge (Nov 2026)
+
+The agent answers every question 4 times (4 lanes, temperature 0.7), and one answer has to be submitted.
+The judge picks it. This page says what the judge does, why it is built this way, how the two best
+judges compare (Qwen3.6-35B-A3B in production, Qwen3.8-27B as the challenger, both with the `diff_cmp`
+prompt), and how to test a change. All numbers are measured unless marked *(estimate)*. The full record
+is in [judge_results.md](judge_results.md); a short list of findings is in
+[judge_findings.md](judge_findings.md).
+
+## The problem
+
+The 4 lanes often disagree, and at least one is right much more often than a single lane is:
+
+| | one lane (pass@1) | any lane right (pass@4) |
+|---|---|---|
+| SQLite, 135 local questions (run q36rg) | 51.1% | 69.6% |
+| BigQuery, 204 questions (Nov 17 run) | 48.0% | 63.2% |
+
+Selection decides how much of that gap we keep. Majority vote keeps little of it (54.2% and 51.6%),
+because the right answer is often the one only one lane found.
+
+## How the judge works
+
+Production is `nl2sql-v2/scripts/select_answer.py --mode pairwise --thinking` (the `diff_cmp` prompt is
+the default):
+
+1. Run each lane's SQL and group lanes whose results are equal (row order ignored, the scorer's
+   normalisation). If all lanes agree, submit that result; no judge call is made.
+2. Judge every pair of distinct results twice, once in each presentation order. The judge sees the
+   question, the external document (first 8,000 characters), a schema overview, both SQL queries, the
+   first 8 rows of each result with its full shape, and a comparison of the two full results computed
+   by `result_compare.py` (shapes, which columns pair up, rows and values found on one side only).
+3. The `diff_cmp` prompt asks for four steps: list the concrete differences between the two queries;
+   use the comparison to say whether each one changes the result; set aside those that change no value;
+   decide the rest against the question and the document. A rules block repeats what counts (extra
+   columns are fine; missing rows or values are not; how the SQL is written is not a criterion).
+4. The judge reasons first (thinking on, temperature 0.6, up to 8,192 tokens) and replies with JSON
+   naming the winner.
+5. Submit the result with the most wins. Ties go to the result more lanes produced.
+
+```bash
+cd nl2sql-v2
+uv run python scripts/select_answer.py --mode pairwise --thinking \
+    --runs ../results/q36rg_pass4_k1.csv,../results/q36rg_pass4_k2.csv,../results/q36rg_pass4_k3.csv,../results/q36rg_pass4_k4.csv \
+    --judge-endpoint http://<node>:8765/v1 --judge-model QuantTrio/Qwen3.6-35B-A3B-AWQ \
+    --output ../results/q36rg_selected.csv
+```
+
+A question with 4 different results needs 12 judge calls; questions where the lanes disagree and one
+is right need about 7 on average on SQLite.
+
+## Why it is built this way
+
+- **A judge beats majority vote.** Over 540 SQLite pools (4 saved run sets × 135 questions) the old
+  thinking judge picked 296 right against 261 for majority vote; on all 204 BigQuery questions the judges
+  beat majority vote by 7 to 10 picks on the 65 questions where the lanes disagree and at least one is
+  right.
+- **Pairs, in both orders.** Comparing two answers at a time keeps each call small. Judges favour the
+  answer shown first (the old prompt was right 85% of the time with the right answer first, 71% with it
+  second), so every pair is asked both ways and the bias cancels in the totals.
+- **Thinking on.** Without reasoning the same model picks 281 of 540 (SQLite) and 24 of 105 (BigQuery)
+  instead of 296 and 26.
+- **The `diff_cmp` prompt and the computed comparison.** Tested in a pre-registered design (SQLite split
+  by database into a design half and a test half, 4 samples per pair; [judge_prompt_eval.md](judge_prompt_eval.md)).
+  On the test half's close calls it gained +7.2 picks [+1.9, +13.0] (97.5% interval), without losing
+  easy pools. Over the
+  540 pools it moves the expected score from 293.4 to 305.6, and with the right answer shown second the
+  judge is right 84% of the time instead of 74%. It costs about 23% more judge tokens. On BigQuery it
+  gives the 35B no gain (+0.8 [−2.9, +4.3] for the old prompt on the 204 questions), and it stays the
+  default because it was allowed to lose up to 1.5 there.
+- **An untuned model.** Six fine-tuning recipes (SFT, DPO, letter-only training; at most 2,644
+  examples over 1,814 practice pairs from non-Spider2 databases) never beat the untuned thinking judge
+  on Spider2. The practice data
+  was simpler than Spider2 and about half of its hard pairs had a defensible "wrong" answer. Details:
+  [judge_training_methods.md](judge_training_methods.md).
+- **The agent's own model.** The 35B judge is the model that serves the agent, so production needs no
+  second model.
+
+## The two judges
+
+Both run with thinking, temperature 0.6, 8,192 tokens and the `diff_cmp` prompt.
+
+| | Qwen3.6-35B-A3B (production) | Qwen3.8-27B |
+|---|---|---|
+| model | mixture of experts, about 3B parameters active per token; AWQ 4-bit | dense 27B, bf16; about 9× the compute per token |
+| reasoning per BigQuery call (median) | 3,053 tokens | 5,146 tokens |
+| calls that reach 8,192 tokens without a verdict | 1% | 16–25% SQLite, 31–32% BigQuery |
+| first-shown answer wins both orders (right-vs-wrong pairs) | 7–12% | 0–1% |
+| SQLite, 540 pools (expected correct) | 305.6 | **317.4** (+11.8 [+1.7, +22.0] on the 217 pools where lanes disagree) |
+| BigQuery, earlier set (105 pools, greedy failures only) | 27.7 | **33.3** (+5.6 [+2.1, +9.5]) |
+| BigQuery, all 204 questions (Nov 17) | 112.3 and 113.9 in two runs | **115.5** (+2.3 [−1.6, +6.8] against both 35B runs pooled) |
+
+- The 27B is the better judge on SQLite and ahead on both BigQuery sets, but on the full BigQuery set
+  its lead is not resolved.
+- A missing verdict counts as a coin flip, so its truncated calls cost it: if every truncated call had
+  been right, it would score 119.9 of 204 on BigQuery; if every one had been wrong, 99.5. Given more room
+  to finish it stays ahead of the 35B if it gets more than about 53% of those calls right
+  *(simulation)*; the 35B gets 66% of the same comparisons right.
+- Qwen3.8 has no smaller model than the 27B. Whether a dense 27B fits the project's small-model goal is
+  an open decision; production stays on the 35B until it is made.
+- Other models of the same sizes did worse than the 35B: GLM-4.7-Flash (296.9 of 540) and
+  Magistral-Small-2509 (300.0). JEV-27B's one-step decision mode scored 290 of 540.
+
+## Final scores, latest runs
+
+Judge rows are the expected accuracy of one production run (exp1, computed from 4 samples of every
+judge call; see below).
+
+**SQLite, 135 local questions, run q36rg** (Qwen3.6-35B-A3B agent, 4 lanes, temperature 0.7):
+
+| | correct of 135 | accuracy |
+|---|---|---|
+| one lane (pass@1, average) | 69.0 | 51.1% |
+| majority vote (ties at random) | 73.2 | 54.2% |
+| 35B judge, `diff_cmp` | 85.6 | 63.4% |
+| 27B judge, `diff_cmp` | 86.6 | 64.1% |
+| any lane right (pass@4) | 94 | 69.6% |
+
+On this run set alone the 27B's lead is +1.0 [−2.5, +4.6]. The newer run sets q36e and q36x (Oct 7–8,
+explored enrichment) are being judged now: pass@1 53.7% and 50.0%, pass@4 92 and 91 of 135 (q36x's
+own log says 50.2% and 92; one lane's SQL gives another result when re-run).
+
+**BigQuery, 204 questions, Nov 17 run** (same agent model, bf16, 4 lanes, temperature 0.7):
+
+| | correct of 204 | accuracy |
+|---|---|---|
+| one lane (pass@1, average) | 98.0 | 48.0% |
+| majority vote (ties at random) | 105.2 | 51.6% |
+| 35B judge, `diff_cmp` (two runs pooled) | 113.2 | 55.5% |
+| 27B judge, `diff_cmp` | 115.5 | 56.6% |
+| any lane right (pass@4) | 129 | 63.2% |
+
+The judge keeps about two thirds of the pass@1 to pass@4 gap on SQLite (16.6 of 25 picks for the 35B)
+and about half on BigQuery (15.2 of 31).
+
+## Where the judge still loses
+
+- **SQLite.** Losses sit in pools where only one lane is right. Reading 29 missed comparisons with the
+  gold answer in view: 12 were misreads with the deciding information in the prompt, 7 held a hard-coded
+  value or SQL style against the right answer, 4 were questions that allow the other reading, 3 were
+  formatting conventions the gold wants, 2 needed data the judge cannot see, 1 held extra detail
+  against the right answer. The judge does not apply rules the prompt already states.
+- **BigQuery.** Of the 16.7 picks the 35B loses on the 65 mixed questions, about half are label
+  problems no judge should fix: gold files that contradict their own SQL, a 1.6 parts-per-million
+  difference failing a tolerance, questions with two fair readings. The rest are reasoning errors with
+  the answer in view: accepting a filter the question does not state, penalising hard-coded values the
+  results confirm, misreading the quantity or month asked for. The 27B fixes the clearest of these.
+  Rough ceiling for any judge on this set: about 122 of 204 *(estimate)*.
+
+## What did not help
+
+- Fine-tuning (six recipes), a readout trained on the judge's hidden states, and a two-loss head: no
+  gain on Spider2.
+- Rule layers and confidence gating on top of the thinking judge (296 → 282 of 540), table details from
+  the database in the prompt (helped easy pairs, hurt hard ones), summaries of the agent's trace
+  (+8 / −7 over 405), voting over more samples.
+- BigQuery prompt rules (Nov 18): a rule that filters must come from the question, and a final step that
+  drops objections to how a query is written. The first fixes the filters it names and rejects
+  exclusions the question implies; the second changes nothing. A clearer comparison tool and re-asking
+  pairs whose two orders disagree gave +0.1 each.
+- The agent's output-shape rubric as extra information (checked offline, Nov 18): on the BigQuery
+  comparisons the judges miss, both answers almost always have the shape the rubric asks for.
+
+## How to test a judge change
+
+Score changes with exp1, not with single runs: two single runs of the same judge pick differently on
+about 23 of 540 SQLite questions, and even two 4-sample runs differed by 1.6 picks on BigQuery's 65
+mixed pools.
+
+1. Build the candidate pools: `judge_pools.py --no-judge` (SQLite: re-runs each lane's SQL, groups equal
+   results, labels groups with the scorer) or `bq_judge_pools.py --no-judge` (BigQuery: reads results
+   from the traces; never re-run SQL on BigQuery, it bills per byte).
+2. Build an eval set: `selection_eval.py build`, or `runset_evalset.py` for new SQLite run sets (it
+   reuses the design/test split by database).
+3. Compute the result comparisons: `build_compare_cache.py`.
+4. Judge every ordered pair 4 times: `rejudge_pools.py --variants <names> --samples 4` (cluster jobs:
+   `slurm/judge_variants.slurm` for the 35B, `slurm/jev_variants.slurm` for the 27B,
+   `slurm/runset_pools.slurm` for steps 1–3 on new SQLite run sets). Prompt variants live in
+   `judge_prompts.py`.
+5. Score: `selection_eval.py score --evalset ... --judge NAME=calls.jsonl --ref <baseline>` prints exp1
+   per set and stratum with paired question bootstraps.
+
+exp1 is the exact expected accuracy of one production run: each ordered pair has 4 sampled verdicts,
+and every combination of one verdict per pair is weighed. A missing verdict counts as 0.5. The
+evaluation counts each lane in the round-robin, which differs from production's win count by under 1
+pick per stratum. Before testing a change, fix the measure and the pass bar in writing, keep part of
+the data unread, and compare against a fresh run of the baseline: comparisons picked out by the
+baseline's own samples drift back toward the average on any rerun.
+
+## Open items (Nov 18)
+
+- Running: the 35B and the 27B on the newer SQLite run sets q36e and q36x.
+- Running: a second round of BigQuery prompt tests, written before any call
+  ([bq_judge_improvement_plan.md](bq_judge_improvement_plan.md), round 2). It tests a specification
+  written before judging (`dc_spec`), results shown before the SQL (`dc_rf`), the doc and schema uncut
+  (`dc_full`; the 8,000- and 40,000-character cuts hide field definitions on GA360 and the end of wide
+  tables), and shorter reasoning for the 27B (`dc_brief`).
+- Needs a decision: the 27B with a larger token budget, starting with its 641 truncated calls on
+  BigQuery.

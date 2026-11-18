@@ -10,7 +10,8 @@ change worth 5-10 questions. Each ordered pair is judged K times instead, and a 
   avgK  the accuracy of the round-robin on the K-sample average (twosample.py's rule)
 
 Pools: the 4 lanes of one question in one run set (Spider2 q36rg, q36s, q36, v2), or Rohini's
-4 BigQuery retries (lanes 0-3; the greedy lane is left out, as in bq_anatomy.py).
+4 BigQuery retries (lanes 0-3; the greedy lane is left out, as in bq_anatomy.py), or the 4 lanes
+of her full BigQuery pass@4 (bigquery_passk_nov2026_17, its own BigQuery-only eval set).
   mixed      a correct and a wrong group among the lanes: only these can change with the judge
   contested  mixed, 1-2 correct lanes (of 4): the primary metric
   easy       mixed, 3 correct lanes: the regression check
@@ -22,6 +23,7 @@ whose groups differ (nondeterministic agent SQL) is left out of its comparisons.
 Usage:
     python scripts/selection_eval.py build --pools <results/pools> --bq-pools <bq_passk/pools> \\
         --out selection_evalset.json
+    python scripts/selection_eval.py build --bq-pools <bq17/pools> --bq-ref-prefix groups --out bq17_evalset.json
     python scripts/selection_eval.py score --evalset selection_evalset.json \\
         --judge think=<pools>/think35/qwen36-35b-think_*_n12_s*.jsonl,<bq>/think35_bq_n16_s*.jsonl \\
         --judge rerun=<pools>/think35_rerun/qwen36-35b-think-rerun_*_n12_s*.jsonl --ref think
@@ -222,11 +224,11 @@ def score_judge(evalset, samples, sigs, rules=()):
 
 
 def build(args):
-    sp = sorted(glob.glob(f"{args.pools}/{args.ref_prefix}_*_n12_s*.jsonl"))
+    sp = sorted(glob.glob(f"{args.pools}/{args.ref_prefix}_*_n12_s*.jsonl")) if args.pools else []
     bq = sorted(glob.glob(f"{args.bq_pools}/{args.bq_ref_prefix}_n16_s*.jsonl"))
-    if len(sp) != 48 or not bq:
+    if (args.pools and len(sp) != 48) or not bq:
         raise SystemExit(f"expected 48 Spider2 reference shards and BigQuery shards, got {len(sp)}/{len(bq)}")
-    qdb = {q["instance_id"]: q["db"] for q in map(json.loads, open(args.questions))}
+    qdb = {q["instance_id"]: q["db"] for q in map(json.loads, open(args.questions))} if sp else {}
     pools = {}
     for f in sp + bq:
         for line in open(f):
@@ -241,6 +243,14 @@ def build(args):
                         "stratum": s, "ncorr": ncorr, "groups": groups, "sig": signature(it),
                         "contains": it.get("contains", [])}
     evalset = {"pools": pools}
+    if not sp:  # BigQuery only: no Spider2 halves to balance
+        Path(args.out).write_text(json.dumps(evalset, indent=1))
+        cnt = defaultdict(int)
+        for e in pools.values():
+            cnt[e["stratum"]] += 1
+        print(f"wrote {args.out}: {len(pools)} BigQuery pools | "
+              + " ".join(f"{s} {cnt[s]}" for s in ("contested", "easy", "all_correct", "no_correct")))
+        return
     # baseline outcomes (thinking judge, run 1 and rerun) to balance the halves
     runs = {}
     for name, g in (("think", [f"{args.pools}/{args.ref_prefix}_*_n12_s*.jsonl"]),
@@ -455,7 +465,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
-    b.add_argument("--pools", required=True, help="Spider2 results/pools dir")
+    b.add_argument("--pools", help="Spider2 results/pools dir (left out: a BigQuery-only eval set)")
     b.add_argument("--bq-pools", required=True, help="bq_passk/pools dir")
     b.add_argument("--ref-prefix", default="think35/qwen36-35b-think")
     b.add_argument("--rerun-prefix", default="think35_rerun/qwen36-35b-think-rerun")

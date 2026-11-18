@@ -4,13 +4,17 @@
 # each $Q/<n>_<name>.args file holds rejudge_pools.py arguments (variants, --select, --samples,
 # --out-dir). An arm is marked .done when it finishes with no failed calls left; failed calls are
 # retried on the next pass. With every arm done the session waits for new arm files and exits
-# when $Q/STOP exists. All arms resume, so a requeued or restarted session just continues.
+# when $Q/STOP exists. All arms resume, so a requeued or restarted session just continues. Copies
+# of a session are matched by job name, so sessions with their own --job-name (one per queue) leave
+# each other alone.
 #
 #   sbatch ~/slurm/judge_variants.slurm                                                (lilab)
 #   sbatch --partition=preempt --qos=preempt_qos --constraint='A6000|6000Ada|L40S|A100_80GB' \
 #       ~/slurm/judge_variants.slurm                                                   (preempt)
 # A preempt copy that starts while a lilab copy runs exits at once; a lilab copy cancels the
 # preempt copies once its servers answer, before it writes anything.
+# EVALSET, BQ_POOLS, BQ_BASE, BQ_QUESTIONS, QUEUE and LOG point a session at another eval set (the
+# full BigQuery pass@4, Nov 17); its arm files then add --bq-ref-prefix and --comparisons.
 #
 #SBATCH --job-name=judge_var
 #SBATCH --partition=lilab
@@ -28,15 +32,19 @@ U=/data/user_data/$USER
 M=$U/nl2sql-databao                     # existing checkout: vLLM venv, Spider2 DBs, benchmark venv
 W=$U/nl2sql-sel                         # pools and results
 B=$U/bq_passk
-Q=$W/results/variants/queue
-LOG=$W/logs/variants
+Q=${QUEUE:-$W/results/variants/queue}
+LOG=${LOG:-$W/logs/variants}
+EV=${EVALSET:-$W/results/variants/selection_evalset.json}
+BQP=${BQ_POOLS:-$B/pools}
+BQB=${BQ_BASE:-$B/bigquery_passk_nov2026}
+BQQ=${BQ_QUESTIONS:-$B/bq_questions.jsonl}
 MODEL=QuantTrio/Qwen3.6-35B-A3B-AWQ
 export HF_HOME=$U/.cache/huggingface VLLM_MLA_DISABLE=1 NL2SQL_DATA_ROOT=$M
 mkdir -p "$Q" "$LOG"
 log() { echo "[$(date -Is)] $*"; }
 log "node=$(hostname) job=$SLURM_JOB_ID partition=$SLURM_JOB_PARTITION gpus=${CUDA_VISIBLE_DEVICES:-}"
 if [ "$SLURM_JOB_PARTITION" != lilab ] && \
-        [ -n "$(squeue -h -u "$USER" -n judge_var -p lilab -t RUNNING -o %i)" ]; then
+        [ -n "$(squeue -h -u "$USER" -n "$SLURM_JOB_NAME" -p lilab -t RUNNING -o %i)" ]; then
     log "a lilab session is running; exiting"; exit 0
 fi
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
@@ -61,7 +69,7 @@ done
 curl -sf localhost:8765/v1/models >/dev/null && curl -sf localhost:8766/v1/models >/dev/null || { log "vLLM not up after 40 min"; exit 1; }
 log "both servers up"
 if [ "$SLURM_JOB_PARTITION" = lilab ]; then
-    scancel -u "$USER" -n judge_var -p preempt && log "cancelled any preempt session"
+    scancel -u "$USER" -n "$SLURM_JOB_NAME" -p preempt && log "cancelled any preempt session"
     sleep 30
 fi
 printf 'job=%s\nnode=%s\nendpoints=http://%s:8765/v1,http://%s:8766/v1\nstarted=%s\n' \
@@ -77,15 +85,15 @@ while true; do
         name=$(basename "$f" .args)
         log "arm $name: start"
         # shellcheck disable=SC2046
-        "$PY" scripts/rejudge_pools.py $(cat "$f") --evalset "$W/results/variants/selection_evalset.json" \
-            --pools "$W/results/pools" --bq-pools "$B/pools" --bq-base "$B/bigquery_passk_nov2026" \
-            --bq-questions "$B/bq_questions.jsonl" --judge-model "$MODEL" \
+        "$PY" scripts/rejudge_pools.py $(cat "$f") --evalset "$EV" \
+            --pools "$W/results/pools" --bq-pools "$BQP" --bq-base "$BQB" \
+            --bq-questions "$BQQ" --judge-model "$MODEL" \
             --judge-endpoint http://localhost:8765/v1,http://localhost:8766/v1 --resume \
             >> "$LOG/$name.log" 2>&1
         rc=$?
-        left=$("$PY" scripts/rejudge_pools.py $(cat "$f") --evalset "$W/results/variants/selection_evalset.json" \
-            --pools "$W/results/pools" --bq-pools "$B/pools" --bq-base "$B/bigquery_passk_nov2026" \
-            --bq-questions "$B/bq_questions.jsonl" --judge-model "$MODEL" \
+        left=$("$PY" scripts/rejudge_pools.py $(cat "$f") --evalset "$EV" \
+            --pools "$W/results/pools" --bq-pools "$BQP" --bq-base "$BQB" \
+            --bq-questions "$BQQ" --judge-model "$MODEL" \
             --judge-endpoint http://localhost:8765/v1 --resume --count-only 2>/dev/null)
         log "arm $name: exit $rc, calls left: ${left:-?}"
         [ "$rc" = 0 ] && [ "${left:-1}" = 0 ] && touch "$f.done"
@@ -100,7 +108,7 @@ while true; do
     if [ $pending = 0 ]; then
         if [ -e "$Q/STOP" ]; then
             log "queue empty and STOP set; exiting"
-            scancel -u "$USER" -n judge_var -t PENDING   # copies still queued on the other partition
+            scancel -u "$USER" -n "$SLURM_JOB_NAME" -t PENDING   # copies of this session still queued
             exit 0
         fi
         sleep 300

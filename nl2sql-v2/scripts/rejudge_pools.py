@@ -13,9 +13,22 @@ completion tokens and truncation are kept. Calls are interleaved sample-major ac
 variant with the same number of samples.
 
 Output: <out-dir>/calls_<variant>.jsonl, one JSON line per call (resumable): key, first, second,
-sample, variant, verdict, p_first, reason, reasoning, completion_tokens, truncated, error, retry.
-A reply without a valid verdict (no JSON, truncated reasoning, bad request) is final and counts as
-a missing verdict, as in the reference runs; only server failures (retry=true) are made again.
+sample, variant, verdict, p_first, reason, reasoning, completion_tokens, truncated, error, retry,
+timeouts, loose_json. A reply without a valid verdict (no JSON, truncated reasoning, bad request) is final and
+counts as a missing verdict, as in the reference runs; only server failures (retry=true) are made again.
+JSON that does not parse but names the winner plainly is read from its last "winner" field and marked
+loose_json (GLM-4.7-Flash can leave the reason unquoted; the Qwen arms had 0-3 such replies in 6984).
+A slow request is not given up (--timeout, 4 h): its retry would be a fresh draw, so giving up on slow
+ones keeps short reasoning over long. With 1800 s, 10-40% of JEV-27B System 2 draws were redrawn (Nov 15).
+
+Other model families turn thinking on their own way: --chat-template-kwargs '{}' sends no
+enable_thinking (vLLM's mistral tokenizer mode), and --system-prompt-file sends a system message
+first (Magistral's reasoning prompt, SYSTEM_PROMPT.txt in its repo).
+
+With --jev-dir the judge is a JEV checkpoint's System 1 decision (judge_pairs.JevJudge, --judge-model
+jev-decision) instead: variant jev is judge_pools.py's jev_choice state, jev_cmp the same state with
+the result comparison appended under diff_cmp's heading. The decision is deterministic, so one call
+per ordered pair whatever --samples says.
 
 Usage (on Babel, from nl2sql-v2/):
     python scripts/rejudge_pools.py --evalset selection_evalset.json --variants base,colrule \\
@@ -40,9 +53,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from select_answer import PAIRWISE_PROMPT, winner_prob
-from judge_prompts import VARIANTS
+from judge_prompts import COMPARISON, VARIANTS
 
-BQ_LANES = ["2_retry_1", "2_retry_2", "2_retry_3", "2_retry_4", "1_greedy_run_R"]
+JEV_VARIANTS = ("jev", "jev_cmp")
+JEV_QUESTION = "Which candidate SQL query correctly answers the database question?"  # as judge_pools.py
 
 
 def load_reference(pools_dir, prefix, bq_dir, bq_prefix):
@@ -57,25 +71,30 @@ def load_reference(pools_dir, prefix, bq_dir, bq_prefix):
 
 
 class Contexts:
-    """(question text, doc_section, schema_section) per pool, built as the reference runs built them."""
+    """(question text, doc_section, schema_section) per pool, built as the reference runs built them.
+    A variant's "context" options (judge_prompts.VARIANTS) change the BigQuery cuts: doc_chars (8000) and
+    schema_chars (40000); dc_full lifts both, so the judge sees the doc and schema the agent saw."""
 
     def __init__(self, args):
         self.args, self.cache, self.dbs = args, {}, {}
         self.qmeta = self.bqmeta = None
 
-    def get(self, key, it):
+    def get(self, key, it, opts=None):
         iid = it["instance_id"]
-        if iid in self.cache:
-            return self.cache[iid]
+        opts = opts or {}
+        ck = (iid, opts.get("doc_chars", 8000), opts.get("schema_chars", 40000))
+        if ck in self.cache:
+            return self.cache[ck]
         if key.startswith("bq:"):
+            from bq_judge_pools import lanes_of
             if self.bqmeta is None:
                 self.bqmeta = {q["instance_id"]: q for q in map(json.loads, open(self.args.bq_questions))}
             q = self.bqmeta[iid]
-            doc = ("\nReference documentation:\n" + q["doc"][:8000] + "\n") if q.get("doc") else ""
+            doc = ("\nReference documentation:\n" + q["doc"][:ck[1]] + "\n") if q.get("doc") else ""
             rep = it["groups"][0]["rep_lane"]  # bq_judge_pools.py: the schema of group 0's representative lane
-            tr = json.load(open(Path(self.args.bq_base) / BQ_LANES[rep] / "traces" / f"{iid}.json"))
+            tr = json.load(open(Path(self.args.bq_base) / lanes_of(self.args.bq_base)[rep] / "traces" / f"{iid}.json"))
             m = re.search(r"Full database schema.*?(?=\n## Expected output shape|\Z)", tr.get("system", ""), re.S)
-            schema = "\n" + (m.group(0) if m else "")[:40000] + "\n"
+            schema = "\n" + (m.group(0) if m else "")[:ck[2]] + "\n"
         else:
             from nl2sql.config import QUESTIONS_FILE, SQLITE_DIR
             from nl2sql.db import Database
@@ -85,9 +104,9 @@ class Contexts:
             q = self.qmeta[iid]
             if q["db"] not in self.dbs:
                 self.dbs[q["db"]] = Database(SQLITE_DIR / f"{q['db']}.sqlite")
-            doc, schema = question_context(q, self.dbs[q["db"]])
-        self.cache[iid] = (q["question"], doc, schema)
-        return self.cache[iid]
+            doc, schema = question_context(q, self.dbs[q["db"]])  # no Spider2 doc reaches 8000 chars
+        self.cache[ck] = (q["question"], doc, schema)
+        return self.cache[ck]
 
 
 def main():
@@ -105,7 +124,13 @@ def main():
     ap.add_argument("--comparisons", help="build_compare_cache.py output, for variants with {comparison}")
     ap.add_argument("--judge-endpoint", required=True, help="comma-separated; calls are spread over them")
     ap.add_argument("--judge-model", required=True)
+    ap.add_argument("--jev-dir", help="local autotrust/JEV-* snapshot: judge with its System 1 decision "
+                                      "(variants jev, jev_cmp)")
     ap.add_argument("--max-tokens", type=int, default=8192)
+    ap.add_argument("--timeout", type=float, default=14400, help="seconds per request (see the docstring)")
+    ap.add_argument("--chat-template-kwargs", default='{"enable_thinking": true}',
+                    help="JSON sent as chat_template_kwargs; {} sends none")
+    ap.add_argument("--system-prompt-file", help="a system message sent before every prompt")
     ap.add_argument("--workers", type=int, default=96)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--resume", action="store_true")
@@ -115,9 +140,12 @@ def main():
     args = ap.parse_args()
 
     variants = args.variants.split(",")
+    known = JEV_VARIANTS if args.jev_dir else tuple(VARIANTS)
     for v in variants:
-        if v not in VARIANTS:
-            raise SystemExit(f"unknown variant {v}; known: {', '.join(VARIANTS)}")
+        if v not in known:
+            raise SystemExit(f"unknown variant {v}; known: {', '.join(known)}")
+    if args.jev_dir:
+        args.samples = 1
     ev = json.loads(Path(args.evalset).read_text())["pools"]
     filt = [f.split("=") for f in args.select.split(";") if f]
     keys = sorted(k for k, e in ev.items() if e["stratum"] in ("contested", "easy")
@@ -131,7 +159,7 @@ def main():
             raise SystemExit(f"{k}: reference pool differs from the eval set")
     ctx = Contexts(args)
     comps = {}
-    if any("{comparison}" in VARIANTS[v]["template"] for v in variants):
+    if any(v == "jev_cmp" or "{comparison}" in VARIANTS.get(v, {"template": ""})["template"] for v in variants):
         if not args.comparisons:
             raise SystemExit("a variant needs --comparisons")
         for r in map(json.loads, open(args.comparisons)):
@@ -139,8 +167,16 @@ def main():
 
     def prompt_for(variant, key, a, b):
         it = ref[key]
-        question, doc, schema = ctx.get(key, it)
+        question, doc, schema = ctx.get(key, it, VARIANTS.get(variant, {}).get("context"))
         ga, gb = it["groups"][a], it["groups"][b]
+        if variant in JEV_VARIANTS:  # the decision state, not a prompt
+            from judge_pairs import jev_state
+            state = jev_state({"question": question}, doc, schema,
+                              [(ga["sql"], ga["preview"]), (gb["sql"], gb["preview"])])
+            if variant == "jev_cmp":
+                state += "\n\n" + COMPARISON.format(
+                    comparison=comps.get((key, a, b), "Comparison unavailable.")).strip()
+            return state
         spec = VARIANTS[variant]
         fields = dict(question=question, doc_section=doc, schema_section=schema,
                       sql_a=ga["sql"], res_a=ga["preview"], sql_b=gb["sql"], res_b=gb["preview"])
@@ -182,37 +218,60 @@ def main():
     print(f"{len(keys)} pools, {len(pairs)} ordered pairs, {len(variants)} variants x {args.samples} samples: "
           f"{len(tasks)} calls to make", flush=True)
     # build every question's context up front (DB schema reads are not thread-safe)
-    for k in {t[1] for t in tasks}:
-        ctx.get(k, ref[k])
+    for v, k in {(t[0], t[1]) for t in tasks}:
+        ctx.get(k, ref[k], VARIANTS.get(v, {}).get("context"))
 
     import openai
     clients = []
     for e in args.judge_endpoint.split(","):  # a port taken by someone else's server must not take calls
-        c = openai.OpenAI(base_url=e, api_key="EMPTY", timeout=1800, max_retries=0)
+        c = openai.OpenAI(base_url=e, api_key="EMPTY", timeout=args.timeout, max_retries=0)
         try:
             served = [m.id for m in c.models.list().data]
         except Exception as ex:
             print(f"{e}: not answering ({str(ex)[:80]})", flush=True)
             continue
         if args.judge_model in served:
+            if args.jev_dir:
+                from judge_pairs import JevJudge
+                c = JevJudge(e, args.jev_dir, 40000)
             clients.append(c)
         else:
             print(f"{e}: serves {served}, not {args.judge_model}; skipped", flush=True)
     if not clients:
         raise SystemExit("no endpoint serves the judge model")
+    ctk = json.loads(args.chat_template_kwargs)
+    system = [{"role": "system", "content": Path(args.system_prompt_file).read_text()}] if args.system_prompt_file else []
 
-    def request(i, prompt):
-        """The completion; moves to the next server on connection errors or 5xx, waits up to 2h when all are down."""
+    def request(i, prompt, rec):
+        """The completion; moves to the next server on connection errors or 5xx, waits up to 2h when all are down.
+        Timeouts are counted in rec, since each one replaces a slow draw with a fresh one."""
         deadline = time.time() + 7200
         while True:
             for j in range(len(clients)):
                 client = clients[(i + j) % len(clients)]
                 try:
                     return client.chat.completions.create(
-                        model=args.judge_model, messages=[{"role": "user", "content": prompt}],
+                        model=args.judge_model, messages=system + [{"role": "user", "content": prompt}],
                         temperature=0.6, max_tokens=args.max_tokens, logprobs=True, top_logprobs=5,
-                        extra_body={"chat_template_kwargs": {"enable_thinking": True}})
-                except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError):
+                        extra_body={"chat_template_kwargs": ctk} if ctk else None)
+                except openai.APITimeoutError:  # a subclass of APIConnectionError
+                    rec["timeouts"] += 1
+                except (openai.APIConnectionError, openai.InternalServerError):
+                    continue
+            if time.time() > deadline:
+                raise RuntimeError("all judge servers down for 2h")
+            time.sleep(60)
+
+    def decide(i, state):
+        """JEV's [P(A), P(B)]; moves to the next server on connection errors, waits up to 2h when all are down."""
+        import httpx
+        deadline = time.time() + 7200
+        while True:
+            for j in range(len(clients)):
+                try:
+                    return clients[(i + j) % len(clients)].decide("choice", state, JEV_QUESTION,
+                                                                  ["Candidate A", "Candidate B"])
+                except httpx.TransportError:
                     continue
             if time.time() > deadline:
                 raise RuntimeError("all judge servers down for 2h")
@@ -221,9 +280,13 @@ def main():
     def call(i, v, k, a, b, s):
         rec = {"key": k, "first": a, "second": b, "sample": s, "variant": v, "verdict": None, "p_first": None,
                "reason": "", "reasoning": "", "completion_tokens": None, "truncated": False, "error": "",
-               "retry": False}
+               "retry": False, "timeouts": 0}
         try:
-            resp = request(i, prompt_for(v, k, a, b))
+            if args.jev_dir:
+                p = decide(i, prompt_for(v, k, a, b))
+                rec.update(verdict="AB"[p[1] > p[0]], p_first=p[0])
+                return rec
+            resp = request(i, prompt_for(v, k, a, b), rec)
             ch = resp.choices[0]
             extra = ch.message.model_dump()
             rec["reasoning"] = (getattr(ch.message, "reasoning", None) or extra.get("reasoning")
@@ -234,7 +297,14 @@ def main():
             m = re.search(r"\{.*\}", text, re.DOTALL)
             if not m:
                 raise ValueError(f"no JSON in reply: {text[-120:]!r}")
-            data = json.loads(m.group(0))
+            try:
+                data = json.loads(m.group(0))
+            except ValueError:  # see the docstring: the winner may still be plain
+                w = re.findall(r'"winner"\s*:\s*"?([ABab])"?\s*[,}]', m.group(0))
+                if not w:
+                    raise
+                data = {"winner": w[-1], "reason": m.group(0)}
+                rec["loose_json"] = True
             verdict = str(data.get("winner", "")).strip().upper()
             if verdict not in ("A", "B"):
                 raise ValueError(f"invalid verdict {verdict!r}")

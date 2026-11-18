@@ -27,8 +27,15 @@ expert MLP. Routed experts, the router and the vision tower stay frozen and unto
   choice_reason  dpo.jsonl rows: the letter is read after the judge's own reasoning (thinking on,
        '<think>' + reasoning + '</think>' + '{"winner": "'), once after the right and once after the
        wrong sample of the same prompt, and must be the correct letter both times; plus --weight x
-       the next-token loss on the right sample's reasoning. Served as a separate scorer that reads a
-       base judge's reasoning (prefill only), so the reasoning itself is never changed
+       the next-token loss on the right sample's reasoning (generation), and --vec-weight x a
+       contrastive loss on the reasoning vector (the hidden state at '</think>'; a linear head,
+       saved as vec_head.pt, must score the right sample above the wrong one). Served as a separate
+       scorer that reads a base judge's reasoning (prefill only), so the reasoning itself is never
+       changed
+
+Every choice-type stage first runs forward_check (finite, non-zero states; the two letters hold the
+next-token probability; a repeat matches; for choice_reason, the untrained judge's own letter comes
+back) and stops mid-training on non-finite or all-zero states.
 
 Checkpoints every --save-steps; a rerun with the same --out resumes from the latest, so
 a preempted job just requeues. The finished adapter is written to <out>/final (for dpo,
@@ -203,8 +210,12 @@ def mt_rows(tok, choice, sft, max_length):
 
 def reason_rows(tok, rows, max_length):
     """choice_reason rows from dpo.jsonl: one right and one wrong reasoning sample of the same prompt,
-    each rendered by thinking_text; label = the correct letter (0 = A, 1 = B)."""
+    each rendered by thinking_text; label = the correct letter (0 = A, 1 = B); *_think_end = the
+    position of the sample's '</think>' token, where the vector loss reads the reasoning."""
     out, letter_ids, too_long = [], None, 0
+    think_end = tok.convert_tokens_to_ids("</think>")
+    if tok.tokenize("</think>") != ["</think>"]:
+        raise SystemExit("'</think>' is not one token: the vector loss has no position to read")
     for r in rows:
         seqs = []
         for side in ("chosen", "rejected"):
@@ -212,11 +223,14 @@ def reason_rows(tok, rows, max_length):
             if letter_ids is None:
                 letter_ids = letter_ids_after(tok, text)
                 print("choice_reason: text ends", repr(text[-60:]), "letter ids", letter_ids)
-            seqs.append((tok(text, add_special_tokens=False).input_ids, len(tok(gen, add_special_tokens=False).input_ids)))
+            ids = tok(text, add_special_tokens=False).input_ids
+            seqs.append((ids, len(tok(gen, add_special_tokens=False).input_ids),
+                         len(ids) - 1 - ids[::-1].index(think_end)))
         if max(len(s[0]) for s in seqs) > max_length:
             too_long += 1
             continue
-        out.append({"right_ids": seqs[0][0], "right_n_prompt": seqs[0][1], "wrong_ids": seqs[1][0],
+        out.append({"right_ids": seqs[0][0], "right_n_prompt": seqs[0][1], "right_think_end": seqs[0][2],
+                    "wrong_ids": seqs[1][0], "wrong_think_end": seqs[1][2],
                     "label": "AB".index(r["correct_letter"])})
     print(f"choice_reason: {len(rows)} rows, {len(out)} within {max_length} tokens ({too_long} dropped)")
     return out, letter_ids
@@ -231,15 +245,65 @@ def nll(logits, targets):
     return tot / max(1, n)
 
 
-def two_loss_trainer(model, cfg, ds, letter_ids, stage, weight):
+def states(model, ids):
+    """Final hidden states [L, D] of one sequence and the output head, from the inner model (no
+    logits_to_keep): the pick, next-token and vector losses all read this one forward pass."""
+    import torch
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    out = base.model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False)
+    return out[0][0], base.lm_head
+
+
+STATE_LIMIT, LOGIT_LIMIT = 1e4, 200.0  # far above a working model's (final states under ~60, logits ~50)
+
+
+def assert_healthy(x, where, limit):
+    """Stop on the broken-forward signatures (Nov 13): non-finite values, a row of hidden states (or of
+    logits computed from them) that is exactly zero, or values beyond limit (a letter-logit gap of 755
+    was seen); a working model produces none of them."""
+    import torch
+    if not bool(torch.isfinite(x).all()) or bool((x.abs().sum(-1) == 0).any()) or float(x.abs().max()) > limit:
+        raise RuntimeError(f"broken forward pass: non-finite, all-zero or out-of-range values "
+                           f"({where}; max |x| {float(x.abs().max()):.3g})")
+
+
+def forward_check(model, seqs, letter_ids, labels=None, min_mass=0.5):
+    """Sanity check before training, on the path the losses read (states): on up to 8 rows the
+    hidden states are healthy, the two letters hold at least min_mass of the next-token probability
+    (the untrained judge always writes one of them there), and a repeat of the first row gives the
+    same letter log-probabilities. With labels (choice_reason: the correct letter, which the untrained
+    judge wrote after the right sample's reasoning) all but one row must match. A trained adapter is
+    checked with min_mass=0: its 2-way letter loss leaves the rest of the vocabulary free."""
+    import torch
+    dev = model.get_input_embeddings().weight.device
+    n, logp, mass = min(8, len(seqs)), [], []
+    with torch.no_grad():
+        for i in list(range(n)) + [0]:  # the first row again: a repeat must give the same answer
+            h, head = states(model, torch.tensor([seqs[i]], device=dev))
+            assert_healthy(h, f"forward check row {i}", STATE_LIMIT)
+            p = head(h[-1:]).float()[0].softmax(-1)[letter_ids]
+            logp.append(p.log().cpu())
+            mass.append(float(p.sum()))
+    repeat = float((logp[-1] - logp[0]).abs().max())
+    agree = None if labels is None else sum(int(lp.argmax().item() == l) for lp, l in zip(logp[:n], labels))
+    print(f"forward check on {n} rows: letter mass min {min(mass):.3f}, repeat max|diff| {repeat:.3g}"
+          + ("" if agree is None else f", the labelled letter on {agree}/{n}"), flush=True)
+    if min(mass) < min_mass or repeat > 0.5 or (agree is not None and agree < n - 1):
+        raise SystemExit("forward check failed: the forward pass does not reproduce the judge")
+
+
+def two_loss_trainer(model, cfg, ds, letter_ids, stage, weight, vec_weight=0.0):
     """choice_mt: 2-way letter cross-entropy on choice rows; weight x next-token loss on sft rows.
     choice_reason: letter cross-entropy after the right and after the wrong reasoning sample (the
-    pick must be correct either way), plus weight x next-token loss on the right sample's reasoning."""
+    pick must be correct either way), plus weight x next-token loss on the right sample's reasoning
+    (generation), plus vec_weight x a contrastive loss on a reasoning vector: model.vec_head reads the
+    hidden state at '</think>' and must score the right sample above the wrong one,
+    -log sigmoid(s_right - s_wrong)."""
     import torch
     from transformers import Trainer
 
     class TwoLossTrainer(Trainer):
-        hits, pick_l, reason_l = [], [], []
+        hits, pick_l, reason_l, vec_l, vec_hits = [], [], [], [], []
 
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
@@ -252,37 +316,61 @@ def two_loss_trainer(model, cfg, ds, letter_ids, stage, weight):
                 ids = inputs["input_ids"]
                 if inputs["kind"] == "choice":
                     two = tail_logits(model, ids, 1)[-1, letter_ids].float()[None]
+                    assert_healthy(two, "choice row", LOGIT_LIMIT)
                     loss = torch.nn.functional.cross_entropy(two, label.to(two.device))
                     TwoLossTrainer.hits.append(int(two.argmax(-1).item() == label.item()))
-                    TwoLossTrainer.pick_l.append(float(loss))
+                    TwoLossTrainer.pick_l.append(loss.item())
                 else:
                     n0 = int(inputs["n_prompt"])
                     lg = tail_logits(model, ids, ids.shape[1] - n0 + 1)[:-1]
+                    assert_healthy(lg, "sft row", LOGIT_LIMIT)
                     loss = weight * nll(lg, ids[0, n0:].to(lg.device))
-                    TwoLossTrainer.reason_l.append(float(loss) / weight)
+                    TwoLossTrainer.reason_l.append(loss.item() / weight)
                 return loss
-            # choice_reason
+            # choice_reason: one forward per sample; every loss reads its final hidden states
             r_ids, w_ids, n0 = inputs["right_ids"], inputs["wrong_ids"], int(inputs["right_n_prompt"])
-            lr = tail_logits(model, r_ids, r_ids.shape[1] - n0 + 1)
-            two_r = lr[-1, letter_ids].float()[None]
-            two_w = tail_logits(model, w_ids, 1)[-1, letter_ids].float()[None]
+            h_r, head = states(model, r_ids)
+            h_w, _ = states(model, w_ids)
+            assert_healthy(h_r, "right sample", STATE_LIMIT)
+            assert_healthy(h_w, "wrong sample", STATE_LIMIT)
+            two_r = head(h_r[-1:]).float()[:, letter_ids]
+            two_w = head(h_w[-1:]).float()[:, letter_ids].to(two_r.device)
+            assert_healthy(torch.cat([two_r, two_w]), "letter logits", LOGIT_LIMIT)
             lab = label.to(two_r.device)
             pick = 0.5 * (torch.nn.functional.cross_entropy(two_r, lab)
-                          + torch.nn.functional.cross_entropy(two_w.to(two_r.device), lab))
-            reason = nll(lr[:-1], r_ids[0, n0:].to(lr.device))
+                          + torch.nn.functional.cross_entropy(two_w, lab))
+            loss = pick
             TwoLossTrainer.hits += [int(two_r.argmax(-1).item() == lab.item()),
                                     int(two_w.argmax(-1).item() == lab.item())]
-            TwoLossTrainer.pick_l.append(float(pick))
-            TwoLossTrainer.reason_l.append(float(reason))
-            return pick + weight * reason
+            TwoLossTrainer.pick_l.append(pick.item())
+            if weight > 0:  # generation: next-token loss on the right sample's reasoning
+                lg = head(h_r[n0 - 1:-1])  # on lm_head's GPU, not the last layer's
+                reason = nll(lg, r_ids[0, n0:].to(lg.device))
+                loss = loss + weight * reason.to(loss.device)
+                TwoLossTrainer.reason_l.append(reason.item())
+            if vec_weight > 0:  # vector: contrastive score of the reasoning at '</think>'
+                vh = model.vec_head
+                s_r = vh(h_r[int(inputs["right_think_end"])].to(vh.weight.device, vh.weight.dtype)).float()
+                s_w = vh(h_w[int(inputs["wrong_think_end"])].to(vh.weight.device, vh.weight.dtype)).float()
+                vec = torch.nn.functional.softplus(-(s_r - s_w)).squeeze()
+                loss = loss + vec_weight * vec.to(loss.device)
+                TwoLossTrainer.vec_l.append(vec.item())
+                TwoLossTrainer.vec_hits.append(int(float(s_r) > float(s_w)))
+            return loss
+
+        def _save(self, output_dir=None, state_dict=None):
+            super()._save(output_dir, state_dict)
+            if vec_weight > 0:  # Trainer saves only the adapter; the contrastive head goes beside it
+                torch.save(self.model.vec_head.state_dict(), Path(output_dir or self.args.output_dir) / "vec_head.pt")
 
         def log(self, logs, *a, **k):
             if "loss" in logs:
                 for name, vals in (("pick_acc", TwoLossTrainer.hits), ("pick_loss", TwoLossTrainer.pick_l),
-                                   ("reason_nll", TwoLossTrainer.reason_l)):
+                                   ("reason_nll", TwoLossTrainer.reason_l), ("vec_loss", TwoLossTrainer.vec_l),
+                                   ("vec_acc", TwoLossTrainer.vec_hits)):
                     if vals:
                         logs[name] = round(sum(vals) / len(vals), 4)
-                TwoLossTrainer.hits, TwoLossTrainer.pick_l, TwoLossTrainer.reason_l = [], [], []
+                        vals.clear()
             super().log(logs, *a, **k)
 
     def collate(batch):
@@ -293,7 +381,8 @@ def two_loss_trainer(model, cfg, ds, letter_ids, stage, weight):
             return {"input_ids": torch.tensor([b["input_ids"]]), "labels": torch.tensor([b["label"]]),
                     "kind": b["kind"], "n_prompt": b.get("n_prompt", 0)}
         return {"right_ids": torch.tensor([b["right_ids"]]), "wrong_ids": torch.tensor([b["wrong_ids"]]),
-                "right_n_prompt": b["right_n_prompt"], "labels": torch.tensor([b["label"]])}
+                "right_n_prompt": b["right_n_prompt"], "right_think_end": b["right_think_end"],
+                "wrong_think_end": b["wrong_think_end"], "labels": torch.tensor([b["label"]])}
 
     return TwoLossTrainer(model=model, args=cfg, train_dataset=ds, data_collator=collate)
 
@@ -347,6 +436,7 @@ def choice_trainer(model, cfg, ds, letter_ids):
             except TypeError:  # forward without logits_to_keep
                 logits = model(**kw).logits[:, -1]
             two = logits[:, letter_ids].float()
+            assert_healthy(two, "choice row", LOGIT_LIMIT)
             labels = inputs["labels"].to(two.device)
             loss = torch.nn.functional.cross_entropy(two, labels)
             ChoiceTrainer.hits += (two.argmax(-1) == labels).tolist()
@@ -374,6 +464,8 @@ def main():
     ap.add_argument("--sft-data", help="choice_mt: sft.jsonl (the judge's own right reasoning)")
     ap.add_argument("--weight", type=float, default=0.25,
                     help="choice_mt / choice_reason: weight of the next-token loss on reasoning")
+    ap.add_argument("--vec-weight", type=float, default=0.0,
+                    help="choice_reason: weight of the contrastive loss on the reasoning vector at '</think>'")
     ap.add_argument("--out", required=True)
     ap.add_argument("--base", default=BASE)
     ap.add_argument("--init", help="dpo: the SFT adapter to start from (and to use as reference); "
@@ -426,6 +518,9 @@ def main():
         print(f"{args.stage}: {len(rows)} rows, {len(kept)} within {args.max_length} tokens")
     ds = Dataset.from_list(kept)
 
+    if torch.cuda.is_available():
+        from gpu_preflight import gpu_preflight
+        gpu_preflight()
     model = AutoModelForImageTextToText.from_pretrained(
         args.base, dtype=torch.bfloat16, device_map=device_map(args.base), experts_implementation=args.experts)
     model.config.use_cache = False
@@ -451,21 +546,19 @@ def main():
         trl_only = ("max_length", "router_aux_loss_coef")
         cfg = TrainingArguments(learning_rate=args.lr or 1e-4, remove_unused_columns=False,
                                 **{k: v for k, v in common.items() if k not in trl_only})
+        if args.stage == "choice_reason" and args.vec_weight > 0:
+            # the reasoning vector's scorer; zero weights, so the contrastive loss starts at exactly log 2
+            # (a bias would cancel in s_right - s_wrong)
+            emb = model.get_output_embeddings().weight
+            model.vec_head = torch.nn.Linear(emb.shape[1], 1, bias=False).to(emb.device, torch.float32)
+            torch.nn.init.zeros_(model.vec_head.weight)
         trainer = (choice_trainer(model, cfg, ds, letter_ids) if args.stage == "choice"
-                   else two_loss_trainer(model, cfg, ds, letter_ids, args.stage, args.weight))
+                   else two_loss_trainer(model, cfg, ds, letter_ids, args.stage, args.weight, args.vec_weight))
+        # the adapter starts at zero, so this checks the untrained judge (and the forward pass itself)
         if args.stage == "choice_reason":
-            # identity check before training: after the right sample's reasoning the untrained judge
-            # writes the correct letter (that is what the sample concluded); a broken forward does not
-            dev = model.get_input_embeddings().weight.device
-            agree = 0
-            with torch.no_grad():
-                for r in kept[:8]:
-                    x = torch.tensor([r["right_ids"]], device=dev)
-                    two = tail_logits(model, x, 1)[-1, letter_ids]
-                    agree += int(two.argmax().item() == r["label"])
-            print(f"identity check: correct letter after the right reasoning on {agree}/8", flush=True)
-            if agree < 7:
-                raise SystemExit("identity check failed: the forward pass does not reproduce the judge")
+            forward_check(model, [r["right_ids"] for r in kept], letter_ids, [r["label"] for r in kept])
+        else:
+            forward_check(model, [r["input_ids"] for r in kept if r.get("kind", "choice") == "choice"], letter_ids)
     elif args.stage == "sft":
         from trl import SFTConfig, SFTTrainer
         model = get_peft_model(model, LoraConfig(
@@ -510,12 +603,18 @@ def main():
         if res.unexpected_keys:
             raise SystemExit(f"checkpoint adapter does not fit the model: {res.unexpected_keys[:3]}")
         print(f"restored {len(state)} adapter tensors")
+    vec = args.stage == "choice_reason" and args.vec_weight > 0
+    if last and vec:  # Trainer restores the adapter and the optimizer, not the head's weights
+        model.vec_head.load_state_dict(torch.load(f"{last}/vec_head.pt"))
+        print("restored the contrastive head")
     trainer.train(resume_from_checkpoint=last)
     print("peak GiB per GPU:", [round(torch.cuda.max_memory_allocated(i) / 2**30, 1)
                                 for i in range(torch.cuda.device_count())])
     final = out / "final"
     if args.stage in ("sft", "choice", "choice_mt", "choice_reason"):
         trainer.model.save_pretrained(str(final))
+        if vec:
+            torch.save(model.vec_head.state_dict(), final / "vec_head.pt")
     else:
         trainer.model.save_pretrained(str(out / "dpo_only"))
         if args.init:

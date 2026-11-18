@@ -5,7 +5,8 @@ on practice training databases only and scored once on the held-out practice set
 
 - Data: practice traces, other_reading pairs dropped. Training = split "train" on databases outside
   holdout.json; held-out = split "heldout" (the val split) or a holdout.json database.
-- Configurations: every (layer, position) of the shards, each with the verdict letter as a covariate.
+- Configurations: every (layer, position) of the shards, each with the verdict letter and the
+  presentation order (the higher-numbered candidate shown first) as covariates.
   Features are standardized inside each fold. C is chosen per configuration by leave-one-database-out
   cross-validation on log loss with the one-SE rule (the largest penalty within one SE of the best);
   the configuration with the lowest cross-validated log loss is frozen.
@@ -13,10 +14,14 @@ on practice training databases only and scored once on the held-out practice set
 - Gate A, on the held-out mixed ordered pairs: within-pair AUROC (right vs wrong traces of the same
   ordered pair) >= 0.65 and >= baseline + 0.05 with the database-bootstrap interval of the
   difference above 0 (4,000 reps, seed 0).
+- Stage B step 2 (--frozen LAYER/POSITION:C, on the diff_cmp judgments): no configuration search; the
+  frozen probe is refit on the training databases, the baseline is chosen as above, and Gate A is
+  checked once more. <out>.probe.npz keeps the fitted probe (standardization, coefficients) for
+  the Spider2 evaluation.
 Nothing from Spider2 or BigQuery is read. The held-out report is written once; --force reruns it.
 
     python scripts/probe_fit.py --states <dir> [<dir>] --practice <dir with the verdict and
-        pair_labels files and judge_train_v4/data_v6/holdout.json> --out <report prefix>
+        pair_labels files and judge_train_v4/data_v6/holdout.json> --out <report prefix> [--frozen L20/verdict:0.001]
 """
 
 import argparse
@@ -124,11 +129,14 @@ def db_bootstrap(per_dbs, reps=4000, seed=0):
     return np.array(out)
 
 
-def fit_predict(Xtr, ytr, Xte, C):
+def fit(Xtr, ytr, C):
     from sklearn.linear_model import LogisticRegression
     mu, sd = Xtr.mean(0), Xtr.std(0) + 1e-6
-    m = LogisticRegression(C=C, max_iter=3000)
-    m.fit((Xtr - mu) / sd, ytr)
+    return mu, sd, LogisticRegression(C=C, max_iter=3000).fit((Xtr - mu) / sd, ytr)
+
+
+def fit_predict(Xtr, ytr, Xte, C):
+    mu, sd, m = fit(Xtr, ytr, C)
     return m.predict_proba((Xte - mu) / sd)[:, 1]
 
 
@@ -161,6 +169,7 @@ def main():
     ap.add_argument("--practice", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--frozen", help="LAYER/POSITION:C chosen earlier (Stage B step 2): refit and score, no search")
     args = ap.parse_args()
     out = Path(args.out)
     if Path(f"{out}.heldout.json").exists() and not args.force:
@@ -175,6 +184,7 @@ def main():
     is_held = np.array([rows[i]["split"] == "heldout" or rows[i]["db"] in hold for i in keep])
     y = np.array([float(rows[i]["right"]) for i in keep])
     va = np.array([float(rows[i]["verdict"] == "A") for i in keep])
+    order = np.array([float(rows[i]["first"] > rows[i]["second"]) for i in keep])
     zk = z[keep]
     ident = float(np.mean((zk > 0) == (va == 1)))
     groups = np.array([rows[i]["db"] for i in keep])
@@ -189,16 +199,19 @@ def main():
                             [hedge[(rows[i]["file"], rows[i]["instance_id"], rows[i]["pair"], rows[i]["sample"])]
                              for i in keep]])
     configs = {}
-    for li, lname in enumerate(LAYERS[:feats.shape[1]]):
+    if args.frozen:
+        name, C = args.frozen.rsplit(":", 1)
+        configs[name] = dict(C=float(C), frozen=True)
+    for li, lname in enumerate(LAYERS[:feats.shape[1]] if not args.frozen else []):
         for pi, pname in enumerate(POSITIONS[:feats.shape[2]]):
-            X = np.column_stack([feats[keep, li, pi, :].astype(np.float32), va])
+            X = np.column_stack([feats[keep, li, pi, :].astype(np.float32), va, order])
             C, ll, pred, grid = select(X[tr], y[tr], groups[tr])
             cv_auc = auc_of(within_pair(pred, [rows[i] for i in np.array(keep)[tr]], range(int(tr.sum()))))
             configs[f"{lname}/{pname}"] = dict(C=C, cv_logloss=ll, cv_within_auc=cv_auc, grid=grid)
             print(f"{lname}/{pname}: C={C} cv logloss {ll:.4f} cv within-pair AUROC {cv_auc:.3f}", flush=True)
     bC, bll, bpred, bgrid = select(base[tr], y[tr], groups[tr])
     b_cv_auc = auc_of(within_pair(bpred, [rows[i] for i in np.array(keep)[tr]], range(int(tr.sum()))))
-    chosen = min(configs, key=lambda k: configs[k]["cv_logloss"])
+    chosen = next(iter(configs)) if args.frozen else min(configs, key=lambda k: configs[k]["cv_logloss"])
     sel = dict(n_configs=len(configs), configs=configs, chosen=chosen,
                baseline=dict(C=bC, cv_logloss=bll, cv_within_auc=b_cv_auc, grid=bgrid))
     Path(f"{out}.selection.json").write_text(json.dumps(sel, indent=1))
@@ -207,8 +220,11 @@ def main():
     # held-out evaluation, once
     lname, pname = chosen.split("/")
     li, pi = LAYERS.index(lname), POSITIONS.index(pname)
-    X = np.column_stack([feats[keep, li, pi, :].astype(np.float32), va])
-    p_probe = fit_predict(X[tr], y[tr], X[te], configs[chosen]["C"])
+    X = np.column_stack([feats[keep, li, pi, :].astype(np.float32), va, order])
+    mu, sd, m = fit(X[tr], y[tr], configs[chosen]["C"])
+    p_probe = m.predict_proba((X[te] - mu) / sd)[:, 1]
+    np.savez(f"{out}.probe.npz", mu=mu, sd=sd, coef=m.coef_[0], intercept=m.intercept_, config=chosen,
+             C=configs[chosen]["C"], features="hidden state, verdict letter A, first > second")
     p_base = fit_predict(base[tr], y[tr], base[te], bC)
     te_rows = [rows[i] for i in np.array(keep)[te]]
     wp_probe = within_pair(p_probe, te_rows, range(len(te_rows)))

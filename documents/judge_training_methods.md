@@ -58,17 +58,41 @@ at the position where the letter is written.
 | `sft` | imitate the judge's own right judgments | completion-only next-token NLL over y (reasoning and reply), −Σ log π_θ(y_t \| x, y_<t) / \|y\|; the prompt is masked (TRL SFTTrainer, `completion_only_loss=True`) |
 | `dpo` | prefer the right judgment over a wrong one on the same prompt | −log σ(β [(log π_θ(y_w\|x) − log π_ref(y_w\|x)) − (log π_θ(y_l\|x) − log π_ref(y_l\|x))]), β = 0.1, over the whole judgment (TRL DPOTrainer). Reference: the SFT model (v1) or the base (v2a, v3c) |
 | `choice` | only the pick, thinking off | 2-way cross-entropy on [z_A, z_B] after the thinking-off reply opening `{\n "winner": "`: log(1 + exp(−s · (z_A − z_B))), s = +1 if A is correct, else −1 |
-| `choice_mt` *(planned, C1)* | the pick (thinking off) plus the judge's own right reasoning | choice loss on choice rows + λ × completion NLL on sft rows (thinking on), λ = 0.25 |
-| `choice_reason` *(planned, C2)* | the pick read after the judge's own reasoning | ½ [CE(z \| x, right reasoning) + CE(z \| x, wrong reasoning)] toward the correct letter, + λ × NLL of the right reasoning, λ = 0.25. Input: thinking-on prompt + `<think>` reasoning `</think>` + `{"winner": "` |
+| `choice_mt` *(planned, C1)* | the pick (thinking off) plus the judge's own right reasoning | choice loss on choice rows + λ × completion NLL on sft rows (thinking on), λ = 0.25 (`--weight`) |
+| `choice_reason` *(planned, C2)* | the pick read after the judge's own reasoning, plus optional reasoning losses | **classification:** ½ [CE(z \| x, right reasoning) + CE(z \| x, wrong reasoning)] toward the correct letter; **+ generation:** λ × NLL of the right reasoning (`--weight`); **+ vector:** μ × softplus(−(w · h_right − w · h_wrong)) (`--vec-weight`). Input: thinking-on prompt + `<think>` reasoning `</think>` + `{"winner": "` |
+
+In the vector loss, h is the final hidden state at the `</think>` token of each reasoning sample, and w
+is a linear head (no bias). w starts at zero, so the loss starts at exactly log 2. It is trained with the
+adapter and saved as `vec_head.pt` beside it in every checkpoint. All three losses read one forward pass
+per sample.
 
 Notes:
-- **The letter loss is already a linear head.** z_A − z_B = (W_A − W_B) · h, with h the LoRA-adapted
-  last hidden state. So the `choice` loss is logistic regression on the hidden state, with the head
-  taken from the output embedding. A separate CLS head would add only a free direction and a bias.
-- **What separates the planned arms is the input, not the head.** With A/B verdicts, "is this
-  reasoning right?" and "pick the correct letter after reading it" are the same target. C2 differs
-  from v4 by reading the reasoning, and C1/C2 add a reasoning loss, as GenRM, CLoud, Critic-RM and
-  distilling step-by-step do (judge_results.md §6).
+- **The letter loss is already a linear head.** z_A − z_B = (W_A − W_B) · h at the letter position,
+  with h the LoRA-adapted last hidden state. So the `choice` loss is logistic regression on the hidden
+  state, with the head taken from the output embedding.
+- **The vector loss is a different target.** It compares two reasonings for the same prompt and ranks
+  the right one higher: a verifier of the reasoning, read where the reasoning ends. The letter loss
+  after the wrong reasoning instead asks the model to overrule that reasoning's conclusion.
+- **Reasoning losses as auxiliary tasks.** C1 and C2 add a reasoning loss to the pick, as GenRM, CLoud,
+  Critic-RM and distilling step-by-step do (judge_results.md §6).
+
+### Planned arms (two-loss study)
+
+Every arm keeps the classification loss on the pick. Same data (`judge_train_v4/data`), holdout and
+settings as v4.
+
+| arm | stage and flags | the pick | reasoning loss |
+|---|---|---|---|
+| C0 | `choice` | letter, thinking off | none: this is v4, not re-run (its log shows healthy training) |
+| C1 | `choice_mt --weight 0.25 --epochs 1` | letter, thinking off | generation: NLL of the judge's own right reasoning (1 epoch over 5,417 rows; compare with v4-e1) |
+| C2-0 | `choice_reason --weight 0` | letter after the judge's own reasoning | none |
+| C2-gen | `choice_reason --weight 0.25` | as C2-0 | generation |
+| C2-vec | `choice_reason --weight 0 --vec-weight 1` | as C2-0 | vector (contrastive, at `</think>`) |
+| C2-both | `choice_reason --weight 0.25 --vec-weight 1` | as C2-0 | generation + vector |
+| A | `extract_judge_states.py` + `probe_fit.py` | none (model frozen) | vector only: logistic probe on frozen states ([head_probe_prereg.md](head_probe_prereg.md)) |
+
+C2-0 against C0 measures reading the reasoning. C2-gen, C2-vec and C2-both against C2-0 measure each
+reasoning loss. C2-vec against A measures whether training the model beats a probe on a frozen one.
 
 ## 4. Common settings (`train_judge_lora.py`, `train_judge.slurm`)
 
@@ -84,6 +108,24 @@ Notes:
   - learning rate: 1e-4 for sft and choice, 5e-6 for dpo unless set;
   - epochs: 2 for sft and choice, 1 for dpo unless set;
   - training stops on a non-finite or exploding loss.
+- **Checks in the choice-type stages (from Nov 13):**
+  - Before the model loads, `gpu_preflight.py` checks each GPU's matrix products and each GPU pair's
+    copies against the CPU.
+  - Before training, `forward_check` runs up to 8 rows through the same path the losses use. The hidden
+    states must be finite and non-zero, and the two letters must hold at least half the next-token
+    probability. A repeat of the first row must match. For `choice_reason`, the untrained judge must
+    also return the sample's own letter on all but one row.
+  - During training, the run stops at once on any of these in the hidden states or logits:
+    - a non-finite value;
+    - an all-zero row;
+    - a value far outside a working model's range (states above 10,000, logits above 200; a working
+      model stays under about 60 and 50).
+
+    Before this check, zero states gave a finite loss of log 2 that the NaN stop missed, and a garbage
+    logit gap of 755 averaged into an unremarkable step loss.
+  - `scripts/smoke_two_loss.py` (`slurm/smoke_two_loss.slurm`) runs every choice-type stage on a tiny
+    random model of the same architecture. For the vector head it checks that the head trains, is saved
+    with each checkpoint, and is restored on resume.
 - **Hardware:** 2× A100-80GB or 4× ≥48GB GPUs on the preempt partition.
 - **Serving:** `merge_judge_adapter.py` folds W += (α/r) B A into the AWQ checkpoint's unquantized
   modules (vLLM 0.18.1 cannot serve LoRA on this AWQ MoE build). The merged judge is served by vLLM.
@@ -124,14 +166,23 @@ Commands:
    by the tuned judge's soft score.
 4. **Pre-set stop rule (v6):** v6 had to beat v4 by more than about 10 points on held-out Claude
    h1/h2 and complex pairs, and as a tie-breaker. It did not, so judge-data work stopped.
+5. **The C2 arms (planned)** score a base judge's stored reasoning samples rather than write their own.
+   - Per ordered pair, each sample gets P(correct letter | reasoning) from the merged adapter (prefill
+     only, as in `vstar_scores.py`).
+   - C2-vec and C2-both also get the head score w · h at `</think>`, which needs an HF forward (as in
+     Stage A).
+   - Both are scored as within-pair AUROC on held-out practice pairs, and as picks in the Spider2
+     round-robin.
 
 ## 7. Caveats
 
 - **Label noise.** 7–27% "another fair reading" per source, and the label check catches about half.
   Practice SQL is simpler than Spider2's (BIRD median 228 vs 1,266 chars).
 - **Evaluation temperature.** v1, v2a and v3c were evaluated at temperature 0.2 instead of 0.6.
-- **Open forward-pass issue (Nov 13).** The bf16 HF forward used by all trainings is intermittently
-  broken (zero / NaN activations). See judge_results.md §7.
-  - Until it is resolved, §4 results may understate what training can do.
-  - New runs pass an identity check first, and the MoE experts implementation is selectable
+- **Forward-pass issue (Nov 13).** Split over 2 L40S GPUs, the bf16 HF forward returned zero, NaN or
+  garbage activations in some jobs and not others, on the same nodes and inputs (judge_results.md §7).
+  The suspect is a particular GPU or GPU pair, so every HF job now runs `gpu_preflight.py` before
+  loading the model.
+  - The v1–v6 training logs show no sign of it.
+  - New runs pass the checks in §4 first, and the MoE experts implementation is selectable
     (`--experts`).

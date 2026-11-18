@@ -113,6 +113,10 @@ def main():
         pos = [len(ids) - 1, t_end] + [r0 + int(f * (r1 - r0)) for f in (0.25, 0.5, 0.75)]
         return ids, pos, (r0, r1)
 
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from gpu_preflight import gpu_preflight
+    gpu_preflight()
     gib = 2 ** 30
     n_gpu = torch.cuda.device_count()
     max_memory = {i: int(torch.cuda.get_device_properties(i).total_memory * 0.92) - (4 * gib if i == 0 else 0)
