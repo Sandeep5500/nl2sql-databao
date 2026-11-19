@@ -226,3 +226,74 @@ Details: [judge_results.md](judge_results.md) §13; running log `results/bq17/im
   mixed 65); sample 0 alone, which ran without a preemption, 116.0 (+0.5 [−3.7, +4.4]).
 - **Reading.** Neither prompt changes nor a larger budget improves the judge on BigQuery measurably. Both
   BigQuery sets are now used for development.
+
+## Round 3: acting on the error analysis, 35B only (Nov 18, evening; written before any round-3 call)
+
+The user asked to try the actionable findings (judge_35b_improvement.md, judge_results.md §11 and §13, the gold audit
+in `nl2sql-v2/reports/Spider2 Lite BigQuery gold errors.md`) on the 35B, and to report the official numbers and the
+numbers under the audit's corrected labels.
+
+**Arms.**
+- **A. Ask twice + superset rule** (no new calls): two calls per ordered pair, votes averaged, then the superset
+  rule. Scored from the stored samples (k = 2 drawn from 8), as in `results/bq17/headroom/`.
+- **B. `dc_facts`**: `diff_cmp` plus a short "dataset notes" section for BigQuery questions: facts from each
+  dataset's official documentation (what one row is, which columns identify an entity, special codes and flags,
+  units and scales, time zones and precision, nested fields whose values repeat on child rows). Built before any
+  call, for every dataset that appears in a mixed pool of either set (44 datasets), by one fixed procedure: the
+  writers see the schema the judge sees, Spider2's reference docs and the web, never the gold files, the
+  questions' answers, our judge calls or the error readings; facts only, no advice (advice hurt the agent in
+  October). SQLite prompts are unchanged.
+- **C. Listwise**: for questions with three or four distinct results, one call shows every result (numbered,
+  with SQL, result preview and the computed comparison of each pair) and asks which one answers the question,
+  with `diff_cmp`'s steps and rules adapted to several candidates. Four samples per question, the candidate
+  order rotated each sample. Two-result questions keep the deployed round-robin. A sample without a valid pick
+  falls back to the deployed round-robin for that question.
+
+**Sets and baselines.** bq17 (204 questions, 65 mixed) and the earlier BigQuery set (105, 37 mixed); baseline the
+deployed `diff_cmp` with both runs pooled on each set (8 samples per ordered pair). 4 samples per ordered pair (B)
+or per question (C).
+
+**Measures.** exp1 on all questions of each set; the gate uses both sets' mixed pools together (102), paired
+question bootstrap, 97.5% intervals (two new-call arms). Reported for every arm, without affecting the gate:
+bq17 under the audit's strict and lenient corrected labels (`results/bq17/headroom/corrected_labels.py`); both sets
+without the seven questions whose official label rewards an arbitrary choice (bq035, ga010, bq002, bq424, bq055,
+bq397, bq208); for B, also without the four questions that motivated it (bq045, bq356, bq051, bq389); and the
+combinations with A (k = 2 averaging and the superset rule on B's calls; majority of two listwise samples on C).
+
+**Gates, fixed now.** B or C is proposed for production only if the 102 mixed pools gain at least +2.0 with the
+97.5% interval above 0, against the pooled baselines. C changes SQLite pools too, so it would then need a SQLite
+run with mixed pools at least −1.5 before production; B leaves SQLite prompts unchanged. A's decision is about
+cost (2x judge calls), from the numbers already measured.
+
+**Cost.** B: 4 × (506 + 280) = 3,144 calls; C: about 4 × 85 = 340 calls; one 35B session on preempt (lilab has a
+queue), about 3 h.
+
+## Round 3 results (Nov 18, night)
+
+Scores: `results/bq17/round3/score_r3_final.txt` (`score_r3.py`); notes `results/bq17/round3/facts/` (44 datasets,
+compiled to `facts.json`). All arms complete with 4 samples; the `dc_facts` sessions ran without a preemption, the bq17
+listwise session was preempted once (64 of its 220 calls drawn again).
+
+| | gate: both sets' mixed pools (102), 97.5% | bq17 mixed (65) | earlier set mixed (37) |
+|---|---|---|---|
+| A ask twice + superset rule (no new calls) | +1.9 [−0.1, +4.1] | +1.5 [+0.2, +3.0] | +0.4 [−0.8, +1.5] |
+| B `dc_facts` | +2.2 [−2.6, +7.2] | −0.4 [−4.5, +3.8] | +2.6 [+0.8, +4.5] |
+| C listwise | +0.8 [−4.5, +6.3] | −0.8 [−3.9, +2.1] | +1.7 [−1.9, +5.4] |
+| B + A (combination, not gated) | +4.4 [−1.0, +10.1] | +0.8 [−3.5, +5.5] | +3.6 [+1.5, +6.0] |
+| C + A (combination, not gated) | +0.4 [−3.3, +3.8] | +0.4 [−2.4, +2.7] | +0.0 [−2.1, +2.0] |
+
+- **Neither B nor C passes the gate**: B reaches +2.2 but its interval includes zero, and on bq17 it loses 0.4. No SQLite
+  run follows; production stays on `diff_cmp`.
+- **B helps where the deciding fact is in the notes and costs elsewhere.** On bq17 it fixes bq356 (0.02 → 1.00, the
+  station key) and bq051 (0.00 → 0.73, the GHCN flags), and loses bq407 (−1.00), bq199 (−0.62), ga004 (−0.55),
+  ga032 (−0.38) and bq424 (−0.37); bq045 falls from 0.17 to 0.06. Without the four questions that motivated it, B is
+  +0.3 [−3.0, +3.5] on both sets. On the earlier set its gains are in Stack Overflow, sdoh and covid19_usa questions.
+- **C does worse where it was meant to help**: on bq17's 14 questions where all four tries differ and one is right
+  it scores 4.8 against 5.6.
+- **bq17 totals (of 204), official / strict / lenient corrected labels:** deployed 113.2 / 114.9 / 118.8 (55.5% /
+  56.3% / 58.3%); A 114.7 / 116.7 / 120.5 (56.2% / 57.2% / 59.1%); B 112.8 / 115.9 / 117.7; B + A 114.0 / 117.6 /
+  118.9; C 112.4 / 113.9 / 118.4; C + A 113.6 / 115.6 / 119.8. Earlier set (of 105): deployed 27.7, A 28.1, B 30.3,
+  B + A 31.4, C 29.4, C + A 27.8.
+- **Reading.** Once more the two BigQuery sets disagree (bq17 flat, the earlier set positive). The only change that
+  is positive on both BigQuery sets and on SQLite is A, asking twice with the superset rule; its decision is about
+  cost.

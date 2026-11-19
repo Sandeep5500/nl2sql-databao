@@ -3,7 +3,8 @@
 Every variant keeps the deployed placeholders ({question} {doc_section} {schema_section} {sql_a}
 {res_a} {sql_b} {res_b}) and the deployed reply format (JSON with "winner"), so parsing and
 P(A) reading are unchanged; only the instructions after the candidates differ, except dc_rf (results
-before SQL) and dc_full (BigQuery doc and schema uncut, via "context"). "base" is the old deployed
+before SQL), dc_full (BigQuery doc and schema uncut, via "context") and dc_facts (BigQuery dataset notes,
+via "context"). LISTWISE is the round-3 prompt for listwise_pools.py. "base" is the old deployed
 prompt; diff_cmp is deployed since Nov 13. The variants share one rules block, so rules - base isolates the rules and
 diff_cmp / spec / diff_nocmp - rules isolate the procedure; diff_cmp - diff_nocmp isolates the
 computed result comparison ({comparison}, from build_compare_cache.py). They come from the
@@ -166,4 +167,53 @@ VARIANTS = {
     # chars) hide the GA360 field definitions (doc 35,736 chars) and the end of wide tables (up to 56,963)
     "dc_full": {"template": _HEAD + COMPARISON + _DIFF_CMP + "\n\n" + RULES + _REPLY,
                 "context": {"doc_chars": 40000, "schema_chars": 60000}},
+    # round 3 (Nov 18): diff_cmp plus short notes from each BigQuery dataset's official documentation (grain,
+    # identifying columns, special codes and flags, units, time precision; rejudge_pools.py --facts). Spider2
+    # prompts are unchanged.
+    "dc_facts": {"template": _HEAD + COMPARISON + _DIFF_CMP + "\n\n" + RULES + _REPLY, "context": {"facts": True}},
 }
+
+# Round 3 listwise judge (listwise_pools.py): every distinct result of a question in one call, for questions
+# with three or four of them, where the three wrong results often share one mistake and a round-robin makes
+# the right one beat each of them in turn. diff_cmp's steps and rules, worded for several candidates; the
+# candidates are numbered so that A and B can keep their meaning inside each pairwise comparison.
+_LW_HEAD = """You are judging {n} candidate SQL answers to a database question.
+
+Question: {question}
+{doc_section}{schema_section}
+{candidates}
+--- Result comparisons (computed from the full results; they show where results differ, not which one \
+is right; in each comparison, A and B stand for the two candidates named in its heading) ---
+{comparisons}
+
+"""
+
+_LW_STEPS = """Which candidate correctly answers the question? Work in this order:
+1. List the points on which the candidates' queries differ: joins, filters and time ranges, grain (one \
+row per what), what is counted or summed (distinct items or rows), NULL and duplicate handling, ranking, \
+ties and limits, units, signs and rounding, output columns. Note which candidates take each side.
+2. For each point, use the result comparisons to say whether it changes the result on this database. \
+Set aside every point that changes no value.
+3. Decide each remaining point against the question and the reference documentation (when given). How \
+many candidates take a side is not evidence for it.
+4. Pick the candidate whose result-changing choices the question supports."""
+
+LW_RULES = """Rules:
+- Every query ran successfully on this database, and each execution result is the query's actual \
+output. Dialect, portability, efficiency, style and how general the SQL is are not criteria.
+- Columns: extra columns beyond what was asked are fine and are never a reason to prefer a \
+candidate. A requested value that is missing or wrong is.
+- Rows: the result must contain the rows the question asks for. Several items where the \
+question asks for one, the wrong number of top items, or rows left out that belong (some \
+years, groups or entities) make a result wrong.
+- A difference between queries matters only if it changes the result on this database. A \
+hard-coded value that another result confirms, a guard for NULLs or zeros that never occur, an \
+equivalent formula, or a tie-break that changes nothing is not a flaw.
+- When results differ, find the difference in the SQL that causes it and decide that difference \
+against the question. Do not prefer numbers because they look more typical; this database may be \
+small or unusual. Comments inside the SQL are claims, not evidence."""
+
+LISTWISE = _LW_HEAD + _LW_STEPS + "\n\n" + LW_RULES + """
+
+Reply with JSON only: {{"winner": <the number of the correct candidate>, "reason": "<one sentence>"}}"""
+

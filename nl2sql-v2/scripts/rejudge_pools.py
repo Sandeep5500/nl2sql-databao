@@ -76,16 +76,25 @@ def load_reference(pools_dir, prefix, bq_dir, bq_prefix):
 class Contexts:
     """(question text, doc_section, schema_section) per pool, built as the reference runs built them.
     A variant's "context" options (judge_prompts.VARIANTS) change the BigQuery cuts: doc_chars (8000) and
-    schema_chars (40000); dc_full lifts both, so the judge sees the doc and schema the agent saw."""
+    schema_chars (40000); dc_full lifts both, so the judge sees the doc and schema the agent saw. "facts" adds
+    the dataset's notes from --facts after the doc (dc_facts); Spider2 contexts have none."""
 
     def __init__(self, args):
         self.args, self.cache, self.dbs = args, {}, {}
-        self.qmeta = self.bqmeta = None
+        self.qmeta = self.bqmeta = self.facts = None
+
+    def facts_section(self, db):
+        if self.facts is None:
+            if not self.args.facts:
+                raise SystemExit("a variant needs --facts")
+            self.facts = json.load(open(self.args.facts))
+        note = self.facts.get(db)
+        return f"\nDataset notes (from the dataset's official documentation):\n{note}\n" if note else ""
 
     def get(self, key, it, opts=None):
         iid = it["instance_id"]
         opts = opts or {}
-        ck = (iid, opts.get("doc_chars", 8000), opts.get("schema_chars", 40000))
+        ck = (iid, opts.get("doc_chars", 8000), opts.get("schema_chars", 40000), bool(opts.get("facts")))
         if ck in self.cache:
             return self.cache[ck]
         if key.startswith("bq:"):
@@ -94,6 +103,8 @@ class Contexts:
                 self.bqmeta = {q["instance_id"]: q for q in map(json.loads, open(self.args.bq_questions))}
             q = self.bqmeta[iid]
             doc = ("\nReference documentation:\n" + q["doc"][:ck[1]] + "\n") if q.get("doc") else ""
+            if ck[3]:
+                doc += self.facts_section(q["db"])
             rep = it["groups"][0]["rep_lane"]  # bq_judge_pools.py: the schema of group 0's representative lane
             tr = json.load(open(Path(self.args.bq_base) / lanes_of(self.args.bq_base)[rep] / "traces" / f"{iid}.json"))
             m = re.search(r"Full database schema.*?(?=\n## Expected output shape|\Z)", tr.get("system", ""), re.S)
@@ -125,6 +136,7 @@ def main():
     ap.add_argument("--bq-base", help="bigquery_passk_nov2026 dir (trace system prompts for the schema)")
     ap.add_argument("--bq-questions")
     ap.add_argument("--comparisons", help="build_compare_cache.py output, for variants with {comparison}")
+    ap.add_argument("--facts", help="JSON {db: notes}, for variants whose context has facts (dc_facts)")
     ap.add_argument("--judge-endpoint", required=True, help="comma-separated; calls are spread over them")
     ap.add_argument("--judge-model", required=True)
     ap.add_argument("--jev-dir", help="local autotrust/JEV-* snapshot: judge with its System 1 decision "

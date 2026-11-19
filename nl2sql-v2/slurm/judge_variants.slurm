@@ -2,11 +2,11 @@
 # Judge prompt-variant session (Nov 2026 selection eval): serves the untuned 35B judge on both GPUs
 # (ports 8765, 8766; the judge_gpu_session flags) and runs the arms queued in $Q, oldest first:
 # each $Q/<n>_<name>.args file holds rejudge_pools.py arguments (variants, --select, --samples,
-# --out-dir). An arm is marked .done when it finishes with no failed calls left; failed calls are
-# retried on the next pass. With every arm done the session waits for new arm files and exits
-# when $Q/STOP exists. All arms resume, so a requeued or restarted session just continues. Copies
-# of a session are matched by job name, so sessions with their own --job-name (one per queue) leave
-# each other alone.
+# --out-dir); a $Q/<n>_<name>.lw file holds listwise_pools.py arguments instead (round 3). An arm
+# is marked .done when it finishes with no failed calls left; failed calls are retried on the next
+# pass. With every arm done the session waits for new arm files and exits when $Q/STOP exists. All
+# arms resume, so a requeued or restarted session just continues. Copies of a session are matched by
+# job name, so sessions with their own --job-name (one per queue) leave each other alone.
 #
 #   sbatch ~/slurm/judge_variants.slurm                                                (lilab)
 #   sbatch --partition=preempt --qos=preempt_qos --constraint='A6000|6000Ada|L40S|A100_80GB' \
@@ -79,19 +79,21 @@ cd "$U/judge-code/nl2sql-v2"
 PY=$M/nl2sql-v2/.venv/bin/python
 while true; do
     pending=0
-    for f in $(ls "$Q"/*.args 2>/dev/null | sort); do
+    for f in $(ls "$Q"/*.args "$Q"/*.lw 2>/dev/null | sort); do
         [ -e "$f.done" ] && continue
         pending=1
-        name=$(basename "$f" .args)
+        name=$(basename "$f"); name=${name%.*}
+        script=scripts/rejudge_pools.py
+        [ "${f##*.}" = lw ] && script=scripts/listwise_pools.py
         log "arm $name: start"
         # shellcheck disable=SC2046
-        "$PY" scripts/rejudge_pools.py $(cat "$f") --evalset "$EV" \
+        "$PY" "$script" $(cat "$f") --evalset "$EV" \
             --pools "$W/results/pools" --bq-pools "$BQP" --bq-base "$BQB" \
             --bq-questions "$BQQ" --judge-model "$MODEL" \
             --judge-endpoint http://localhost:8765/v1,http://localhost:8766/v1 --resume \
             >> "$LOG/$name.log" 2>&1
         rc=$?
-        left=$("$PY" scripts/rejudge_pools.py $(cat "$f") --evalset "$EV" \
+        left=$("$PY" "$script" $(cat "$f") --evalset "$EV" \
             --pools "$W/results/pools" --bq-pools "$BQP" --bq-base "$BQB" \
             --bq-questions "$BQQ" --judge-model "$MODEL" \
             --judge-endpoint http://localhost:8765/v1 --resume --count-only 2>/dev/null)
