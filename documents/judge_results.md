@@ -895,7 +895,61 @@ The plan, with its gates and two amendments, was written before the calls it cov
   (`calls_<variant>.starts.jsonl`) counts them (27B 16,384 sample 2: 79 of 506; sample 1, cancelled:
   at least 251 of 384).
 
-## 14. Where things are
+## 14. Round 3 and the production rule (Nov 18–19)
+
+**Round 3** (35B only; plan, gate and full results in [bq_judge_improvement_plan.md](bq_judge_improvement_plan.md),
+"Round 3"). Dataset notes from each BigQuery dataset's official documentation (`dc_facts`) and a listwise judge
+(all results of a question in one call) both fail the gate on the 102 mixed BigQuery pools: +2.2 [−2.6, +7.2] and
++0.8 [−4.5, +6.3] (97.5%). The notes fix the questions whose deciding fact is documented (bq356, bq051) and lose
+about as much elsewhere. Asking every pair twice and applying the superset rule is the only change that is
+positive on both BigQuery sets and on SQLite.
+
+**Adopted on Nov 19** (the user's decision): `select_answer.py` now judges every ordered pair twice (`--votes 2`)
+and then applies the superset rule (a result that holds every column of the pick's result with the same rows
+replaces it; the widest such result). `--votes 1 --no-superset-rule` gives the earlier production.
+`selection_eval.py score` scores the new production as `NAME@U@V2`, exactly (each ordered pair's vote is the mean
+of 2 of its samples, drawn without replacement); it gives the same totals as round 3's Monte Carlo scripts.
+The calls of one question now go out at once (`--workers`, default 16). Checks: with a fake judge, the call count
+(two per ordered pair), the superset upgrade, `--votes 1 --no-superset-rule` reproducing the old picks, and 12 calls
+in 0.4 s instead of 3.7 s with the same pick; with the served 35B (`slurm/prod_smoke.slurm`, 3 SQLite questions),
+12, 12 and 4 calls, none failed, all 3 picks right (majority vote got 2). Across
+the eval sets, 398 pairs of results stand in the superset relation; the contained result is right and the wider one
+wrong in none of them, and the reverse in 36.
+
+From the stored samples (old = one call per ordered pair, new = ask twice + superset rule, same samples; 95%
+paired question bootstrap on the mixed pools; `results/prod_nov19/score_prod.py`):
+
+| set | old | new | new − old |
+|---|---|---|---|
+| BigQuery bq17 (of 204) | 113.2 (55.5%) | 114.7 (56.2%) | +1.5 [+0.1, +3.0] |
+| bq17, strict corrected labels | 114.9 (56.3%) | 116.7 (57.2%) | +1.7 [+0.4, +3.1] |
+| bq17, lenient corrected labels | 118.8 (58.3%) | 120.5 (59.1%) | +1.6 [+0.3, +3.2] |
+| BigQuery earlier set (of 105) | 27.7 (26.4%) | 28.2 (26.8%) | +0.4 [−0.7, +1.5] |
+| SQLite q36rg (of 135) | 85.6 (63.4%) | 87.2 (64.6%) | +1.6 [−0.1, +3.8] |
+| SQLite q36e | 82.8 (61.4%) | 83.3 (61.7%) | +0.5 [−1.2, +2.6] |
+| SQLite q36x | 82.8 (61.3%) | 85.5 (63.3%) | +2.7 [+0.4, +5.7] |
+
+The two BigQuery sets and q36rg (part of the 540 SQLite pools) chose the rule; q36e and q36x did not.
+
+**Check on fresh samples (written before any call, Nov 19).** The rule is measured again on new samples: 4 fresh
+`diff_cmp` samples per ordered pair (35B, thinking, 8,192 tokens, the deployed comparison caches) on bq17 (506
+ordered pairs), the earlier BigQuery set (280), q36rg (294), q36e (270) and q36x (322): 6,688 calls on preemptible
+GPUs (`judge_variants.slurm`, three sessions). Measure: old and new production on the same fresh samples, per set,
+with the 95% paired question bootstrap; bq17 also under the audit's strict and lenient labels. Production stays
+adopted either way. The check fails if the new rule is below the old one summed over the five sets' mixed pools;
+the decision then goes back to the user. Calls redrawn after a preemption are counted from the starts logs.
+
+**bf16 judge test (written before any call, Nov 19).** The same model at full precision instead of AWQ 4-bit:
+`Qwen/Qwen3.6-35B-A3B` in bf16, one vLLM engine over two GPUs (`judge_variants.slurm` with `MODEL` and `TP=2`; a GPU
+preflight and an obvious-pair smoke test before any call). Everything else as in the fresh AWQ check above: the same
+vLLM build and flags, `diff_cmp`, thinking, temperature 0.6, 8,192 tokens, the same comparison caches, 4 samples per
+ordered pair on the same five sets. Measure: the production rule (`@U@V2`) on the same pools, bf16 minus the fresh
+AWQ samples. Pass: on both BigQuery sets' mixed pools (102) at least +2.0 with the 97.5% paired question bootstrap
+above zero, and on the SQLite run sets' mixed pools (146) not below −1.5. One-call numbers and call health (no
+verdict, truncation, tokens) are reported alongside. If it passes, a bf16 judge needs two 48 GB GPUs (or one
+80 GB GPU) per server instead of one, with the same active parameters per token.
+
+## 15. Where things are
 
 - **Data pipeline.** `build_bird_dataset.py`, `build_beaver_dataset.py`, `beaver_to_sqlite.py`,
   `beaver_gold_mysql.py`, `check_db_overlap.py`, `profile_traps.py`, `sql_mutations.py`,
@@ -904,7 +958,7 @@ The plan, with its gates and two amendments, was written before the calls it cov
 - **Training.** `make_judge_sft_dpo.py`, `train_judge_lora.py` (stages sft, dpo, choice, choice_mt,
   choice_reason), `merge_judge_adapter.py`, `judge_gate.py`.
 - **Judging and evaluation.** `judge_pools.py` and `bq_judge_pools.py` (`--no-judge` builds the groups
-  only), `judge_pairs.py`, `rejudge_pools.py`, `selection_eval.py` (exp1; rules @U / @T; soft votes @S),
+  only), `judge_pairs.py`, `rejudge_pools.py`, `selection_eval.py` (exp1; rules @U / @T; soft votes @S; two votes per pair @V2),
   `runset_evalset.py` (eval set for new Spider2 run sets, Nov 18), `judge_prompts.py`,
   `result_compare.py`, `build_compare_cache.py`, `analyze_pools.py`, `compare_judges.py`.
 - **Trace verification.** `extract_judge_states.py`, `probe_fit.py` (`--frozen` for Stage B),
@@ -914,5 +968,6 @@ The plan, with its gates and two amendments, was written before the calls it cov
 - **Cluster jobs.** `nl2sql-v2/slurm/`.
 - **Full BigQuery rerun.** `results/bq17/` (plan, scores, scripts); its error analysis in `anatomy/`,
   the Nov 18 ablations in `improve/` (round 2: `score_r2.py`, `score_16k.py`, `score_rerun.py`,
-  `r2_movers.py`, `r2_16k_calls.py`, `fetch_r2.sh`).
+  `r2_movers.py`, `r2_16k_calls.py`, `fetch_r2.sh`); round 3 in `round3/` (`score_r3.py`, `facts/`).
+- **Production rule check (Nov 19).** `results/prod_nov19/` (`score_prod.py`; fresh calls in `fetched/`).
 - **Results on Babel.** `/data/user_data/dpalagan/{judge-data,nl2sql-sel}/results/`.

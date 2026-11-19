@@ -27,17 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nl2sql.config import QUESTIONS_FILE, SQLITE_DIR
 from nl2sql.db import Database
-from nl2sql.eval import compare_dataframes, load_eval_standards, score_against_gold
-from select_answer import (canonical, equivalent, pairwise_verdict, question_context,
+from nl2sql.eval import load_eval_standards, score_against_gold
+from select_answer import (canonical, contains, equivalent, pairwise_verdict, question_context,
                            result_preview)
 from judge_pairs import JevJudge, db_context_for, in_shard, jev_state
 import select_answer
-
-
-def contains(big, small):
-    """big holds every column of small, same row count (row order ignored)."""
-    return (big.shape[0] == small.shape[0] and small.shape[1] <= big.shape[1]
-            and compare_dataframes(big, small, ignore_order=True))
 
 
 def main():

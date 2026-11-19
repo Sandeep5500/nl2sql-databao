@@ -21,12 +21,13 @@ because the right answer is often the one only one lane found.
 
 ## How the judge works
 
-Production is `nl2sql-v2/scripts/select_answer.py --mode pairwise --thinking` (the `diff_cmp` prompt is
-the default):
+Production is `nl2sql-v2/scripts/select_answer.py --mode pairwise --thinking` (the `diff_cmp` prompt, two
+calls per ordered pair and the superset rule are the defaults; the last two since Nov 19):
 
 1. Run each lane's SQL and group lanes whose results are equal (row order ignored, the scorer's
    normalisation). If all lanes agree, submit that result; no judge call is made.
-2. Judge every pair of distinct results twice, once in each presentation order. The judge sees the
+2. Judge every pair of distinct results in both presentation orders, twice per order (`--votes 2`; once
+   per order before Nov 19). The judge sees the
    question, the external document (first 8,000 characters), a schema overview, both SQL queries, the
    first 8 rows of each result with its full shape, and a comparison of the two full results computed
    by `result_compare.py` (shapes, which columns pair up, rows and values found on one side only).
@@ -36,7 +37,12 @@ the default):
    columns are fine; missing rows or values are not; how the SQL is written is not a criterion).
 4. The judge reasons first (thinking on, temperature 0.6, up to 8,192 tokens) and replies with JSON
    naming the winner.
-5. Submit the result with the most wins. Ties go to the result more lanes produced.
+5. Take the result with the most wins. Ties go to the result more lanes produced.
+6. Superset rule: if another result holds every column of that result with the same rows, submit the
+   widest such result instead. The scorer accepts extra columns, so the wider result is right whenever
+   the winner is, unless the gold answer's row order counts and the wider result orders its rows
+   differently. Of the 398 such pairs in our eval sets, none had the winner right and the wider result
+   wrong; 36 had the reverse.
 
 ```bash
 cd nl2sql-v2
@@ -46,8 +52,10 @@ uv run python scripts/select_answer.py --mode pairwise --thinking \
     --output ../results/q36rg_selected.csv
 ```
 
-A question with 4 different results needs 12 judge calls; questions where the lanes disagree and one
-is right need about 7 on average on SQLite.
+A question with 4 different results needs 24 judge calls (12 before Nov 19); questions where the lanes
+disagree and one is right need about 14 on average on SQLite. The calls of one question are sent at once
+(`--workers`, default 16), so asking twice adds judge compute but little waiting. `--votes 1
+--no-superset-rule` gives the earlier production.
 
 ## Why it is built this way
 
@@ -68,6 +76,12 @@ is right need about 7 on average on SQLite.
   judge is right 84% of the time instead of 74%. It costs about 23% more judge tokens. On BigQuery it
   gives the 35B no gain (+0.8 [−2.9, +4.3] for the old prompt on the 204 questions), and it stays the
   default because it was allowed to lose up to 1.5 there.
+- **Ask twice, then the superset rule (adopted Nov 19).** Averaging two verdicts per ordered pair
+  softens one unlucky verdict, and the superset rule only moves to a result the scorer accepts whenever
+  it accepts the winner. It was the one change that helped on both BigQuery sets and on SQLite in the
+  Nov 18 tests; on the stored samples it adds +1.5 [+0.1, +3.0] picks on BigQuery (204 questions), +0.4 on
+  the earlier BigQuery set, and +1.6, +0.5 and +2.7 on the SQLite run sets q36rg, q36e and q36x. It doubles
+  the judge calls. A check on fresh samples is in [judge_results.md](judge_results.md) §14.
 - **An untuned model.** Six fine-tuning recipes (SFT, DPO, letter-only training; at most 2,644
   examples over 1,814 practice pairs from non-Spider2 databases) never beat the untuned thinking judge
   on Spider2. The practice data
@@ -98,15 +112,26 @@ Both run with thinking, temperature 0.6, 8,192 tokens and the `diff_cmp` prompt.
   A missing verdict counts half for each side, which leaves the result more lanes gave ahead; where that
   result is right and the 27B, once it finishes, decides wrong (bq389, bq424), the pick is lost. Its
   errors cluster in the hard questions, so finishing exposes them rather than spreading them thin.
-- Qwen3.8 has no smaller model than the 27B. Whether a dense 27B fits the project's small-model goal is
-  an open decision; production stays on the 35B until it is made.
+- Under the production rule (asks twice, superset rule; scored from the stored samples) the 27B scores
+  117.1 of 204 on BigQuery against the 35B's 114.7 (+2.4 [−1.7, +6.8]) and 34.0 against 28.2 on the earlier
+  BigQuery set (+5.9 [+1.2, +10.7]); on the SQLite run sets +0.9 (q36rg), +6.9 [+1.5, +12.8] (q36s), +2.5
+  (q36) and −0.2 (v2). The rule helps both judges by about the same amount.
+- **Does the 27B fit the small-model goal?** (Nov 19) The goal set in September is a small deployed model
+  (9B-class), with larger models used only as a reference or as an offline teacher. Qwen3.8 has no smaller
+  model than the 27B. Per judge call the 27B uses about 15× the 35B's compute (9× the active parameters per
+  token, 1.7× the reasoning tokens), needs two 48 GB GPUs in bf16 where the AWQ 35B needs one, and is a
+  second model next to the agent's own. It gains +1 to +7 picks per set, resolved on 2 of 6 sets.
+  Recommendation (pending the team's decision): it does not fit; production stays on the 35B, and the 27B is
+  reported as the larger-judge reference.
 - Other models of the same sizes did worse than the 35B: GLM-4.7-Flash (296.9 of 540) and
   Magistral-Small-2509 (300.0). JEV-27B's one-step decision mode scored 290 of 540.
 
 ## Final scores, latest runs
 
-Judge rows are the expected accuracy of one production run (exp1, computed from 4 samples of every
-judge call; see below).
+Judge rows are the expected accuracy of one run (exp1, computed from 4 or more samples of every judge
+call; see below). "One call per pair" is production before Nov 19; "production" asks every pair twice and
+applies the superset rule, scored here from the stored samples (a check on fresh samples is in
+[judge_results.md](judge_results.md) §14).
 
 **SQLite, 135 local questions, run q36rg** (Qwen3.6-35B-A3B agent, 4 lanes, temperature 0.7):
 
@@ -114,11 +139,12 @@ judge call; see below).
 |---|---|---|
 | one lane (pass@1, average) | 69.0 | 51.1% |
 | majority vote (ties at random) | 73.2 | 54.2% |
-| 35B judge, `diff_cmp` | 85.6 | 63.4% |
-| 27B judge, `diff_cmp` | 86.6 | 64.1% |
+| 35B judge, `diff_cmp`, one call per pair | 85.6 | 63.4% |
+| **35B judge, production (asks twice, superset rule)** | **87.2** | **64.6%** |
+| 27B judge, `diff_cmp`, one call per pair | 86.6 | 64.1% |
 | any lane right (pass@4) | 94 | 69.6% |
 
-On this run set alone the 27B's lead is +1.0 [−2.5, +4.6].
+On this run set alone the 27B's lead over the one-call 35B is +1.0 [−2.5, +4.6].
 
 **SQLite, newer run sets q36e and q36x** (Oct 7–8, explored enrichment; 35B judge only, the 27B was
 not run on them):
@@ -127,10 +153,11 @@ not run on them):
 |---|---|---|
 | one lane (pass@1, average) | 72.5 (53.7%) | 67.5 (50.0%) |
 | majority vote (ties at random) | 78.5 (58.1%) | 75.2 (55.7%) |
-| 35B judge, `diff_cmp` | 82.8 (61.3%) | 82.8 (61.3%) |
+| 35B judge, `diff_cmp`, one call per pair | 82.8 (61.3%) | 82.8 (61.3%) |
+| **35B judge, production (asks twice, superset rule)** | **83.3 (61.7%)** | **85.5 (63.3%)** |
 | any lane right (pass@4) | 92 (68.1%) | 91 (67.4%) |
 
-The judge beats majority vote by +4.3 [−0.9, +9.8] and +7.5 [+1.3, +13.8] picks. q36x's own log says
+The one-call judge beats majority vote by +4.3 [−0.9, +9.8] and +7.5 [+1.3, +13.8] picks. q36x's own log says
 50.2% and 92; one lane's SQL gives another result when re-run.
 
 **BigQuery, 204 questions, Nov 17 run** (same agent model, bf16, 4 lanes, temperature 0.7):
@@ -139,11 +166,16 @@ The judge beats majority vote by +4.3 [−0.9, +9.8] and +7.5 [+1.3, +13.8] pick
 |---|---|---|
 | one lane (pass@1, average) | 98.0 | 48.0% |
 | majority vote (ties at random) | 105.2 | 51.6% |
-| 35B judge, `diff_cmp` (two runs pooled) | 113.2 | 55.5% |
-| 27B judge, `diff_cmp` | 115.5 | 56.6% |
+| 35B judge, `diff_cmp`, one call per pair (two runs pooled) | 113.2 | 55.5% |
+| **35B judge, production (asks twice, superset rule)** | **114.7** | **56.2%** |
+| 27B judge, `diff_cmp`, one call per pair | 115.5 | 56.6% |
 | any lane right (pass@4) | 129 | 63.2% |
 
-The 35B judge keeps half to two thirds of the pass@1 to pass@4 gap on SQLite (q36rg 16.6 of 25 picks,
+Under the gold audit's corrected labels (13 audited questions, chosen where the judges lost, so the
+correction leans in the judges' favour) the 35B production scores 116.7 (57.2%, strict) and 120.5 (59.1%,
+both fair readings accepted); one call per pair gives 114.9 and 118.8.
+
+With one call per pair, the 35B judge keeps half to two thirds of the pass@1 to pass@4 gap on SQLite (q36rg 16.6 of 25 picks,
 q36e 10.3 of 19.5, q36x 15.3 of 23.5) and about half on BigQuery (15.2 of 31).
 
 ## Where the judge still loses
@@ -166,7 +198,9 @@ q36e 10.3 of 19.5, q36x 15.3 of 23.5) and about half on BigQuery (15.2 of 31).
   gain on Spider2.
 - Rule layers and confidence gating on top of the thinking judge (296 → 282 of 540), table details from
   the database in the prompt (helped easy pairs, hurt hard ones), summaries of the agent's trace
-  (+8 / −7 over 405), voting over more samples.
+  (+8 / −7 over 405). More samples per pair gave the old prompt +3 of 540 (two samples, not
+  significant); with `diff_cmp`, two samples plus the superset rule were small but positive on every set
+  and became production (above).
 - BigQuery prompt rules (Nov 18): a rule that filters must come from the question, and a final step that
   drops objections to how a query is written. The first fixes the filters it names and rejects
   exclusions the question implies; the second changes nothing. A clearer comparison tool and re-asking
@@ -179,6 +213,11 @@ q36e 10.3 of 19.5, q36x 15.3 of 23.5) and about half on BigQuery (15.2 of 31).
   (above).
 - The agent's output-shape rubric as extra information (checked offline, Nov 18): on the BigQuery
   comparisons the judges miss, both answers almost always have the shape the rubric asks for.
+- Round 3 for the 35B on BigQuery (Nov 18): short notes from each dataset's official documentation in the
+  prompt (+2.2 [−2.6, +7.2] over the 102 mixed BigQuery pools; they fix the questions whose deciding fact
+  is documented and lose about as much elsewhere) and a listwise judge that sees every result of a
+  question in one call (+0.8 [−4.5, +6.3]; worse than the round-robin when all four results differ).
+  Neither reached the +2.0 the plan asked for.
 
 ## How to test a judge change
 
@@ -198,11 +237,13 @@ asked for +2.0).
    `slurm/judge_variants.slurm` for the 35B, `slurm/jev_variants.slurm` for the 27B,
    `slurm/runset_pools.slurm` for steps 1–3 on new SQLite run sets). Prompt variants live in
    `judge_prompts.py`.
-5. Score: `selection_eval.py score --evalset ... --judge NAME=calls.jsonl --ref <baseline>` prints exp1
-   per set and stratum with paired question bootstraps.
+5. Score: `selection_eval.py score --evalset ... --judge NAME@U@V2=calls.jsonl --ref <baseline>` prints
+   exp1 per set and stratum with paired question bootstraps. `@U@V2` scores a run that asks every pair
+   twice and applies the superset rule, as production does; `NAME=` without suffixes gives the one-call
+   numbers of the earlier records.
 
-exp1 is the exact expected accuracy of one production run: each ordered pair has 4 sampled verdicts,
-and every combination of one verdict per pair is weighed. A missing verdict counts as 0.5. The
+exp1 is the exact expected accuracy of one run: each ordered pair has 4 sampled verdicts, and every
+combination of one verdict per pair (with `@V2`, of two verdicts per pair, averaged) is weighed. A missing verdict counts as 0.5. The
 evaluation counts each lane in the round-robin, which differs from production's win count by under 1
 pick per stratum. Before testing a change, fix the measure and the pass bar in writing, keep part of
 the data unread, and compare against a fresh run of the baseline: comparisons picked out by the
@@ -211,11 +252,14 @@ when a job is stopped are drawn again, and those are mostly the long ones; `reju
 request in `calls_<variant>.starts.jsonl`, so redrawn calls can be counted, and a sample that ran without
 a preemption is the clean one.
 
-## Open items (Nov 18)
+## Open items (Nov 19)
 
-- Needs a decision: whether the dense 27B fits the project's small-model goal. It is ahead on SQLite
-  (+11.8 over 540 pools, +1.0 on q36rg) and not resolved on BigQuery, and a larger token budget does not
-  change that.
+- Running: the check of the production rule on fresh samples, and the same 35B in bf16 instead of AWQ
+  4-bit ([judge_results.md](judge_results.md) §14).
+- Running: an audit of all 204 BigQuery labels, so that corrected-label scores can move both ways (the
+  Nov 18 audit read only the 13 questions where the judges lost).
+- Needs the team's confirmation: the 27B does not fit the small-model goal (recommended above, "The two
+  judges").
 - Not run: the 27B on q36e and q36x (stopped to free GPUs for BigQuery).
 - Not read: the 27B's misses in the BigQuery questions nobody has read (2.9 picks over 43 pools).
 - Both BigQuery sets have been used for development, so a further BigQuery change needs a new test set,

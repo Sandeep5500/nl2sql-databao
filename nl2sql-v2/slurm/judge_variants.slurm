@@ -15,6 +15,10 @@
 # preempt copies once its servers answer, before it writes anything.
 # EVALSET, BQ_POOLS, BQ_BASE, BQ_QUESTIONS, QUEUE and LOG point a session at another eval set (the
 # full BigQuery pass@4, Nov 17); its arm files then add --bq-ref-prefix and --comparisons.
+# MODEL serves another checkpoint (default the AWQ judge), TP=2 serves it as one engine over both GPUs
+# (port 8765 only; for the bf16 35B, Nov 19). A TP=2 session checks the GPUs first (gpu_preflight.py;
+# split bf16 models computed garbage on some allocations on Nov 13), and every session sends one
+# obvious pair before its arms: the judge must reason and pick the right answer.
 #
 #SBATCH --job-name=judge_var
 #SBATCH --partition=lilab
@@ -38,7 +42,8 @@ EV=${EVALSET:-$W/results/variants/selection_evalset.json}
 BQP=${BQ_POOLS:-$B/pools}
 BQB=${BQ_BASE:-$B/bigquery_passk_nov2026}
 BQQ=${BQ_QUESTIONS:-$B/bq_questions.jsonl}
-MODEL=QuantTrio/Qwen3.6-35B-A3B-AWQ
+MODEL=${MODEL:-QuantTrio/Qwen3.6-35B-A3B-AWQ}
+TP=${TP:-1}
 export HF_HOME=$U/.cache/huggingface VLLM_MLA_DISABLE=1 NL2SQL_DATA_ROOT=$M
 mkdir -p "$Q" "$LOG"
 log() { echo "[$(date -Is)] $*"; }
@@ -50,33 +55,75 @@ fi
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 module load cuda-12.1 2>/dev/null || true
 GPUS=(${CUDA_VISIBLE_DEVICES//,/ })
+if [ "$TP" = 2 ]; then
+    "$M/.vllm-venv/bin/python" -c "import sys; sys.path.insert(0, '$HOME/judge-code-staging/nl2sql-v2/scripts')
+from gpu_preflight import gpu_preflight; gpu_preflight()" || exit 1
+    SERVERS=("${GPUS[0]},${GPUS[1]}")
+else
+    SERVERS=("${GPUS[0]}" "${GPUS[1]}")
+fi
 PIDS=()
-for i in 0 1; do
-    CUDA_VISIBLE_DEVICES=${GPUS[$i]} "$M/.vllm-venv/bin/python" -m vllm.entrypoints.openai.api_server \
+PORTS=()
+for i in "${!SERVERS[@]}"; do
+    CUDA_VISIBLE_DEVICES=${SERVERS[$i]} "$M/.vllm-venv/bin/python" -m vllm.entrypoints.openai.api_server \
         --model "$MODEL" --port $((8765 + i)) --host 0.0.0.0 --max-model-len 60000 \
         --gpu-memory-utilization 0.92 --dtype bfloat16 --enforce-eager --trust-remote-code \
+        --tensor-parallel-size "$TP" \
         --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
         --enable-prefix-caching --mamba-cache-mode align \
         > "$LOG/vllm_${SLURM_JOB_ID}_$i.log" 2>&1 &
     PIDS+=($!)
+    PORTS+=($((8765 + i)))
 done
 trap 'kill ${PIDS[*]} 2>/dev/null' EXIT
+up() { for p in "${PORTS[@]}"; do curl -sf "localhost:$p/v1/models" >/dev/null || return 1; done; }
 for _ in $(seq 1 240); do
-    curl -sf localhost:8765/v1/models >/dev/null && curl -sf localhost:8766/v1/models >/dev/null && break
+    up && break
     for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null || { log "a vLLM server died"; tail -30 "$LOG"/vllm_${SLURM_JOB_ID}_*.log; exit 1; }; done
     sleep 10
 done
-curl -sf localhost:8765/v1/models >/dev/null && curl -sf localhost:8766/v1/models >/dev/null || { log "vLLM not up after 40 min"; exit 1; }
-log "both servers up"
+up || { log "vLLM not up after 40 min"; exit 1; }
+EPS=$(printf 'http://localhost:%s/v1,' "${PORTS[@]}")
+EPS=${EPS%,}
+log "servers up: $EPS"
 if [ "$SLURM_JOB_PARTITION" = lilab ]; then
     scancel -u "$USER" -n "$SLURM_JOB_NAME" -p preempt && log "cancelled any preempt session"
     sleep 30
 fi
-printf 'job=%s\nnode=%s\nendpoints=http://%s:8765/v1,http://%s:8766/v1\nstarted=%s\n' \
-    "$SLURM_JOB_ID" "$(hostname)" "$(hostname)" "$(hostname)" "$(date -Is)" > "$HOME/joblogs/judge_var_session.txt"
+printf 'job=%s\nnode=%s\nendpoints=%s\nstarted=%s\n' \
+    "$SLURM_JOB_ID" "$(hostname)" "${EPS//localhost/$(hostname)}" "$(date -Is)" > "$HOME/joblogs/judge_var_session.txt"
 
 cd "$U/judge-code/nl2sql-v2"
 PY=$M/nl2sql-v2/.venv/bin/python
+# smoke: one obvious pair, sent as rejudge_pools.py sends calls; the judge must reason, then pick A (three
+# tries per server, so one unlucky sample does not end a healthy session; broken output fails all three)
+for p in "${PORTS[@]}"; do
+    ok=0
+    for _ in 1 2 3; do
+        "$PY" - "$p" "$MODEL" <<'EOF' && { ok=1; break; }
+import re, sys
+import openai
+port, model = sys.argv[1:]
+prompt = ("You are judging two candidate SQL answers to a database question.\n\nQuestion: How many customers "
+          "placed more than 5 orders?\n\nCandidate A SQL:\nSELECT COUNT(*) FROM (SELECT customer_id FROM orders "
+          "GROUP BY customer_id HAVING COUNT(*) > 5)\nCandidate A execution result:\ncount\n12\n\nCandidate B SQL:\n"
+          "SELECT COUNT(*) FROM orders\nCandidate B execution result:\ncount\n4000\n\nWhich candidate correctly "
+          'answers the question? Reply with JSON only: {"winner": "A" or "B", "reason": "<one sentence>"}')
+c = openai.OpenAI(base_url=f"http://localhost:{port}/v1", api_key="EMPTY", timeout=600)
+r = c.chat.completions.create(model=model, temperature=0.6, max_tokens=4096,
+                              messages=[{"role": "user", "content": prompt}],
+                              extra_body={"chat_template_kwargs": {"enable_thinking": True}})
+m = r.choices[0].message.model_dump()
+reasoning = m.get("reasoning") or m.get("reasoning_content") or ""
+content = m["content"] or ""
+print(f"smoke {port}: {len(reasoning)} reasoning chars, {r.usage.completion_tokens} tokens, reply {content[-120:]!r}",
+      flush=True)
+assert reasoning, "no reasoning"
+assert re.findall(r'"winner"\s*:\s*"([AB])"', content)[-1] == "A", "wrong or unparsable verdict"
+EOF
+    done
+    [ $ok = 1 ] || { log "smoke failed on port $p"; exit 1; }
+done
 while true; do
     pending=0
     for f in $(ls "$Q"/*.args "$Q"/*.lw 2>/dev/null | sort); do
@@ -90,13 +137,13 @@ while true; do
         "$PY" "$script" $(cat "$f") --evalset "$EV" \
             --pools "$W/results/pools" --bq-pools "$BQP" --bq-base "$BQB" \
             --bq-questions "$BQQ" --judge-model "$MODEL" \
-            --judge-endpoint http://localhost:8765/v1,http://localhost:8766/v1 --resume \
+            --judge-endpoint "$EPS" --resume \
             >> "$LOG/$name.log" 2>&1
         rc=$?
         left=$("$PY" "$script" $(cat "$f") --evalset "$EV" \
             --pools "$W/results/pools" --bq-pools "$BQP" --bq-base "$BQB" \
             --bq-questions "$BQQ" --judge-model "$MODEL" \
-            --judge-endpoint http://localhost:8765/v1 --resume --count-only 2>/dev/null)
+            --judge-endpoint "http://localhost:${PORTS[0]}/v1" --resume --count-only 2>/dev/null)
         log "arm $name: exit $rc, calls left: ${left:-?}"
         [ "$rc" = 0 ] && [ "${left:-1}" = 0 ] && touch "$f.done"
         # calls that keep failing on every server (retry records): give up after two passes without progress

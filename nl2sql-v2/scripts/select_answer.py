@@ -3,8 +3,11 @@
 result, majority-vote, and let a judge model pick among the distinct clusters
 (DivSkill-style dedup+judge).
 
+Production (since 2026-11-19) is --mode pairwise --thinking with the defaults: the diff_cmp
+prompt, every ordered pair judged twice (--votes 2), then the superset rule (documents/judge.md).
+
 Usage (from nl2sql-v2/):
-    uv run python scripts/select_answer.py \
+    uv run python scripts/select_answer.py --mode pairwise --thinking \
         --runs ../results/q36_pass4_k1.csv,../results/q36_pass4_k2.csv,... \
         --judge-endpoint http://node:8765/v1 --judge-model QuantTrio/... \
         --output ../results/q36_selected.csv
@@ -18,6 +21,7 @@ import random
 import re
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -142,6 +146,24 @@ def equivalent(a, b, ignore_order):
         return False
     return compare_dataframes(a, b, ignore_order=ignore_order) and \
         compare_dataframes(b, a, ignore_order=ignore_order)
+
+
+def contains(big, small):
+    """big holds every column of small, same row count (row order ignored)."""
+    return (big.shape[0] == small.shape[0] and small.shape[1] <= big.shape[1]
+            and compare_dataframes(big, small, ignore_order=True))
+
+
+def superset_pick(clusters, pick):
+    """The superset rule: the widest other cluster (then more votes, then the earlier one) whose
+    result contains the picked cluster's non-empty result, else pick. The scorer accepts extra
+    columns, so that result is right whenever the pick is, unless the gold answer's row order
+    counts and the wider result orders its rows differently (none of the 398 such pairs in the
+    Nov 2026 eval sets did)."""
+    small = clusters[pick]["df"]
+    sup = [k for k, cl in enumerate(clusters)
+           if k != pick and small.shape[0] > 0 and contains(cl["df"], small)]
+    return max(sup, key=lambda k: (clusters[k]["df"].shape[1], clusters[k]["votes"], -k)) if sup else pick
 
 
 def result_preview(df, rows=8):
@@ -317,7 +339,19 @@ def main():
                          "and the judge picks with its result (no vote counts shown); "
                          "pairwise_probe = pairwise round-robin where each ordered pair "
                          "gets its own SQL check")
+    ap.add_argument("--votes", type=int, default=2,
+                    help="pairwise mode: judge calls per ordered pair, each counted as a win. 2 (ask "
+                         "twice) was adopted on 2026-11-19 with the superset rule (documents/judge.md); "
+                         "1 is the earlier production")
+    ap.add_argument("--no-superset-rule", dest="superset_rule", action="store_false",
+                    help="submit the judge's pick as it is. By default (since 2026-11-19) a cluster whose "
+                         "result holds every column of the pick's result with the same rows replaces it "
+                         "(the widest such cluster)")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="pairwise mode: judge calls of one question sent at once (1 = one at a time)")
     args = ap.parse_args()
+    if args.votes < 1 or args.workers < 1:
+        raise SystemExit("--votes and --workers must be at least 1")
     global THINKING
     THINKING = args.thinking
     if args.max_tokens is None:
@@ -424,24 +458,30 @@ def main():
             reason = f"round-robin wins={wins} failed={n_failed}/{n_probes}"
             probe_sql = f"{n_written}/{n_probes} probes written"
         elif args.mode == "pairwise":
-            # DivSkill: exhaustive round-robin over unordered pairs, each judged
-            # twice with swapped presentation order; highest win count wins.
-            wins = [0] * len(clusters)
-            n_calls = n_failed = 0
+            # DivSkill: exhaustive round-robin over unordered pairs, each judged in
+            # both presentation orders, --votes times per order; highest win count wins.
+            calls = []
             for i in range(len(clusters)):
                 for j in range(i + 1, len(clusters)):
                     for (a, b) in ((i, j), (j, i)):
-                        n_calls += 1
                         cmp_text = (result_comparison(clusters[a]["df"], clusters[b]["df"])
                                     if "{comparison}" in template else None)
-                        try:
-                            v, _ = pairwise_verdict(*judge, q, doc, schema, cand[a], cand[b],
-                                                    template=template, comparison=cmp_text)
-                            wins[a if v == "A" else b] += 1
-                        except Exception:
-                            n_failed += 1
+                        calls += [(a, b, cmp_text)] * args.votes
+
+            def winner(call):
+                a, b, cmp_text = call
+                try:
+                    v, _ = pairwise_verdict(*judge, q, doc, schema, cand[a], cand[b],
+                                            template=template, comparison=cmp_text)
+                    return a if v == "A" else b
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(args.workers) as ex:
+                winners = list(ex.map(winner, calls))
+            wins = [winners.count(k) for k in range(len(clusters))]
             pick = max(range(len(clusters)), key=lambda k: (wins[k], clusters[k]["votes"]))
-            reason = f"round-robin wins={wins} failed={n_failed}/{n_calls}"
+            reason = f"round-robin wins={wins} failed={winners.count(None)}/{len(calls)}"
         else:
             cand_txt = "\n\n".join(
                 f"--- Candidate {i + 1} (votes: {cl['votes']}) ---\nSQL:\n{cl['sql']}\n"
@@ -457,6 +497,12 @@ def main():
                     pick, reason = 0, "invalid pick -> majority fallback"
             except Exception as e:
                 pick, reason = 0, f"judge error -> majority fallback: {str(e)[:80]}"
+
+        if args.superset_rule and len(clusters) > 1:
+            wider = superset_pick(clusters, pick)
+            if wider != pick:
+                reason = f"superset rule {pick + 1} -> {wider + 1}; {reason}"
+                pick = wider
 
         judge_score, _ = score_against_gold(clusters[pick]["df"], iid, standards)
         tallies["majority"] += maj_score

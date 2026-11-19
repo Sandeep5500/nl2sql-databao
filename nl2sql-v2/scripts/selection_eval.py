@@ -37,6 +37,9 @@ Selection rules on top of the judge, named by suffixes (NAME@U@T=...):
      lanes, then the lower index (deployed: more lanes, then the lower index)
   S  soft votes: each judgment counts its p_first (a probe's or scorer's probability) instead of
      p_first rounded to 0/1, so a calibrated score gets credit for its confidence
+  V2 ask twice (V<k> in general): each ordered pair's vote is the mean of 2 of its samples, drawn without
+     replacement (all of them when it has fewer), so exp1 is the expected accuracy of a run that asks
+     every pair twice. Production since Nov 19 is NAME@U@V2 (select_answer.py --votes 2, superset rule)
 """
 
 import argparse
@@ -121,13 +124,17 @@ def stratum(groups):
     return ("contested" if ncorr <= 2 else "easy"), ncorr
 
 
-def outcomes(vals):
-    """Distribution over a verdict value (1, 0, 0.5 = missing) from the samples of one ordered pair."""
+def outcomes(vals, votes=1):
+    """Distribution over a verdict value (1, 0, 0.5 = missing) from the samples of one ordered pair;
+    with votes > 1, over the mean of that many samples drawn without replacement."""
     if not vals:
         return {0.5: 1.0}
+    vals = [0.5 if v is None else v for v in vals]
+    k = min(votes, len(vals))
+    draws = list(itertools.combinations(vals, k))
     d = defaultdict(float)
-    for v in vals:
-        d[0.5 if v is None else v] += 1 / len(vals)
+    for c in draws:
+        d[sum(c) / k] += 1 / len(draws)
     return dict(d)
 
 
@@ -147,9 +154,10 @@ def pick(groups, st, rules=(), contains=()):
     return top
 
 
-def pool_scores(groups, pair_samples, mc_draws=20000, seed=0, rules=(), contains=()):
+def pool_scores(groups, pair_samples, mc_draws=20000, seed=0, rules=(), contains=(), votes=1):
     """(exp1, avgK) for one pool: groups [(n, correct, cols)], pair_samples {(x, y): [values]},
-    rules: selection rules on top of the round-robin ("U", "T"), contains: the pool's "a>b" list."""
+    rules: selection rules on top of the round-robin ("U", "T"), contains: the pool's "a>b" list,
+    votes: samples averaged into each ordered pair's vote (the V rule)."""
     contains = set(contains)
     alive = [a for a, g in enumerate(groups) if g[0] > 0]
     n = {a: groups[a][0] for a in alive}
@@ -157,7 +165,7 @@ def pool_scores(groups, pair_samples, mc_draws=20000, seed=0, rules=(), contains
         c = float(groups[alive[0]][1])
         return c, c
     pairs = [(x, y) for x in alive for y in alive if x != y]
-    dist = {p: outcomes(pair_samples.get(p, [])) for p in pairs}
+    dist = {p: outcomes(pair_samples.get(p, []), votes) for p in pairs}
     # average rule: each ordered pair contributes its mean value
     st = {a: n[a] - 1.0 for a in alive}
     for (x, y), d in dist.items():
@@ -203,7 +211,7 @@ def pool_scores(groups, pair_samples, mc_draws=20000, seed=0, rules=(), contains
     return hits / mc_draws, avg
 
 
-def score_judge(evalset, samples, sigs, rules=()):
+def score_judge(evalset, samples, sigs, rules=(), votes=1):
     """{pool key: (exp1, avgK)} for pools this judge can be scored on; skipped keys with reasons."""
     out, skipped = {}, defaultdict(list)
     for k, e in evalset["pools"].items():
@@ -216,7 +224,7 @@ def score_judge(evalset, samples, sigs, rules=()):
                 skipped["not judged"].append(k)
                 continue
             out[k] = pool_scores(groups, samples[k], seed=zlib.crc32(k.encode()), rules=rules,
-                                 contains=e.get("contains", ()))
+                                 contains=e.get("contains", ()), votes=votes)
         else:
             c = float(e["stratum"] == "all_correct")
             out[k] = (c, c)
@@ -377,8 +385,10 @@ def score(args):
     for spec in args.judge:
         name, _, globs = spec.partition("=")
         rules = tuple(name.split("@")[1:])
-        if set(rules) - {"U", "T", "S"}:
-            raise SystemExit(f"unknown rule in {name}; known: @U @T @S")
+        votes = [int(r[1:]) for r in rules if r[:1] == "V" and r[1:].isdigit()]
+        rules = tuple(r for r in rules if not (r[:1] == "V" and r[1:].isdigit()))
+        if set(rules) - {"U", "T", "S"} or len(votes) > 1 or min(votes, default=1) < 1:
+            raise SystemExit(f"unknown rule in {name}; known: @U @T @S @V<k>")
         s, sg = load_samples(globs.split(","), old_rule=args.old_rule, soft="S" in rules)
         rules = tuple(r for r in rules if r != "S")
         if args.diag:
@@ -386,7 +396,7 @@ def score(args):
                                                     and e["stratum"] in ("contested", "easy")
                                                     and json.dumps(sg.get(k, e["sig"])) == json.dumps(e["sig"])])
                           for h in ("design", "test", "bq")}
-        judges[name], skipped = score_judge(evalset, s, sg, rules)
+        judges[name], skipped = score_judge(evalset, s, sg, rules, votes[0] if votes else 1)
         for why, ks in skipped.items():
             print(f"[{name}] {len(ks)} mixed pools left out: {why}", file=sys.stderr)
     sets = [("spider2 design", lambda e: e["half"] == "design"), ("spider2 test", lambda e: e["half"] == "test"),
