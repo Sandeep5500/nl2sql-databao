@@ -224,7 +224,9 @@ Right answers are numbered 0 to 3 (the 4 answers of the November 17 run). N18 = 
 
 ## Files
 
-- Evidence packets, protocols, verdicts, second checks and the label builder: `results/bq17/audit/` (not tracked;
-  copies of the protocols, notes and corrected labels are in
-  `nl2sql-v2/research_notes/Spider2 Lite BigQuery full label audit/`).
-- Scoring: `results/prod_nov19/score_prod.py` (the official, strict, no-drift and lenient views).
+- Protocols, auditor notes, verdicts, second checks and the corrected labels:
+  `nl2sql-v2/research_notes/Spider2 Lite BigQuery full label audit/`.
+- Label builder: `nl2sql-v2/scripts/bq_audit_labels.py` (rebuilds `corrected_labels_full.json` from the verdicts and
+  second checks; the official labels come from `results/bq17/`).
+- Scoring: `nl2sql-v2/scripts/score_production_rule.py` (the official, strict, no-drift and lenient views).
+- Evidence packets, and the scripts that built them and the newly mixed pools: `results/bq17/audit/` (not tracked).

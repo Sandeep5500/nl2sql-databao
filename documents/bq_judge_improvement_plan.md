@@ -255,7 +255,7 @@ or per question (C).
 
 **Measures.** exp1 on all questions of each set; the gate uses both sets' mixed pools together (102), paired
 question bootstrap, 97.5% intervals (two new-call arms). Reported for every arm, without affecting the gate:
-bq17 under the audit's strict and lenient corrected labels (`results/bq17/headroom/corrected_labels.py`); both sets
+bq17 under the audit's strict and lenient corrected labels (`nl2sql-v2/scripts/bq_corrected_labels.py`); both sets
 without the seven questions whose official label rewards an arbitrary choice (bq035, ga010, bq002, bq424, bq055,
 bq397, bq208); for B, also without the four questions that motivated it (bq045, bq356, bq051, bq389); and the
 combinations with A (k = 2 averaging and the superset rule on B's calls; majority of two listwise samples on C).

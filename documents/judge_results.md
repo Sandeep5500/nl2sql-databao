@@ -917,7 +917,7 @@ the eval sets, 398 pairs of results stand in the superset relation; the containe
 wrong in none of them, and the reverse in 36.
 
 From the stored samples (old = one call per ordered pair, new = ask twice + superset rule, same samples; 95%
-paired question bootstrap on the mixed pools; `results/prod_nov19/score_prod.py`):
+paired question bootstrap on the mixed pools; `nl2sql-v2/scripts/score_production_rule.py`):
 
 | set | old | new | new − old |
 |---|---|---|---|
@@ -1024,5 +1024,9 @@ needs one GPU per server instead of two.
 - **Full BigQuery rerun.** `results/bq17/` (plan, scores, scripts); its error analysis in `anatomy/`,
   the Nov 18 ablations in `improve/` (round 2: `score_r2.py`, `score_16k.py`, `score_rerun.py`,
   `r2_movers.py`, `r2_16k_calls.py`, `fetch_r2.sh`); round 3 in `round3/` (`score_r3.py`, `facts/`).
-- **Production rule check (Nov 19).** `results/prod_nov19/` (`score_prod.py`; fresh calls in `fetched/`).
+- **Production rule check (Nov 19).** `score_production_rule.py`; fresh calls in `results/prod_nov19/fetched/`, the
+  bf16 test's scorer in `results/prod_nov19/score_bf16.py`.
+- **BigQuery label audits (Nov 18–19).** `bq_corrected_labels.py` (the 13 questions of Nov 18) and
+  `bq_audit_labels.py` (all 204; verdicts, second checks and the corrected labels in
+  `nl2sql-v2/research_notes/Spider2 Lite BigQuery full label audit/`); evidence packets in `results/bq17/audit/`.
 - **Results on Babel.** `/data/user_data/dpalagan/{judge-data,nl2sql-sel}/results/`.
