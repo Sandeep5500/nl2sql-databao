@@ -80,8 +80,9 @@ disagree and one is right need about 14 on average on SQLite. The calls of one q
   softens one unlucky verdict, and the superset rule only moves to a result the scorer accepts whenever
   it accepts the winner. It was the one change that helped on both BigQuery sets and on SQLite in the
   Nov 18 tests; on the stored samples it adds +1.5 [+0.1, +3.0] picks on BigQuery (204 questions), +0.4 on
-  the earlier BigQuery set, and +1.6, +0.5 and +2.7 on the SQLite run sets q36rg, q36e and q36x. It doubles
-  the judge calls. A check on fresh samples is in [judge_results.md](judge_results.md) §14.
+  the earlier BigQuery set, and +1.6, +0.5 and +2.7 on the SQLite run sets q36rg, q36e and q36x. Fresh
+  samples drawn after the decision confirm it: +1.9, +0.2, +1.4, 0.0 and +2.1 on the same sets, +5.6 [+1.5,
+  +10.6] in all ([judge_results.md](judge_results.md) §14). It doubles the judge calls.
 - **An untuned model.** Six fine-tuning recipes (SFT, DPO, letter-only training; at most 2,644
   examples over 1,814 practice pairs from non-Spider2 databases) never beat the untuned thinking judge
   on Spider2. The practice data
@@ -130,8 +131,9 @@ Both run with thinking, temperature 0.6, 8,192 tokens and the `diff_cmp` prompt.
 
 Judge rows are the expected accuracy of one run (exp1, computed from 4 or more samples of every judge
 call; see below). "One call per pair" is production before Nov 19; "production" asks every pair twice and
-applies the superset rule, scored here from the stored samples (a check on fresh samples is in
-[judge_results.md](judge_results.md) §14).
+applies the superset rule. Both 35B rows use every sample we have (the stored ones plus 4 fresh samples per
+pair drawn on Nov 19, 8 in all); the fresh samples alone give the same gain ([judge_results.md](judge_results.md)
+§14). The 27B rows use its 4 stored samples.
 
 **SQLite, 135 local questions, run q36rg** (Qwen3.6-35B-A3B agent, 4 lanes, temperature 0.7):
 
@@ -139,12 +141,13 @@ applies the superset rule, scored here from the stored samples (a check on fresh
 |---|---|---|
 | one lane (pass@1, average) | 69.0 | 51.1% |
 | majority vote (ties at random) | 73.2 | 54.2% |
-| 35B judge, `diff_cmp`, one call per pair | 85.6 | 63.4% |
-| **35B judge, production (asks twice, superset rule)** | **87.2** | **64.6%** |
+| 35B judge, `diff_cmp`, one call per pair | 85.3 | 63.2% |
+| **35B judge, production (asks twice, superset rule)** | **86.5** | **64.1%** |
 | 27B judge, `diff_cmp`, one call per pair | 86.6 | 64.1% |
 | any lane right (pass@4) | 94 | 69.6% |
 
-On this run set alone the 27B's lead over the one-call 35B is +1.0 [−2.5, +4.6].
+On this run set alone the 27B's lead over the one-call 35B is +1.0 [−2.5, +4.6] (both from their 4 stored samples;
+the 35B scores 85.6 there).
 
 **SQLite, newer run sets q36e and q36x** (Oct 7–8, explored enrichment; 35B judge only, the 27B was
 not run on them):
@@ -153,8 +156,8 @@ not run on them):
 |---|---|---|
 | one lane (pass@1, average) | 72.5 (53.7%) | 67.5 (50.0%) |
 | majority vote (ties at random) | 78.5 (58.1%) | 75.2 (55.7%) |
-| 35B judge, `diff_cmp`, one call per pair | 82.8 (61.3%) | 82.8 (61.3%) |
-| **35B judge, production (asks twice, superset rule)** | **83.3 (61.7%)** | **85.5 (63.3%)** |
+| 35B judge, `diff_cmp`, one call per pair | 83.2 (61.6%) | 83.1 (61.5%) |
+| **35B judge, production (asks twice, superset rule)** | **83.3 (61.7%)** | **85.1 (63.1%)** |
 | any lane right (pass@4) | 92 (68.1%) | 91 (67.4%) |
 
 The one-call judge beats majority vote by +4.3 [−0.9, +9.8] and +7.5 [+1.3, +13.8] picks. q36x's own log says
@@ -166,14 +169,18 @@ The one-call judge beats majority vote by +4.3 [−0.9, +9.8] and +7.5 [+1.3, +1
 |---|---|---|
 | one lane (pass@1, average) | 98.0 | 48.0% |
 | majority vote (ties at random) | 105.2 | 51.6% |
-| 35B judge, `diff_cmp`, one call per pair (two runs pooled) | 113.2 | 55.5% |
-| **35B judge, production (asks twice, superset rule)** | **114.7** | **56.2%** |
+| 35B judge, `diff_cmp`, one call per pair (three runs pooled) | 112.6 | 55.2% |
+| **35B judge, production (asks twice, superset rule)** | **114.2** | **56.0%** |
 | 27B judge, `diff_cmp`, one call per pair | 115.5 | 56.6% |
 | any lane right (pass@4) | 129 | 63.2% |
 
-Under the gold audit's corrected labels (13 audited questions, chosen where the judges lost, so the
-correction leans in the judges' favour) the 35B production scores 116.7 (57.2%, strict) and 120.5 (59.1%,
-both fair readings accepted); one call per pair gives 114.9 and 118.8.
+Under the labels of the full audit of all 204 questions (Nov 19; corrections in both directions, each strict
+change checked by a second auditor;
+[report](../nl2sql-v2/reports/Spider2%20Lite%20BigQuery%20full%20label%20audit.md)), the 35B production scores
+125.9 (61.7%) with strict corrections, 121.9 (59.8%) without the corrections for data drift, and 146.0 (71.6%)
+when fair second readings also count. One call per pair gives 126.1, 122.1 and 145.9, so the production rule's
+gain holds under the official labels only. Majority vote scores 117.3, 114.1 and 133.3; pass@4 is 141, 137 and
+157. (The earlier 13-question audit, which read only the judges' losses, gave 116.7 and 120.5.)
 
 With one call per pair, the 35B judge keeps half to two thirds of the pass@1 to pass@4 gap on SQLite (q36rg 16.6 of 25 picks,
 q36e 10.3 of 19.5, q36x 15.3 of 23.5) and about half on BigQuery (15.2 of 31).
@@ -218,6 +225,9 @@ q36e 10.3 of 19.5, q36x 15.3 of 23.5) and about half on BigQuery (15.2 of 31).
   is documented and lose about as much elsewhere) and a listwise judge that sees every result of a
   question in one call (+0.8 [−4.5, +6.3]; worse than the round-robin when all four results differ).
   Neither reached the +2.0 the plan asked for.
+- The same 35B in bf16 instead of AWQ 4-bit (Nov 19, fresh samples, production rule): +2.8 [−0.7, +7.0] on
+  BigQuery's mixed pools (+2.0 against every AWQ sample, 0.0 on the 204-question set itself) and −0.9 on SQLite,
+  short of the +2.0 with an interval above zero that the test asked for. bf16 would also need two GPUs per server.
 
 ## How to test a judge change
 
@@ -254,15 +264,12 @@ a preemption is the clean one.
 
 ## Open items (Nov 19)
 
-- Running: the check of the production rule on fresh samples, and the same 35B in bf16 instead of AWQ
-  4-bit ([judge_results.md](judge_results.md) §14).
-- Running: an audit of all 204 BigQuery labels, so that corrected-label scores can move both ways (the
-  Nov 18 audit read only the 13 questions where the judges lost).
+- Labels: the full audit changes the strict labels of 34 of the 204 BigQuery questions (68 answers become
+  right, 22 stop counting as right), mostly from Spider2's November 2025 gold files. Reporting them upstream is
+  the team's call.
 - Needs the team's confirmation: the 27B does not fit the small-model goal (recommended above, "The two
   judges").
 - Not run: the 27B on q36e and q36x (stopped to free GPUs for BigQuery).
 - Not read: the 27B's misses in the BigQuery questions nobody has read (2.9 picks over 43 pools).
 - Both BigQuery sets have been used for development, so a further BigQuery change needs a new test set,
   e.g. a fresh agent run on the 204 questions.
-- About half of the BigQuery loss is label problems (gold files that contradict their SQL in 4 questions,
-  a tolerance tripped by 1.6 parts per million); these limit any judge and could be reported upstream.

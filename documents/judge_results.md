@@ -939,6 +939,46 @@ with the 95% paired question bootstrap; bq17 also under the audit's strict and l
 adopted either way. The check fails if the new rule is below the old one summed over the five sets' mixed pools;
 the decision then goes back to the user. Calls redrawn after a preemption are counted from the starts logs.
 
+**Fresh-sample result (Nov 19): the check passes.** The new rule gains on the fresh samples as it did on the stored
+ones, and is below the old rule on no set. No session was preempted (no redrawn call); 1–2% of calls ended without a
+verdict, as before.
+
+| set | fresh: old → new | new − old (95%) | stored: new − old | all 8 samples: old → new |
+|---|---|---|---|---|
+| BigQuery bq17 (of 204) | 111.3 → 113.2 | +1.9 [+0.2, +3.9] | +1.5 | 112.6 → 114.2 (56.0%) |
+| BigQuery earlier set (of 105) | 28.3 → 28.5 | +0.2 [−0.8, +1.4] | +0.4 | 28.1 → 28.4 |
+| SQLite q36rg (of 135) | 85.0 → 86.4 | +1.4 [−0.1, +3.1] | +1.6 | 85.3 → 86.5 (64.1%) |
+| SQLite q36e | 83.4 → 83.4 | 0.0 [−1.5, +1.5] | +0.5 | 83.2 → 83.3 (61.7%) |
+| SQLite q36x | 83.1 → 85.1 | +2.1 [+0.4, +4.6] | +2.7 | 83.1 → 85.1 (63.1%) |
+| five sets' mixed pools | | **+5.6 [+1.5, +10.6]** | +6.7 | +5.3 [+1.1, +10.9] |
+
+(Stored samples: 8 per ordered pair on BigQuery, 4 on SQLite; fresh: 4; "all" pools both.) The one-call baseline moves
+by up to 1.9 between runs of the same prompt (bq17 113.2 stored, 111.3 fresh), as earlier reruns did; the rule's gain
+is steadier than the baseline itself.
+
+**Full audit of the 204 BigQuery labels (Nov 19;
+[report](../nl2sql-v2/reports/Spider2%20Lite%20BigQuery%20full%20label%20audit.md)).** The Nov 18 audit read only the
+13 questions where the judges lost, so its corrections could only help the judges. Auditors (Claude agents, one
+written protocol, evidence packets built from local files, no BigQuery runs) read the other 191: 131 labels right, 16
+golds wrong, 22 scoring defects, 19 with a second fair reading, 3 unclear. A second auditor re-checked all 34 strict
+changes and rejected 6. With the 13 from Nov 18, strict corrections change 34 questions (68 answers become right, 22
+stop counting as right), and lenient ones 59. The 23 questions that become mixed only under corrected labels were
+judged on Nov 19 with the production settings (776 calls). bq17, every judge sample:
+
+| correct of 204 | official | strict | strict, no drift | lenient |
+|---|---|---|---|---|
+| pass@1 / majority | 98.0 / 105.2 | 109.2 / 117.3 | 106.0 / 114.1 | 123.8 / 133.3 |
+| 35B, one call per pair | 112.6 | 126.1 | 122.1 | 145.9 |
+| **35B, production** | **114.2 (56.0%)** | **125.9 (61.7%)** | **121.9 (59.8%)** | **146.0 (71.6%)** |
+| pass@4 | 129 | 141 | 137 | 157 |
+
+The judge keeps its lead over majority vote (+9.0, +8.6, +7.8, +12.7), but the production rule's gain disappears with
+corrected labels (−0.1 [−2.5, +1.8] strict): its official gain sits in questions whose labels the audit changed
+(ga004 +0.5, bq199 +0.3), and in bq161 the superset rule picks a wider result whose extra column happens to hold the
+gold value while its actual answer differs (−0.9 under strict labels). The superset rule is safe for the official
+scorer, not necessarily for the substance of an answer. The 27B has no samples on the 23 newly mixed questions, so it
+is not scored under the corrected labels.
+
 **bf16 judge test (written before any call, Nov 19).** The same model at full precision instead of AWQ 4-bit:
 `Qwen/Qwen3.6-35B-A3B` in bf16, one vLLM engine over two GPUs (`judge_variants.slurm` with `MODEL` and `TP=2`; a GPU
 preflight and an obvious-pair smoke test before any call). Everything else as in the fresh AWQ check above: the same
@@ -948,6 +988,21 @@ AWQ samples. Pass: on both BigQuery sets' mixed pools (102) at least +2.0 with t
 above zero, and on the SQLite run sets' mixed pools (146) not below −1.5. One-call numbers and call health (no
 verdict, truncation, tokens) are reported alongside. If it passes, a bf16 judge needs two 48 GB GPUs (or one
 80 GB GPU) per server instead of one, with the same active parameters per token.
+
+**bf16 result (Nov 19): the test fails.** Fresh samples, 4 per ordered pair for each model; production rule:
+
+| set | AWQ | bf16 | bf16 − AWQ |
+|---|---|---|---|
+| BigQuery bq17 (of 204) | 113.2 | 114.2 | +1.0 |
+| BigQuery earlier set (of 105) | 28.5 | 30.4 | +1.9 |
+| SQLite q36rg / q36e / q36x (of 135) | 86.4 / 83.4 / 85.1 | 86.9 / 84.1 / 83.1 | +0.5 / +0.7 / −2.0 |
+
+On BigQuery's mixed pools bf16 gains +2.8 [−0.7, +7.0] (97.5%): the point clears +2.0 but the interval includes zero.
+On SQLite's it loses −0.9 [−4.4, +2.4], inside the −1.5 allowance. With one call per pair: +2.5 [−0.9, +6.2] and +0.2.
+The fresh AWQ draw on bq17 came out low, and against every AWQ sample (12 per pair on bq17) bf16 gains +2.0
+[−0.8, +4.9] on BigQuery (0.0 on bq17 itself) and −0.8 on SQLite. bf16 leaves fewer bq17 calls without a verdict (12
+against 24); elsewhere the two are alike, and neither session was preempted. Production stays on the AWQ 35B, which
+needs one GPU per server instead of two.
 
 ## 15. Where things are
 
