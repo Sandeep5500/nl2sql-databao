@@ -25,6 +25,19 @@ def _normalize(value):
     return value
 
 
+#: Relative tolerance for numeric comparison, alongside the absolute one.
+#:
+#: math.isclose keeps its DEFAULT rel_tol=1e-09 whenever only abs_tol is passed,
+#: which made large-magnitude aggregates unmatchable. Gold is executed with
+#: sqlite3 while the agent runs DuckDB-over-SQLite, and the two sum floats in a
+#: different order -- a correct aggregate differs by ~1e-8 RELATIVE. At magnitude
+#: 3.5e6 that is 0.08 ABSOLUTE, so both the 1e-2 absolute bound and the 1e-09
+#: relative default were exceeded and a correct answer scored wrong. No query the
+#: agent could write would match. 1e-6 is ~100x the observed summation error and
+#: ~1e4x tighter than the absolute bound at the magnitudes where it binds.
+NUMERIC_REL_TOL = 1e-6
+
+
 def _vectors_match(v1, v2, tol=1e-2, ignore_order=False):
     v1 = [_normalize(x) for x in v1]
     v2 = [_normalize(x) for x in v2]
@@ -37,7 +50,8 @@ def _vectors_match(v1, v2, tol=1e-2, ignore_order=False):
         if pd.isna(a) and pd.isna(b):
             continue
         if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            if not math.isclose(float(a), float(b), abs_tol=tol):
+            if not math.isclose(float(a), float(b), rel_tol=NUMERIC_REL_TOL,
+                                abs_tol=tol):
                 return False
         elif a != b:
             return False

@@ -161,7 +161,10 @@ def training_args(out, args):
         output_dir=str(out), num_train_epochs=args.epochs,
         per_device_train_batch_size=1, gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr, lr_scheduler_type="cosine", warmup_ratio=0.03,
-        logging_steps=5, save_strategy="no", bf16=True,
+        logging_steps=5, bf16=True,
+        # a rung is only 93-348 optimizer steps at grad_accum=16, so save
+        # often: save_steps=200 never fired for the 250- and 500-pair rungs.
+        save_strategy="steps", save_steps=20, save_total_limit=1,
         gradient_checkpointing=True, report_to=[], seed=args.seed,
         optim="paged_adamw_8bit")
     ok = set(inspect.signature(TrainingArguments.__init__).parameters)
@@ -240,7 +243,13 @@ def main():
         data_collator=lambda b: collate(b, tok.pad_token_id),
         args=training_args(out, args),
     )
-    trainer.train()
+    # the preempt partition requeues on preemption, which restarts the script
+    # from the top; without this a 90-minute rung can lose all of it repeatedly.
+    ckpts = sorted(out.glob("checkpoint-*"),
+                   key=lambda d: int(d.name.split("-")[1])) if out.exists() else []
+    if ckpts:
+        print(f"[train] resuming from {ckpts[-1].name}")
+    trainer.train(resume_from_checkpoint=str(ckpts[-1]) if ckpts else None)
 
     print("\n--- tuned on held-out ---")
     acc2, sym2, n2, bp2 = evaluate(model, tok, held, ids, args.max_len, args.eval_batch)

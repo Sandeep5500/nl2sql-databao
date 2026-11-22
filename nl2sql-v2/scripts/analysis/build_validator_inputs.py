@@ -47,8 +47,28 @@ def reasoning_of(trace: dict) -> dict:
                     summary = _json.loads(tc["function"]["arguments"]).get("result_description")
                 except Exception:
                     pass
+    # The record of what it actually DID: each tool call and what the database
+    # answered. Distinct from narration, which is only the model's prose -- the
+    # five reasoning variants tried so far all showed it the story and never the
+    # verification. A judge can read this as evidence rather than as a claim.
+    steps = []
+    for e in trace.get("trace", []):
+        if "tool" not in e:
+            continue
+        a = e.get("args") or {}
+        if isinstance(a, str):
+            try:
+                a = _json.loads(a)
+            except Exception:
+                a = {"arg": a}
+        arg = (a.get("sql") or a.get("retrieve_text")
+               or (f"{a.get('table')}.{a.get('column')}" if a.get("column") else None)
+               or a.get("table") or a.get("term") or "")
+        res = " ".join(str(e.get("result") or "").split())
+        steps.append(f"{e['tool']}({str(arg)[:160]}) -> {res[:220]}")
     return {"summary": summary, "last_messages": msgs[-2:], "narration": "\n".join(msgs),
-            "thinking": "\n---\n".join(thinking), "thinking_last": "\n---\n".join(thinking[-2:])}
+            "thinking": "\n---\n".join(thinking), "thinking_last": "\n---\n".join(thinking[-2:]),
+            "steps": "\n".join(steps)}
 
 
 def main():
