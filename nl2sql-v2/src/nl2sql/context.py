@@ -89,6 +89,14 @@ class TableContext:
         if explored and npath.exists():
             import json
             self.explored = json.loads(npath.read_text())
+        # join hazards precomputed by scripts/compute_joins.py: same-named
+        # columns in other tables whose types clash or whose values do not
+        # overlap. Absent -> no join lines.
+        self.joins: dict[str, list] = {}
+        jpath = Path(project_dir) / "output" / "joins" / (Path(datasource_id).stem + ".json")
+        if jpath.exists():
+            import json
+            self.joins = {k.lower(): v for k, v in json.loads(jpath.read_text()).items()}
         # column profiles precomputed by scripts/compute_profile.py
         self.profiles: dict[str, dict] = {}
         ppath = Path(project_dir) / "output" / "profile" / (Path(datasource_id).stem + ".json")
@@ -168,6 +176,34 @@ class TableContext:
         if dups:
             return [f"no key: {dups} rows are exact copies of another row"]
         return ["no key confirmed for this table"]
+
+    def join_lines(self, table: str, limit: int = 10) -> list[str]:
+        """Measured hazards for joining this table's columns to a same-named
+        column elsewhere: a type clash needing a cast, or no shared values at
+        all. Facts from the data only; says nothing about whether the pair is
+        meant to be a foreign key."""
+        recs = self.joins.get(table.lower()) or []
+        if not recs:
+            return []
+        # type clashes first, then empty joins, then by how much they overlap
+        recs = sorted(recs, key=lambda r: (not r.get("type_mismatch"),
+                                           (r.get("values_in_common") or 0)))
+        out = []
+        for r in recs[:limit]:
+            tgt = f"{r['other_table']}.{r['column']}"
+            common = r.get("values_in_common")
+            if r.get("type_mismatch"):
+                how = (f"TYPE MISMATCH: {r['column']} is {r['this_type']} here and "
+                       f"{r['other_type']} in {r['other_table']} — CAST both sides "
+                       f"before joining")
+            else:
+                how = f"NO VALUES IN COMMON with {tgt} — this join returns 0 rows"
+            if common is not None and r.get("type_mismatch"):
+                how += f"; {common} value(s) match once cast"
+            out.append("  " + how)
+        if len(recs) > limit:
+            out.append(f"  (+{len(recs) - limit} more)")
+        return ["join hazards (measured, not declared):"] + out
 
     def foreign_keys(self, table: str) -> list[str]:
         out = []

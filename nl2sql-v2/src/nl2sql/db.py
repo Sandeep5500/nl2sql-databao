@@ -218,6 +218,7 @@ class Database:
             fks = context.foreign_keys(table)
             if fks:
                 keys.append("foreign keys (declared): " + "; ".join(fks))
+            keys += context.join_lines(table)
             lines[1:1] = keys
 
         if n_rows:
