@@ -19,6 +19,16 @@ workarounds.
 - NULLs: aggregate functions skip NULLs; comparisons with NULL are never true — use IS \
 NULL / COALESCE deliberately.
 
+Answer formatting (the reference table follows these; extra columns never hurt, \
+extra or missing ROWS always do):
+- Dates: return them as YYYY-MM-DD (or YYYY-MM for a month). Some columns store dates \
+as DD-MM-YYYY or as text like 'April 2017' — convert before submitting.
+- Rounding: do not round unless the question asks for it. If you must, keep at least \
+4 decimal places.
+- Identifiers: when the schema has more than one identifier for the same entity \
+(e.g. customer_id and customer_unique_id), include BOTH columns — but only when the \
+extra column cannot increase the row count.
+
 Pre-submit checklist:
 - Row count plausible? Ordering/rounding as requested?
 - If the question asks for a single value, return a single row and column.

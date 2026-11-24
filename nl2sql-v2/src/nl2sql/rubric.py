@@ -113,6 +113,21 @@ SUBMIT_RUBRIC = {"type": "function", "function": {
                                       "itself fixes it (a single answer, a stated top-N). "
                                       "Otherwise null."},
         "rows_confidence": _CONF,
+        # Two decisions the planner used to defer to open_points, where the analyst
+        # ignored them. Required booleans: it must choose, it cannot hedge.
+        "answer_is_single_row": {"type": "boolean",
+            "description": "TRUE when the question selects ONE winner, total or figure "
+                           "over a set or grouping — 'which X appears most often', "
+                           "'in which year...', 'the five cities with the lowest "
+                           "payments, then the average of their totals'. The grouping "
+                           "is then a FILTER, not the grain. FALSE only when the "
+                           "question asks to see each member separately."},
+        "include_zero_count_entities": {"type": "boolean",
+            "description": "For a per-entity grain, TRUE when entities with no matching "
+                           "data still need a row (count 0) — 'list each X', 'for every "
+                           "X'. FALSE when the question restricts to entities that "
+                           "actually have data. Answer FALSE when the grain is not "
+                           "per-entity."},
         "columns": {"type": "array", "items": {"type": "object", "properties": {
             "holds": {"type": "string", "description": "What the column contains."},
             "type": {"type": "string",
@@ -127,7 +142,22 @@ SUBMIT_RUBRIC = {"type": "function", "function": {
                         "description": "Shape questions left open, each with the "
                                        "alternatives and what would settle it."}},
         "required": ["row_grain", "row_count", "exact_rows", "rows_confidence",
+                     "answer_is_single_row", "include_zero_count_entities",
                      "columns", "columns_confidence", "ordering", "open_points"]}}}
+
+
+def effective_exact_rows(rubric: dict):
+    """The row count the submit-time gate should enforce.
+
+    The planner reliably *identifies* a single-winner question and then declines to
+    put a number on it (exact_rows null, confidence medium) -- measured on local264
+    and local017, which together account for 21 of the lost episodes. When it has
+    committed to answer_is_single_row, that IS the number.
+    """
+    ex = rubric.get("exact_rows")
+    if ex is None and rubric.get("answer_is_single_row") is True:
+        return 1
+    return ex
 
 
 def run_rubric(question: str, session: ToolSession, llm: LLMConfig, cfg: AgentConfig,
@@ -216,6 +246,18 @@ def render_rubric(rubric: dict) -> str:
         "and describes only the shape of the result, not values or method.",
         f"Rows (confidence: {rubric.get('rows_confidence', 'low')}): "
         f"{rubric.get('row_grain', '')} — {rubric.get('row_count', '')}",
+    ]
+    # Stated as decisions, not as open questions: the planner had to commit. Absent
+    # in rubrics generated before the required booleans existed -- say nothing then.
+    if rubric.get("answer_is_single_row") is True:
+        lines.append("The question selects ONE winner over the set, so the answer is "
+                     "a SINGLE row.")
+    elif rubric.get("answer_is_single_row") is False:
+        lines.append("The question asks to see each member, so one row per member.")
+    if rubric.get("include_zero_count_entities") is True:
+        lines.append("Entities with no matching data still need a row (count 0) — "
+                     "use an outer join; do not let a filter drop them.")
+    lines += [
         f"Columns (confidence: {rubric.get('columns_confidence', 'low')}), at minimum:",
     ]
     for i, c in enumerate(rubric.get("columns") or [], 1):

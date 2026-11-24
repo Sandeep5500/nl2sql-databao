@@ -46,6 +46,13 @@ class CriticConfig:
 @dataclass
 class AgentConfig:
     max_steps: int = 30                 # LLM turns per episode
+    # Grant extra steps ONLY to an episode that exhausted the budget without
+    # submitting -- otherwise it dies into the salvage path, whose candidates are
+    # correct 5% of the time against 59% for a real submission. Episodes that
+    # submit in time are untouched, so the baseline stays comparable.
+    step_extension: int = 0             # extra steps per rescue; opt in with
+                                        # --step-extension N (0 = off, old behaviour)
+    max_step_extensions: int = 1        # how many rescues an episode may have
     preview_rows_default: int = 12
     preview_rows_max: int = 50
     result_rows_max: int = 5000     # full stored result cap (max gold is 2000 rows)

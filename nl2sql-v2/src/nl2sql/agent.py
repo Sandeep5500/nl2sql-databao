@@ -26,6 +26,7 @@ class EpisodeResult:
     steps: int = 0
     critic_rounds: int = 0
     shape_refusals: int = 0
+    step_extensions: int = 0
     refused_qid: str = ""
     search_calls: int = 0
     error: str | None = None
@@ -140,7 +141,29 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                   if llm.chat_template_kwargs else None)
 
     ctx_retried_step = -1
-    for step in range(cfg.max_steps):
+    budget, extensions, step = cfg.max_steps, 0, -1
+    while True:
+        step += 1
+        if step >= budget:
+            # Out of steps without a submission. The salvage path that follows picks
+            # a candidate that is correct ~5% of the time, against ~59% for a real
+            # submission, so buy the episode a short extension and tell it to land
+            # the answer. Episodes that submitted in time never reach this.
+            if (result.status == "no_sql" and cfg.step_extension > 0
+                    and extensions < cfg.max_step_extensions):
+                extensions += 1
+                budget += cfg.step_extension
+                result.step_extensions = extensions
+                messages.append({"role": "user", "content": (
+                    f"You have run out of steps without submitting. You get "
+                    f"{cfg.step_extension} more, and no further extension. Do not start "
+                    f"a new line of investigation. Take the best query you have already "
+                    f"run, fix only what is clearly wrong with it, and call "
+                    f"submit_result. Submitting an imperfect answer beats not "
+                    f"submitting.")})
+                step -= 1          # this iteration was the check, not a turn
+                continue
+            break
         result.steps = step + 1
         _compact_memory(messages, cfg, client, llm, result.trace)
         try:
@@ -234,7 +257,7 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                     and not args.get("confirm_shape")
                     and len(df) != rubric_rows
                     and result.shape_refusals < cfg.max_shape_refusals
-                    and cfg.max_steps - step >= cfg.shape_check_reserve):
+                    and budget - step >= cfg.shape_check_reserve):
                 result.shape_refusals += 1
                 complaint = (
                     f"SUBMISSION REFUSED. The planner read the question as asking for "

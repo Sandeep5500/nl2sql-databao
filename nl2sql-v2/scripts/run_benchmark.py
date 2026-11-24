@@ -27,7 +27,7 @@ from nl2sql.config import (AgentConfig, CriticConfig, DCE_PROJECT_DIR, DOCS_DIR,
 from nl2sql.context import SearchContext, TableContext
 from nl2sql.db import Database
 from nl2sql.eval import load_eval_standards, score_against_gold
-from nl2sql.rubric import load_rubric, render_rubric
+from nl2sql.rubric import effective_exact_rows, load_rubric, render_rubric
 from nl2sql.tools import ToolSession
 
 
@@ -212,6 +212,9 @@ def main():
     ap.add_argument("--rubric-enforce", action="store_true",
                     help="refuse a submission whose row count contradicts a "
                          "high-confidence rubric, instead of only advising")
+    ap.add_argument("--step-extension", type=int, default=0,
+                    help="extra steps granted ONCE to an episode that exhausted its "
+                         "budget without submitting (0 = off, the old behaviour)")
     ap.add_argument("--rubric-confident-only", action="store_true",
                     help="use a question's rubric only when it states an exact row "
                          "count with high confidence; otherwise add nothing")
@@ -235,7 +238,8 @@ def main():
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
                       text_sql_fallback=args.text_sql_fallback,
-                      rubric_enforce=args.rubric_enforce)
+                      rubric_enforce=args.rubric_enforce,
+                      step_extension=args.step_extension)
     critic = CriticConfig(enabled=bool(args.critic_model),
                           base_url=args.critic_endpoint, model=args.critic_model,
                           chat_template_kwargs={"enable_thinking": False}
@@ -267,7 +271,7 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["instance_id", "db", "score", "score_detail", "status", "steps",
-                  "critic_rounds", "search_calls", "draft_calls", "wall_seconds",
+                  "critic_rounds", "step_extensions", "search_calls", "draft_calls", "wall_seconds",
                   "sql"]
     correct = 0
     # an empty file (a lane killed before its first question) has no header yet
@@ -330,9 +334,13 @@ def main():
             rubric_rows = None
             if args.rubric_dir:
                 rubric = load_rubric(args.rubric_dir, iid)
-                confident = bool(rubric
-                                 and rubric.get("rows_confidence") == "high"
-                                 and rubric.get("exact_rows") is not None)
+                # effective_exact_rows also honours answer_is_single_row, the required
+                # boolean that replaced the planner's habit of naming the right reading
+                # in open_points and then leaving exact_rows null (local264, local017).
+                eff = effective_exact_rows(rubric) if rubric else None
+                confident = bool(rubric and eff is not None
+                                 and (rubric.get("rows_confidence") == "high"
+                                      or rubric.get("answer_is_single_row") is True))
                 if rubric and args.rubric_confident_only and not confident:
                     rubric = None
                 if rubric:
@@ -340,7 +348,7 @@ def main():
                     # Only a confident, exact count is worth enforcing: 4 of 73 rubrics
                     # had the wrong row count, and a wrong one halves the solve rate.
                     if confident:
-                        rubric_rows = int(rubric["exact_rows"])
+                        rubric_rows = int(eff)
 
             draft = None
             if args.draft_endpoint and args.draft_model:
@@ -381,6 +389,7 @@ def main():
                 "instance_id": iid, "db": db_name, "score": score,
                 "score_detail": detail, "status": result.status,
                 "steps": result.steps, "critic_rounds": result.critic_rounds,
+                "step_extensions": result.step_extensions,
                 "search_calls": result.search_calls,
                 "draft_calls": session.draft_calls,
                 "wall_seconds": round(result.wall_seconds, 1),
