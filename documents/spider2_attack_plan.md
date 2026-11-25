@@ -396,9 +396,18 @@ identical): the gate did `int(exact_rows)` and one rubric of 135 (`local356`) ca
 question. Every lane therefore reports **134/135**; local356 is counted wrong in all
 figures above. It is 0/12 historically, so the cost is ~0.
 
-Artifacts: `~/q36f_out/` on Babel (28 shard CSVs, 135 r3 rubrics, per-episode
-timings) — `/data/user_data` is not readable from login nodes. Traces remain at
-`/data/user_data/juliep2/q36f_tree/logs/traces/q36f_pass4_k{1..4}_{0..6}/`.
+Artifacts, now **in the repo** so a combined/pass@8 run can consume them directly:
+
+- `results/q36f_pass4_k{1..4}.csv` — 134 episodes per lane, the 7 shards merged and
+  sorted by instance_id; carries `step_extensions` (new column) and the final SQL.
+- `logs/rubrics/r3/` — the **exact** 135 rubrics the run read. The planner runs at
+  temp 0.7, so regenerating gives different rubrics and breaks comparability; pass
+  `--rubric-dir logs/rubrics/r3`. See its README for the two reuse traps
+  (`local356`'s empty `exact_rows`, and `local163`'s wrong enforced count).
+- `logs/traces/q36f_pass4_k{1..4}/` — 134 episode traces per lane for `inspect view`.
+
+Also mirrored on Babel at `~/q36f_out/` (login-node readable; `/data/user_data` is
+not). The run's worktree `/data/user_data/juliep2/q36f_tree` is disposable.
 
 Checked and ruled out: the last-quintile accuracy dip (41%/30% vs 59-60% earlier) is
 *difficulty*, not server decay — those questions' q36e-expected rate is 31-33% and
