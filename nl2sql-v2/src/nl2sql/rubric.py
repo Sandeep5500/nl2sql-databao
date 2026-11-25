@@ -153,11 +153,34 @@ def effective_exact_rows(rubric: dict):
     put a number on it (exact_rows null, confidence medium) -- measured on local264
     and local017, which together account for 21 of the lost episodes. When it has
     committed to answer_is_single_row, that IS the number.
+
+    The schema says integer-or-null, but the model also emits "" for "no number"
+    (1 of 135 rubrics in r3: local356, alongside rows_confidence "high"). That
+    used to reach the caller's int() and abort the whole shard, so absent is
+    normalised here and anything unparseable is treated as absent rather than
+    trusted.
     """
-    ex = rubric.get("exact_rows")
+    ex = _as_row_count(rubric.get("exact_rows"))
     if ex is None and rubric.get("answer_is_single_row") is True:
         return 1
     return ex
+
+
+def _as_row_count(value):
+    """A positive int, or None when the planner gave no usable number."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value > 0 and value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            n = int(value.strip())
+        except ValueError:
+            return None
+        return n if n > 0 else None
+    return None
 
 
 def run_rubric(question: str, session: ToolSession, llm: LLMConfig, cfg: AgentConfig,

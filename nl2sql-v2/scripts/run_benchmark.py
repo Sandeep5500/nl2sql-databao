@@ -348,7 +348,7 @@ def main():
                     # Only a confident, exact count is worth enforcing: 4 of 73 rubrics
                     # had the wrong row count, and a wrong one halves the solve rate.
                     if confident:
-                        rubric_rows = int(eff)
+                        rubric_rows = eff   # already a positive int or None
 
             draft = None
             if args.draft_endpoint and args.draft_model:
