@@ -325,3 +325,81 @@ the bottleneck → cross-family judge / probe-augmented judge / trained verifier
 
 Cumulative: all-8-lane 35B union 102/135 (75.6%); global solved-ever 105/135;
 762 winning traces; never-solved core 30.
+
+
+### Results: presentation-loss arm q36f (Nov 24-25, 2026)
+
+Hypothesis: a measurable slice of our failures are answers the agent computes
+correctly and then submits in a shape the scorer rejects. Four changes, all aimed
+at that slice, nothing aimed at capability:
+
+1. **Output-format rules** in the system prompt — ISO dates (`YYYY-MM-DD`), no
+   rounding unless asked, and include BOTH identifiers when the schema has two for
+   one entity (`customer_id` + `customer_unique_id`).
+2. **Rubric commitment** — two *required* booleans added to the submit rubric,
+   `answer_is_single_row` and `include_zero_count_entities`. The planner reliably
+   recognised a single-winner question and then left `exact_rows` null; the boolean
+   forces the call. `effective_exact_rows()` honours it.
+3. **Step rescue** — `--step-extension 15`: an episode that hits the step cap with
+   no SQL submitted gets one budget extension instead of a forced fallback.
+4. Join/type hygiene in `describe_table` (committed, **not** in this run's tree).
+
+Setup: Qwen3.6-35B-A3B-AWQ, temp 0.7, 4 lanes, 7 shards, `--context-mode search
+--schema-overview --rubric-dir r3 --rubric-confident-only --rubric-enforce`.
+Baseline is **q36e** (explored enrichment, old vector index), the best prior config.
+
+| | q36e | q36f |
+|---|---|---|
+| lanes | 75 / 69 / 74 / 72 | 83 / 74 / 83 / 79 |
+| pass@1 | 53.7% (72.5/135) | **59.1% (79.75/135)** |
+| pass@4 | 92 (68.7%) | **100 (74.6%)** |
+| pass^4 | 45 (33.6%) | **53 (39.6%)** |
+| fallback rate | 13.9% | **2.6%** |
+| lane sd | 2.65 | 4.27 |
+
+**+7.25 questions (+5.4 pp), SE 2.51, Welch t=2.89 (df 5, p~0.03)** — the first
+change in this project to clear the noise band. Caveats that belong with the number:
+the effect is 5 points, not 10, and lane sd rose to 4.27, so a *single* lane of this
+config reads anywhere from 55% to 62%. Judge it on the 4-lane mean only.
+
+Solve-count distribution hardened at both poles: never-solved 42 -> **34**,
+always-solved 45 -> **53**. That pass^4 move is the more useful result than pass@1 —
+8 more questions now survive every attempt, which is what a single-lane system needs.
+
+**Reproducible core** (same verdict in all 4 lanes), which is the part not to
+attribute to variance:
+
+- gained, 0/4 baseline -> 4/4 now: `local004` `local030` `local067` `local157`
+  `local264` `local299`
+- lost, 4/4 baseline -> 0/4 now: `local163`
+- net **+5** reproducible; the remaining ~+2 is movement in the coin-flip middle.
+
+Every gain is a question one of the above changes was built for: local004 the dual
+identifier, local157 ISO dates + rounding, local264 the single-row boolean (now
+solves in 3-6 steps vs abstaining before), local030 shape commitment.
+
+Step rescue, pooled over 536 episodes: fired **91** times, 77 went on to submit,
+**31 correct**. It all but eliminated forced fallbacks (13.9% -> 2.6%) and is the
+mechanism behind the f1 gains (`local355`, `local309`).
+
+**One systematic defect, diagnosed — fix before reusing this config.** `local163`
+fails identically in all 4 lanes: the gate enforces `exact_rows: 3` at high
+confidence, but the planner *inferred* 3 from its own grain reasoning ("one row per
+faculty rank") rather than reading a number off the question, and gold has 4 rows
+because rank ASSC has a tie. Enforcement should be restricted to counts the question
+itself states; that keeps the local264 win and drops this casualty. `local023`
+(enforced 5) lost in 3 of 4 lanes for the same family of reason.
+
+Also fixed mid-run (`f5e308e`, not applied to the running tree so lanes stayed
+identical): the gate did `int(exact_rows)` and one rubric of 135 (`local356`) carried
+`exact_rows: ""` next to `rows_confidence: high`, which killed that shard at its last
+question. Every lane therefore reports **134/135**; local356 is counted wrong in all
+figures above. It is 0/12 historically, so the cost is ~0.
+
+Artifacts: `~/q36f_out/` on Babel (28 shard CSVs, 135 r3 rubrics, per-episode
+timings) — `/data/user_data` is not readable from login nodes. Traces remain at
+`/data/user_data/juliep2/q36f_tree/logs/traces/q36f_pass4_k{1..4}_{0..6}/`.
+
+Checked and ruled out: the last-quintile accuracy dip (41%/30% vs 59-60% earlier) is
+*difficulty*, not server decay — those questions' q36e-expected rate is 31-33% and
+70% of them are the same questions in both lanes (slow episodes finish last).

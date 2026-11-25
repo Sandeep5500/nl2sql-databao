@@ -113,6 +113,16 @@ fresh control with profile+keys+gated rubric 51.1% / 92 / 39 · + explored enric
 (old index) and 50.2% / 92 / 41 (rebuilt index). Two runs of one configuration differ by
 about this much, so effects under ~3 points are not resolved by 4 lanes.
 
+Best current config — **presentation-loss arm q36f, 59.1% / 100 / 53** (Nov 25, 2026;
+lanes 83/74/83/79, +7.25 questions over the 53.7% baseline, Welch t=2.89, p~0.03). It
+adds output-format rules (ISO dates, no unrequested rounding, both identifiers when the
+schema has two), two required rubric booleans (`answer_is_single_row`,
+`include_zero_count_entities`), and `--step-extension 15` step rescue, which cut the
+fallback rate 13.9% -> 2.6%. Lane sd is 4.27 (vs 2.65), so judge it on the 4-lane mean,
+never one lane. Known defect to fix before reuse: `--rubric-enforce` enforces row counts
+the planner *inferred* rather than read off the question, which loses local163 in every
+lane. Details, reproducible gain/loss list and artifact paths: documents/spider2_attack_plan.md.
+
 ## Known result baselines (Sept 2026, Qwen3.5-9B)
 
 Greedy agentic 47/135 (34.8%) · single-shot 15.6% · pass@4 54.1% (with greedy: 57.8%) · v1 (GLM) was 20.2%.
