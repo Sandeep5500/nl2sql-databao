@@ -412,3 +412,59 @@ not). The run's worktree `/data/user_data/juliep2/q36f_tree` is disposable.
 Checked and ruled out: the last-quintile accuracy dip (41%/30% vs 59-60% earlier) is
 *difficulty*, not server decay — those questions' q36e-expected rate is 31-33% and
 70% of them are the same questions in both lanes (slow episodes finish last).
+
+### Fix: the local163 tie defect (Nov 25, 2026)
+
+q36f's one reproducible regression, diagnosed and fixed. **No new run** — every number
+below comes from q36f's own CSVs, traces and rubrics plus local re-execution.
+
+**What actually happened.** The r3 rubric for local163 says `exact_rows: 3`,
+`rows_confidence: high`, grain "one row per faculty rank", and in the same breath raises
+the open point *"if two faculty members in the same rank are equally close to the
+average, should both be included or only one?"*. All four lanes wrote
+`ROW_NUMBER() OVER (PARTITION BY FacRank ORDER BY ABS(...)) ... WHERE rn = 1` — three
+rows, one per rank. Gold has 4: rank ASSC ties (LEONARD FIBON 70000 and JULIA MILLS
+75000 are both 2500 from the 72500 average). Re-executed locally and scored with
+`nl2sql/eval.py`: `ROW_NUMBER()` → 0, `RANK()` → 1, `DENSE_RANK()` → 1.
+
+**The enforcement gate was not the cause.** No `shape_refusal` fired on local163 in any
+lane — the agent produced the rubric's 3 rows unprompted, so the gate had nothing to
+object to. The harm came from the rendered rubric text, not from `--rubric-enforce`.
+
+**Measured on q36f before changing anything:**
+
+| | |
+|---|---|
+| enforced counts (86 rubrics) | 37 of 40 with count > 1 match a gold row count |
+| wrong enforced counts | 4: local163 (3 vs 4), local220 (1 vs 2), local279 (10 vs 2), local302 (5 vs 1) |
+| refusal events | 32, across 31 episodes / 18 questions |
+| gate refused a gold-shaped result | 0 times |
+| refused vs unrefused episodes, same questions | 19/31 (61.3%) vs 24/41 (58.5%) |
+
+So the gate is neutral at this n, and the count is a good signal. Two fixes that looked
+obvious were rejected on this evidence: suppressing counts the question does not state
+(all 40 counts > 1 sit on per-entity grains, so the rule has no discrimination), and
+turning the equality check into a lower bound (it would cancel 11 refusals, and in all
+11 the gold count equalled the enforced count — the gate was correctly pushing the agent
+*down*).
+
+**What changed instead** — the count stays the target; the way it may be reached does not:
+1. `row_count_in_doubt()` flags a rubric whose own open points unsettle the row count
+   (ties, "how many rows", "only one"). It catches 3 of the 4 wrong counts and fires on
+   22 of the 86 enforcing r3 rubrics.
+2. `render_rubric()` then adds: N assumes no ties, keep every tied member
+   (RANK/DENSE_RANK, never ROW_NUMBER), invent no tie-breaker, and if the tie is real
+   submit the longer result with `confirm_shape=true`.
+3. The refusal message gains the same escape clause when the submitted result has *more*
+   rows than N — the equality check itself is untouched.
+4. `RUBRIC_SYSTEM` now says an unresolved tie means the count is not fixed by the
+   question, so `rows_confidence` is at most medium. This affects r4+ only; r3 is frozen.
+
+**Risk check.** 10 of the 22 affected questions have correct q36f episodes whose SQL uses
+`ROW_NUMBER()`. Swapping it for `RANK()` in each and re-scoring: 13 of 13 executable
+cases still score 1, 0 break (the rest hold comments or multiple statements that would
+not re-execute standalone). No currently-correct answer in that set depends on arbitrary
+tie-breaking.
+
+**Not verified:** that the agent obeys the new text. The mechanism is proven (RANK scores
+1) and the instruction is proven harmless, but whether local163 flips needs a lane.

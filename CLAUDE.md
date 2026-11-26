@@ -119,9 +119,15 @@ adds output-format rules (ISO dates, no unrequested rounding, both identifiers w
 schema has two), two required rubric booleans (`answer_is_single_row`,
 `include_zero_count_entities`), and `--step-extension 15` step rescue, which cut the
 fallback rate 13.9% -> 2.6%. Lane sd is 4.27 (vs 2.65), so judge it on the 4-lane mean,
-never one lane. Known defect to fix before reuse: `--rubric-enforce` enforces row counts
-the planner *inferred* rather than read off the question, which loses local163 in every
-lane. Details, reproducible gain/loss list and artifact paths: documents/spider2_attack_plan.md.
+never one lane. One defect found and fixed after the run (not in q36f's
+numbers): local163 lost all four lanes because the rubric said "exactly 3, high
+confidence" while its own open point asked whether two faculty could tie, and the agent
+wrote `ROW_NUMBER() ... WHERE rn = 1` to reach 3, dropping the tied rank (gold has 4
+rows). `row_count_in_doubt()` now detects a count its own open points unsettle and tells
+the agent to keep tied members (RANK/DENSE_RANK, not ROW_NUMBER) and to submit the longer
+result with `confirm_shape=true`. The count itself is still the target — it matches gold
+in 37 of 40 r3 cases — and the refusal gate is unchanged, because it measured neutral
+(refused episodes 61.3% vs 58.5% unrefused on the same questions, n=31). Details, reproducible gain/loss list and artifact paths: documents/spider2_attack_plan.md.
 
 ## Known result baselines (Sept 2026, Qwen3.5-9B)
 

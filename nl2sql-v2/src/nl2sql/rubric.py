@@ -4,6 +4,7 @@ agent writes any SQL. By default it has schema-inspection tools only (no SQL,
 so it cannot compute the answer); with_sql=True also gives it run_sql_query."""
 
 import json
+import re
 import time
 
 from openai import OpenAI
@@ -69,6 +70,11 @@ Give a confidence for the rows and, separately, for the columns:
 - low: you cannot tell from the question and the schema. Say what would settle it; the \
 analyst will explore and decide. If the row count is not fixed by the question, the \
 row confidence cannot be high.
+An unresolved TIE is one of these: if you raise ties as an open point — whether two \
+members could be equally close, equally high or equally frequent — then the question \
+does not fix the count, so rows_confidence is at most medium. Put the no-tie number \
+in exact_rows and say in row_count that ties would add rows; never "exactly N" at \
+high confidence while asking whether N could be wrong.
 The analyst treats "high" as a requirement, so a wrong "high" costs more than an honest \
 "low". When you are unsure, say so and describe the alternatives instead of picking one.
 
@@ -164,6 +170,24 @@ def effective_exact_rows(rubric: dict):
     if ex is None and rubric.get("answer_is_single_row") is True:
         return 1
     return ex
+
+
+# An open point that leaves the ROW COUNT unsettled -- in r3 almost always an
+# unresolved tie. 3 of the 4 wrong enforced counts carry one (local163 enforced 3
+# vs gold 4, local220 1 vs 2, local279 10 vs 2), and 23 of the 27 r3 rubrics it
+# matches are literally about ties. It does NOT suppress the count: measured on
+# q36f, every refusal it would have cancelled was the gate correctly pushing the
+# analyst DOWN to gold (11 events, gold == enforced in all 11). What it changes is
+# how the count may be reached -- ties are kept, never broken arbitrarily.
+_COUNT_DOUBT = re.compile(
+    r"\btie[sd]?\b|how many rows|number of rows|row count"
+    r"|both be included|only one", re.I)
+
+
+def row_count_in_doubt(rubric: dict) -> bool:
+    """True when the planner's own open points leave the row count unsettled."""
+    return any(_COUNT_DOUBT.search(str(o))
+               for o in (rubric.get("open_points") or []))
 
 
 def _as_row_count(value):
@@ -277,6 +301,20 @@ def render_rubric(rubric: dict) -> str:
                      "a SINGLE row.")
     elif rubric.get("answer_is_single_row") is False:
         lines.append("The question asks to see each member, so one row per member.")
+    # local163 lost all four q36f lanes here: the planner said "exactly 3, high
+    # confidence" while its own open point asked whether two faculty could tie, and
+    # the analyst wrote ROW_NUMBER() ... WHERE rn = 1 to hit 3, dropping the rank
+    # that ties (gold has 4 rows). The count is still the target -- it is right in
+    # 37 of 40 r3 cases -- but it may not be reached by discarding tied rows.
+    _eff = effective_exact_rows(rubric)
+    if _eff is not None and row_count_in_doubt(rubric):
+        lines.append(
+            f"The planner could not settle whether ties occur, so {_eff} is the "
+            f"count assuming none do. Keep every tied member: rank with RANK() or "
+            f"DENSE_RANK(), not ROW_NUMBER(), and do not invent a tie-breaker the "
+            f"question does not ask for. If you check the data and a tie is real, "
+            f"more than {_eff} rows is the correct answer — submit it with "
+            f"confirm_shape=true rather than cutting rows to reach {_eff}.")
     if rubric.get("include_zero_count_entities") is True:
         lines.append("Entities with no matching data still need a row (count 0) — "
                      "use an outer join; do not let a filter drop them.")

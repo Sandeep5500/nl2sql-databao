@@ -27,7 +27,8 @@ from nl2sql.config import (AgentConfig, CriticConfig, DCE_PROJECT_DIR, DOCS_DIR,
 from nl2sql.context import SearchContext, TableContext
 from nl2sql.db import Database
 from nl2sql.eval import load_eval_standards, score_against_gold
-from nl2sql.rubric import effective_exact_rows, load_rubric, render_rubric
+from nl2sql.rubric import (effective_exact_rows, load_rubric, render_rubric,
+                          row_count_in_doubt)
 from nl2sql.tools import ToolSession
 
 
@@ -332,6 +333,7 @@ def main():
                           + table_context.database_note())
 
             rubric_rows = None
+            rubric_rows_in_doubt = False
             if args.rubric_dir:
                 rubric = load_rubric(args.rubric_dir, iid)
                 # effective_exact_rows also honours answer_is_single_row, the required
@@ -349,6 +351,7 @@ def main():
                     # had the wrong row count, and a wrong one halves the solve rate.
                     if confident:
                         rubric_rows = eff   # already a positive int or None
+                        rubric_rows_in_doubt = row_count_in_doubt(rubric)
 
             draft = None
             if args.draft_endpoint and args.draft_model:
@@ -369,7 +372,8 @@ def main():
                                           table_context=table_context,
                                           doc_text=doc, draft=draft)
                     result = run_episode(q["question"], session, llm, cfg, critic,
-                                         extra_context=extra, rubric_rows=rubric_rows)
+                                         extra_context=extra, rubric_rows=rubric_rows,
+                                         rubric_rows_in_doubt=rubric_rows_in_doubt)
                     if not is_infra_error(result.error):
                         break
                     print("[infra error, retrying question] ", end="", flush=True)

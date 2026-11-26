@@ -112,7 +112,8 @@ def _compact_memory(messages: list[dict], cfg: AgentConfig, client, llm: LLMConf
 
 def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                 cfg: AgentConfig, critic_cfg: CriticConfig | None = None,
-                extra_context: str = "", rubric_rows: int | None = None) -> EpisodeResult:
+                extra_context: str = "", rubric_rows: int | None = None,
+                rubric_rows_in_doubt: bool = False) -> EpisodeResult:
     t0 = time.time()
     client = OpenAI(base_url=llm.base_url, api_key=llm.api_key, timeout=llm.timeout)
     critic_client = None
@@ -265,6 +266,16 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                     f"has {len(df)}.\nEither fix the query so it returns "
                     f"{rubric_rows} row(s), or, if you are certain the planner is wrong, "
                     f"call submit_result again with confirm_shape=true.")
+                # The planner left ties open, so extra rows may be the tie itself.
+                # Name that escape explicitly: the failure this guards against is
+                # the analyst cutting tied rows to reach the count (local163).
+                if rubric_rows_in_doubt and len(df) > rubric_rows:
+                    complaint += (
+                        f"\nThe planner could not settle whether ties occur, so "
+                        f"{rubric_rows} assumes none do. Do NOT drop tied rows or add "
+                        f"a tie-breaker the question does not ask for. Check whether "
+                        f"the extra rows are a genuine tie: if they are, keep them and "
+                        f"submit with confirm_shape=true.")
                 result.trace.append({"step": step, "shape_refusal": complaint,
                                      "rubric_rows": rubric_rows, "got_rows": len(df)})
                 result.refused_qid = str(args.get("query_id", ""))

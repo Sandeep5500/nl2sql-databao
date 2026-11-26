@@ -39,11 +39,17 @@ row count; the other 49 abstain.
    episodes and not 135. Fixed in `f5e308e` — `effective_exact_rows()` now
    normalises the field — so current code handles this file fine. Do not "repair"
    the file; it is kept as the run saw it.
-2. **An enforced count can be wrong.** The planner sometimes infers a count from
-   its own grain reasoning rather than reading one off the question. `local163`
-   asserts `exact_rows: 3` at high confidence ("one row per faculty rank") but gold
-   has 4 rows, because one rank ties — and it fails in all four q36f lanes for that
-   reason. 86 rubrics enforce; treat the enforcement as a hypothesis, not a fact.
+2. **An enforced count can be wrong.** 86 rubrics yield a count; 4 of them
+   disagree with gold (`local163` 3 vs 4, `local220` 1 vs 2, `local279` 10 vs 2,
+   `local302` 5 vs 1). Treat a count as a hypothesis, not a fact.
+   Three of those four carry an open point that doubts the count — almost always an
+   unresolved tie, which is how `local163` was lost: "exactly 3, high confidence"
+   next to "if two faculty members tie, should both be included?", and the agent used
+   `ROW_NUMBER() ... WHERE rn = 1` to reach 3 while gold has 4. Code after q36f
+   (`row_count_in_doubt()` in `nl2sql/rubric.py`) reads those open points and tells
+   the agent to keep tied rows instead, so **these files behave differently on current
+   code than they did in q36f** — 22 of the 86 now get a tie warning. For a run that
+   must match q36f episode for episode, check out `854a6ab`.
 
 ## Companion artifacts
 
