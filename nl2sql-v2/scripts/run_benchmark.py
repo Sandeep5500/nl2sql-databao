@@ -437,6 +437,14 @@ def main():
     ap.add_argument("--text-sql-fallback", action="store_true",
                     help="execute ```sql blocks from replies of models without "
                          "tool training (e.g. Arctic as actor)")
+    ap.add_argument("--step-budget-guard", action="store_true",
+                    help="warehouse arm: near the step cap nudge a deliberate submit, "
+                         "and break the thrash of re-running an identical failing query "
+                         "(off by default so the SQLite baseline is unchanged)")
+    ap.add_argument("--distinct-key-guard", action="store_true",
+                    help="warehouse arm: add one SQL rule telling the model to confirm a "
+                         "key is unique before COUNT(DISTINCT)/GROUP BY counting entities "
+                         "(off by default so the SQLite baseline is unchanged)")
     ap.add_argument("--resume", action="store_true",
                     help="skip instances already in --output and append to it")
     ap.add_argument("--thinking", action="store_true",
@@ -559,7 +567,9 @@ def main():
         llm.max_tokens, llm.timeout = 12_000, 900.0
     cfg = AgentConfig(max_steps=args.max_steps, context_mode=args.context_mode,
                       expansion_queries=0 if args.no_expansion else 3,
-                      text_sql_fallback=args.text_sql_fallback)
+                      text_sql_fallback=args.text_sql_fallback,
+                      step_budget_guard=args.step_budget_guard,
+                      distinct_key_guard=args.distinct_key_guard)
     if args.search_limit:
         cfg.search_limit = args.search_limit
     critic = CriticConfig(enabled=bool(args.critic_model),

@@ -91,12 +91,32 @@ rather than returning rows. Each query is cost-estimated before it runs \
 and refused above {max_scan}; you have {query_budget} queries for this \
 question and a query over {query_timeout_s}s is cancelled.
 - NULLs: aggregates skip NULLs; comparisons with NULL are never true — use IS \
-NULL / COALESCE deliberately.""",
+NULL / COALESCE deliberately.
+- GRAIN: when the question asks for something "for each" / "per" an entity, the \
+result needs one row for EVERY such entity, including entities with no matching \
+rows (0, NULL or empty) — reach them with a LEFT JOIN from the full entity list and \
+COALESCE, not an inner join or a WHERE that silently drops them. Returning fewer \
+rows than there are entities is a common wrong answer here.""",
 )
 
 DIALECTS = {"duckdb_sqlite": DUCKDB_SQLITE, "snowflake": SNOWFLAKE,
             "bigquery": BIGQUERY,
             "duckdb": DUCKDB_SQLITE}
+
+# Appended to a warehouse dialect's SQL rules only when cfg.distinct_key_guard is on
+# (agent.py). Warehouse-scoped, so the duckdb_sqlite baseline stays byte-identical and
+# check_prompt_parity.py keeps passing. Targets the recurring "counted DISTINCT on a key
+# that isn't unique by itself" error (GA4 sessions were the clearest cluster, but the
+# wording is deliberately general so any dataset with the same shape benefits).
+GRAIN_DISTINCT_RULE = """
+- UNIQUENESS BEFORE COUNTING: before COUNT(DISTINCT x) or GROUP BY x to count or \
+dedupe entities (sessions, users, visits, orders, trips...), confirm what one entity's \
+key actually is. An id is frequently unique only WITHIN a parent, so counting the child \
+id alone silently merges rows from different parents and undercounts: a session is \
+identified by (user id + session id) together, an order line by (order id + line \
+number), and so on. Count the full composite key, or count the one row/event that marks \
+the entity, and sanity-check with a quick GROUP BY that the key you chose has the grain \
+you expect."""
 
 
 SYSTEM_PROMPT = """You are an expert data analyst answering a question against {dialect_header}. Work step by step with tools; when \

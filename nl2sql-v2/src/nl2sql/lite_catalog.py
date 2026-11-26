@@ -62,6 +62,11 @@ class LiteCatalog:
         self._stats: dict = {}
         if stats_dir is not None:
             self._load_stats(Path(stats_dir))
+        # cache for candidate-join discovery (describe(relationships=True)):
+        # namespace -> {column_name_lower: {table_fullname, ...}}. Built lazily
+        # the first time a table in that namespace is described, from the shipped
+        # catalog only -- no warehouse query.
+        self._ns_col_index: dict[str, dict[str, set]] = {}
 
     def _load_stats(self, stats_dir: Path) -> None:
         if not stats_dir.is_dir():
@@ -210,8 +215,63 @@ class LiteCatalog:
     def has_stats(self) -> bool:
         return bool(self._stats)
 
+    # columns too generic to be useful join keys; they match across most tables
+    # and only add noise to the relationships section.
+    _JOIN_NOISE = {"date", "year", "month", "day", "time", "timestamp", "datetime",
+                   "name", "value", "count", "type", "status", "code", "description",
+                   "label", "category", "key", "index", "rank", "total", "amount",
+                   # geographic dimensions: shared across tables but not join keys
+                   "latitude", "longitude", "lat", "lon", "lng", "location",
+                   "borough", "city", "state", "country", "region", "address",
+                   "zip", "zipcode", "postal_code", "county"}
+    # datasets with more tables than this are not indexed: loading every table's
+    # JSON to find join keys is not worth it, and such schemas (e.g. ebi_chembl)
+    # are their own problem.
+    _REL_MAX_TABLES = 60
+
+    def _namespace_column_index(self, namespace: str) -> dict[str, set]:
+        """{column_name_lower: {table_fullname, ...}} across one namespace, cached.
+
+        Built from the shipped catalog only -- it materialises each table's columns
+        (lazy JSON read), so it is capped at _REL_MAX_TABLES tables.
+        """
+        if namespace in self._ns_col_index:
+            return self._ns_col_index[namespace]
+        tables = [t for t in self.tables.values() if t.namespace == namespace]
+        idx: dict[str, set] = {}
+        if len(tables) <= self._REL_MAX_TABLES:
+            for t in tables:
+                for c, _ty in self._detail(t).columns:
+                    idx.setdefault(c.lower(), set()).add(t.fullname)
+        self._ns_col_index[namespace] = idx
+        return idx
+
+    def _candidate_joins(self, t: "CatalogTable", max_cols: int = 10,
+                         max_tables_per_col: int = 4) -> list:
+        """[(column, [other_table_fullname, ...])] for this table's columns that also
+        appear, by the same name, in other tables of the same dataset. Ubiquitous and
+        noise columns are skipped so what remains reads as a plausible join key."""
+        idx = self._namespace_column_index(t.namespace)
+        if not idx:
+            return []
+        ntables = len({tb for tbs in idx.values() for tb in tbs})
+        # a column in more than half the dataset's tables is too common to be a key
+        ubiquitous = max(2, (ntables + 1) // 2)
+        out = []
+        for c, _ty in t.columns:
+            cl = c.lower()
+            if cl in self._JOIN_NOISE:
+                continue
+            others = sorted(idx.get(cl, set()) - {t.fullname})
+            if others and len(idx[cl]) <= ubiquitous:
+                out.append((c, others[:max_tables_per_col]))
+            if len(out) >= max_cols:
+                break
+        return out
+
     def describe(self, name: str, sample_rows: int = 5,
-                 max_nested: int = 60, stats: bool = True) -> str:
+                 max_nested: int = 60, stats: bool = True,
+                 relationships: bool = False) -> str:
         t = self._detail(self.resolve(name))
         tstats = (self._stats.get(t.fullname) or {}) if stats else {}
         header = f"table: {t.fullname}"
@@ -246,6 +306,15 @@ class LiteCatalog:
             lines.append(f"sample rows:\n{df.to_csv(index=False)}")
         else:
             lines.append("sample rows: none shipped for this table")
+
+        if relationships:
+            joins = self._candidate_joins(t)
+            if joins:
+                lines.append("candidate join keys (same-named column in another table "
+                             "of this dataset; verify before trusting):")
+                for c, others in joins:
+                    lines.append(f"  {c}  ->  " + ", ".join(others))
+
         if tstats:
             lines.append("[schema from the Spider2 catalog; row/distinct/null "
                          "counts from a one-time enrichment pass, both free to "

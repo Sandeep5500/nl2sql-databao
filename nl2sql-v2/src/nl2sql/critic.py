@@ -17,7 +17,9 @@ class CriticVerdict:
 
 def review(client, cfg: CriticConfig, question: str, sql: str, preview_csv: str,
            doc_text: str | None) -> CriticVerdict:
-    doc_section = f"\nAttached documentation:\n{doc_text[:8000]}\n" if doc_text else ""
+    # 16K (was 8K) so the reviewer sees the same definitions the agent now does;
+    # kept below the agent's 48K doc budget to bound the critic prompt's context.
+    doc_section = f"\nAttached documentation:\n{doc_text[:16_000]}\n" if doc_text else ""
     prompt = CRITIC_PROMPT.format(question=question, doc_section=doc_section,
                                   sql=sql, preview=preview_csv)
     try:

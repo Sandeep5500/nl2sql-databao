@@ -68,6 +68,8 @@ def main():
                     help="reuse an existing rubric dir instead of generating one")
     ap.add_argument("--row-check", action="store_true",
                     help="pass --rubric-row-check to run_benchmark")
+    ap.add_argument("--distinct-key-guard", action="store_true",
+                    help="pass --distinct-key-guard to run_benchmark (uniqueness nudge)")
     args = ap.parse_args()
 
     ids =[i for i in Path(args.instances_file).read_text().strip().split(",") if i]
@@ -104,8 +106,10 @@ def main():
                   "--max-steps", str(args.max_steps),
                   "--temperature", str(args.temperature), "--resume",
                   "--endpoint", args.endpoint,
-                  "--rubric-dir", rubric_dir, "--rubric-confident-only"] + stats
+                  "--rubric-dir", rubric_dir, "--rubric-confident-only",
+                  "--step-budget-guard"] + stats
             + (["--rubric-row-check"] if args.row_check else [])
+            + (["--distinct-key-guard"] if args.distinct_key_guard else [])
             for i, s in enumerate(shards)]
     codes = run_parallel(cmds, [logdir / f"bench{i}.log" for i in range(len(cmds))], env)
     print(f"[{args.tag}] benchmark done in {time.time() - t1:.0f}s, exit codes {codes}",

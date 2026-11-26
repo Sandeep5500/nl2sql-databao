@@ -173,9 +173,24 @@ class AgentConfig:
     history_char_budget: int = 100_000
     truncated_tool_msg_chars: int = 600
     max_tool_result_chars: int = 16_000  # single tool result cap at insertion
+    # read_documentation carries required definitions/formulas, not a query result,
+    # so it gets a larger cap than query output: 6 Spider2 docs exceed 16K (GA, ga4,
+    # Regulome, OSM, optimism) and were being silently cut mid-definition.
+    max_doc_result_chars: int = 48_000
     keep_recent_turns: int = 5           # turns kept verbatim by memory compaction
     summary_max_tokens: int = 700        # [MEMORY] note budget
     find_value_max_columns: int = 200
     context_mode: str = "search"        # search | full | oracle  (ablation arms A/B/C)
     text_sql_fallback: bool = False     # execute ```sql blocks from non-tool models
     dbt_timeout_s: float = 600.0        # per `dbt build` invocation
+    # Warehouse-arm step-budget guard (off by default -> SQLite baseline byte-identical).
+    # Near the step cap, nudge a deliberate submit instead of the passive fallback picker;
+    # and break the scan-cap/timeout thrash where the model re-runs one failing query.
+    step_budget_guard: bool = False
+    finalize_lead_steps: int = 3        # nudge once when this many steps remain
+    repeat_fail_limit: int = 2          # escalate after this many identical failing queries
+    # Warehouse-arm prompt nudge (off by default -> SQLite baseline byte-identical).
+    # Adds one SQL rule: before COUNT(DISTINCT key) / GROUP BY key to count entities,
+    # confirm the key is actually unique (a child id is often unique only within a
+    # parent, e.g. GA4 ga_session_id within user_pseudo_id) or the count undercounts.
+    distinct_key_guard: bool = False

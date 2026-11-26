@@ -267,8 +267,11 @@ class BigQueryDatabase:
         # context/notes are the DCE enrichment material, which only exists for the
         # SQLite databases; the shipped BigQuery catalog carries the publishers' own
         # column descriptions instead. Accepted and ignored so tools.py never has to
-        # branch on dialect.
-        return self.catalog.describe(table, sample_rows=sample_rows, stats=stats)
+        # branch on dialect. We DO surface cross-table relationships (candidate join
+        # keys), derived from the catalog alone -- no warehouse query -- to cut the
+        # wrong-join/wrong-column failures that dominate the wrong-value bucket.
+        return self.catalog.describe(table, sample_rows=sample_rows, stats=stats,
+                                     relationships=True)
 
     @property
     def has_stats(self) -> bool:
@@ -468,7 +471,11 @@ class BigQueryDatabase:
 
     def query_preview(self, sql: str, preview_rows: int, max_rows: int,
                       cell_char_limit: int = 1024,
-                      timeout_s: float = 90.0) -> tuple[pd.DataFrame, str]:
+                      timeout_s: float | None = None) -> tuple[pd.DataFrame, str]:
+        # None -> _run falls back to self.cfg.statement_timeout_s (120s), which is
+        # exactly what the prompt promises the model ("a query over {query_timeout_s}s
+        # is cancelled"). The old hard-coded 90s cancelled queries the model was told
+        # it had 120s for, scoring them wrong for a limit it never saw.
         it, job = self._run(sql, max_rows, timeout_s)
         df, truncated = self._to_frame(it, max_rows)
         preview = df.head(preview_rows).map(lambda v: _trim_cell(v, cell_char_limit))

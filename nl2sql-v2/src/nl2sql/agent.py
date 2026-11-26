@@ -10,9 +10,9 @@ from openai import OpenAI
 
 from . import critic as critic_mod
 from .config import AgentConfig, CriticConfig, LLMConfig
-from .prompts import (DIALECTS, DOC_HINT, MEMORY_PREFIX, SEARCH_HINT_FULL,
-                      SEARCH_HINT_SEARCH, SUMMARIZE_PROMPT, SYSTEM_PROMPT,
-                      VALUE_HINT_FIND, VALUE_HINT_LOOP_FIND,
+from .prompts import (DIALECTS, DOC_HINT, GRAIN_DISTINCT_RULE, MEMORY_PREFIX,
+                      SEARCH_HINT_FULL, SEARCH_HINT_SEARCH, SUMMARIZE_PROMPT,
+                      SYSTEM_PROMPT, VALUE_HINT_FIND, VALUE_HINT_LOOP_FIND,
                       VALUE_HINT_LOOP_PLAIN, VALUE_HINT_PLAIN,
                       USER_START)
 from .tools import ToolSession, build_tool_schemas, parse_tool_args
@@ -157,11 +157,16 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                                        session.db, "dialect",
                                        "duckdb_sqlite")].name,
                                    has_find_value=has_find_value)
-    dialect = DIALECTS[getattr(session.db, "dialect", "duckdb_sqlite")]
+    dialect_key = getattr(session.db, "dialect", "duckdb_sqlite")
+    dialect = DIALECTS[dialect_key]
     # a backend may expose prompt_facts to fill placeholders in its rules (e.g. the
     # Snowflake query budget); unknown placeholders are left visible, not crashed on.
     dialect_rules = dialect.sql_rules.format_map(
         _PromptFacts(getattr(session.db, "prompt_facts", None) or {}))
+    # Warehouse-only uniqueness nudge; never on the duckdb_sqlite baseline, so prompt
+    # parity with origin/main is preserved.
+    if cfg.distinct_key_guard and dialect_key in ("bigquery", "snowflake"):
+        dialect_rules += GRAIN_DISTINCT_RULE
     system = session.system_prompt(question, cfg, extra_context) if hasattr(
         session, "system_prompt") else SYSTEM_PROMPT.format(
         dialect_header=dialect.header,
@@ -185,8 +190,25 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                   if llm.chat_template_kwargs else None)
 
     ctx_retried_step = -1
+    nudged = False                       # step-budget-guard: finalize nudge fired once
+    prev_fail_sql, repeat_fails = None, 0  # step-budget-guard: identical-failure streak
     for step in range(cfg.max_steps):
         result.steps = step + 1
+        if (cfg.step_budget_guard and not nudged and result.status == "no_sql"
+                and step >= cfg.max_steps - cfg.finalize_lead_steps):
+            # Budget almost gone and nothing submitted. If the agent already has a
+            # non-empty result, let IT choose which to submit (beats the passive
+            # cluster-picker below) rather than burning the last turns on new probes.
+            ready = [qid for qid, (_s, d) in session.query_results.items()
+                     if d is not None and len(d) > 0]
+            if ready:
+                nudged = True
+                messages.append({"role": "user", "content": (
+                    f"[harness] Only {cfg.max_steps - step} step(s) left before you are "
+                    f"cut off. You have stored query results: {', '.join(ready)}. If one "
+                    "of them answers the question, call submit_result with its query_id "
+                    "NOW. Do not start new exploration unless a stored result is clearly "
+                    "wrong.")})
         _compact_memory(messages, cfg, client, llm, result.trace)
         try:
             resp = client.chat.completions.create(
@@ -320,9 +342,43 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
                 out = "ERROR: could not parse tool arguments as JSON."
             else:
                 out = session.dispatch(tc.function.name, args)
-            if len(out) > cfg.max_tool_result_chars:
+            if tc.function.name == "read_documentation":
+                # a doc holds required definitions, not a query result; give it a
+                # larger budget and cut on a section boundary with an honest message
+                if len(out) > cfg.max_doc_result_chars:
+                    full = len(out)
+                    head = out[: cfg.max_doc_result_chars]
+                    cut = head.rfind("\n#")           # prefer a markdown heading
+                    if cut < cfg.max_doc_result_chars // 2:
+                        cut = head.rfind("\n")
+                    out = (head[:cut] if cut > 0 else head) + (
+                        f"\n[documentation truncated: showing {cut if cut > 0 else len(head)} "
+                        f"of {full} characters; this file is long -- the earlier sections "
+                        f"above hold the definitions]")
+            elif len(out) > cfg.max_tool_result_chars:
                 out = (out[: cfg.max_tool_result_chars]
                        + "\n[result truncated; narrow your query]")
+            if cfg.step_budget_guard and tc.function.name == "run_sql_query":
+                # Break the scan-cap/timeout thrash: the same query re-run against the
+                # same limit fails identically (prompts.py already says so, statically;
+                # this enforces it). bq096 ran one over-budget query 50+ times to a
+                # step-out. On a repeat failure, tell the model to change or submit.
+                if out.startswith("ERROR"):
+                    norm = " ".join(str(args.get("sql", "")).lower().split())
+                    if norm and norm == prev_fail_sql:
+                        repeat_fails += 1
+                    else:
+                        prev_fail_sql, repeat_fails = norm, 1
+                    if repeat_fails >= cfg.repeat_fail_limit:
+                        out += (
+                            f"\n\n[harness] You have run this exact query and it failed "
+                            f"the same way {repeat_fails} times; re-running it will fail "
+                            "again. Change the query so it fits the scan/time limits (add "
+                            "a filter on the partition/date column, select fewer columns, "
+                            "or aggregate in SQL), or if an earlier query_id already "
+                            "answers the question, call submit_result with it now.")
+                else:
+                    prev_fail_sql, repeat_fails = None, 0  # success resets the streak
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
             result.trace.append({"step": step, "tool": tc.function.name,
                                  "args": args, "result": out})
