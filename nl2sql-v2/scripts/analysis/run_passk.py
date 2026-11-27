@@ -38,6 +38,10 @@ def main():
     ap.add_argument("--row-check", action="store_true")
     ap.add_argument("--distinct-key-guard", action="store_true",
                     help="pass --distinct-key-guard through to each lane")
+    ap.add_argument("--gen-rules-guard", action="store_true",
+                    help="pass --gen-rules-guard through to each lane")
+    ap.add_argument("--domain-notes", action="store_true",
+                    help="pass --domain-notes through to each lane")
     args = ap.parse_args()
 
     tags = [f"{args.base_tag}_k{i}" for i in range(1, args.lanes + 1)]
@@ -61,6 +65,10 @@ def main():
             cmd.append("--row-check")
         if args.distinct_key_guard:
             cmd.append("--distinct-key-guard")
+        if args.gen_rules_guard:
+            cmd.append("--gen-rules-guard")
+        if args.domain_notes:
+            cmd.append("--domain-notes")
         return cmd
 
     log(f"pass@{args.lanes} start: tags={','.join(tags)} wave_size={args.wave_size}")

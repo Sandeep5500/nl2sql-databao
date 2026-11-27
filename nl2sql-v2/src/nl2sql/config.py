@@ -194,3 +194,8 @@ class AgentConfig:
     # confirm the key is actually unique (a child id is often unique only within a
     # parent, e.g. GA4 ga_session_id within user_pseudo_id) or the count undercounts.
     distinct_key_guard: bool = False
+    # Warehouse-arm generic SQL rules (off by default -> SQLite baseline byte-identical).
+    # Four rules distilled from the BigQuery 0/8 error buckets: don't hard-code an
+    # intermediate you were asked to compute; honor a document's exact field set;
+    # confirm which column a concept maps to; match the asked grain/statistic.
+    gen_rules_guard: bool = False

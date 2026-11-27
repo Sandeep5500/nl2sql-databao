@@ -70,6 +70,10 @@ def main():
                     help="pass --rubric-row-check to run_benchmark")
     ap.add_argument("--distinct-key-guard", action="store_true",
                     help="pass --distinct-key-guard to run_benchmark (uniqueness nudge)")
+    ap.add_argument("--gen-rules-guard", action="store_true",
+                    help="pass --gen-rules-guard to run_benchmark (generic SQL rules)")
+    ap.add_argument("--domain-notes", action="store_true",
+                    help="pass --domain-notes to run_benchmark (per-db domain notes)")
     args = ap.parse_args()
 
     ids =[i for i in Path(args.instances_file).read_text().strip().split(",") if i]
@@ -110,6 +114,8 @@ def main():
                   "--step-budget-guard"] + stats
             + (["--rubric-row-check"] if args.row_check else [])
             + (["--distinct-key-guard"] if args.distinct_key_guard else [])
+            + (["--gen-rules-guard"] if args.gen_rules_guard else [])
+            + (["--domain-notes"] if args.domain_notes else [])
             for i, s in enumerate(shards)]
     codes = run_parallel(cmds, [logdir / f"bench{i}.log" for i in range(len(cmds))], env)
     print(f"[{args.tag}] benchmark done in {time.time() - t1:.0f}s, exit codes {codes}",

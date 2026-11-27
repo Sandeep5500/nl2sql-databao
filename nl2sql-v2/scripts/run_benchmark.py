@@ -26,6 +26,7 @@ from nl2sql.config import (CONTEXT_DIR, AgentConfig, CriticConfig, DATA_SOURCES,
                            LLMConfig, VLLM_ENDPOINT_FILE)
 from nl2sql.context import CatalogSearchContext, SearchContext
 from nl2sql.db import Database
+from nl2sql.domain_notes import domain_notes
 from nl2sql.eval import load_eval_standards, score_against_gold
 from nl2sql.rubric import load_rubric, render_rubric
 from nl2sql.tools import ToolSession
@@ -445,6 +446,14 @@ def main():
                     help="warehouse arm: add one SQL rule telling the model to confirm a "
                          "key is unique before COUNT(DISTINCT)/GROUP BY counting entities "
                          "(off by default so the SQLite baseline is unchanged)")
+    ap.add_argument("--gen-rules-guard", action="store_true",
+                    help="warehouse arm: add generic SQL rules (don't hard-code a computed "
+                         "intermediate; honor a document's field set; concept->column; match "
+                         "grain/statistic). Off by default so the SQLite baseline is unchanged")
+    ap.add_argument("--domain-notes", action="store_true",
+                    help="warehouse arm: append per-database domain notes (grain, nesting, "
+                         "identity, sentinels, units) to the context for known databases. Off "
+                         "by default so the SQLite baseline is unchanged")
     ap.add_argument("--resume", action="store_true",
                     help="skip instances already in --output and append to it")
     ap.add_argument("--thinking", action="store_true",
@@ -569,7 +578,8 @@ def main():
                       expansion_queries=0 if args.no_expansion else 3,
                       text_sql_fallback=args.text_sql_fallback,
                       step_budget_guard=args.step_budget_guard,
-                      distinct_key_guard=args.distinct_key_guard)
+                      distinct_key_guard=args.distinct_key_guard,
+                      gen_rules_guard=args.gen_rules_guard)
     if args.search_limit:
         cfg.search_limit = args.search_limit
     critic = CriticConfig(enabled=bool(args.critic_model),
@@ -712,6 +722,13 @@ def main():
                 extra += schema_overview(
                     db, datasource=resolve_datasource(db_name),
                     report_truncation=bool(snow_cfg or bq_cfg))
+            # Mode-agnostic: domain notes must reach the model in --context-mode full
+            # (what the pass@k arm uses), which skips schema_overview above. BigQuery arm
+            # only, so the SQLite baseline is untouched.
+            if args.domain_notes and bq_cfg:
+                note = domain_notes(db_name)
+                if note:
+                    extra += "\n" + note
 
             expected_rows = None
             if args.rubric_dir:

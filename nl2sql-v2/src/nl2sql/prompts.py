@@ -118,6 +118,28 @@ number), and so on. Count the full composite key, or count the one row/event tha
 the entity, and sanity-check with a quick GROUP BY that the key you chose has the grain \
 you expect."""
 
+# Appended to a warehouse dialect's SQL rules only when cfg.gen_rules_guard is on (agent.py).
+# Warehouse-scoped, so the duckdb_sqlite baseline stays byte-identical. Four rules distilled
+# from the BigQuery never-solved (0/8) buckets, kept non-redundant with the GRAIN rule above
+# and the workflow's "check how a value is stored" step.
+BIGQUERY_GEN_RULES = """
+- COMPUTE, DON'T ASSUME: if the question asks you to find/rank/select something (the top \
+source, the Nth state, the leading category), derive it inside the query with a subquery or \
+CTE and ORDER BY/LIMIT. Never paste a specific name, code or id into a WHERE/CASE as if it \
+were the answer — a guessed literal that is wrong fails silently.
+- DOCUMENT FIELDS: when the question says to follow the document / return "all the \
+information" / the listed fields, read_documentation and output exactly those fields, in \
+that order, each mapped to the real column name (confirm with describe_table), not a \
+plausible-looking substitute.
+- CONCEPT -> COLUMN: when a word in the question maps to data (a "medication", a \
+"specialization", a "transaction"), confirm which column actually represents it before \
+filtering or grouping; near-synonym columns (name vs generic_name, code vs description) give \
+different answers.
+- MATCH THE GRAIN AND THE STATISTIC: aggregate at exactly the grain asked (per county is not \
+per state); for a share/percentage keep the zero/none cases in the denominator (LEFT JOIN, \
+not inner); and compute a statistic directly — "highest X" over a group is MAX(X), not an \
+average of a pre-reduced column."""
+
 
 SYSTEM_PROMPT = """You are an expert data analyst answering a question against {dialect_header}. Work step by step with tools; when \
 confident, submit.

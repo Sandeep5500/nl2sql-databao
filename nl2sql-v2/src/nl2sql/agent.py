@@ -10,7 +10,8 @@ from openai import OpenAI
 
 from . import critic as critic_mod
 from .config import AgentConfig, CriticConfig, LLMConfig
-from .prompts import (DIALECTS, DOC_HINT, GRAIN_DISTINCT_RULE, MEMORY_PREFIX,
+from .prompts import (BIGQUERY_GEN_RULES, DIALECTS, DOC_HINT, GRAIN_DISTINCT_RULE,
+                      MEMORY_PREFIX,
                       SEARCH_HINT_FULL, SEARCH_HINT_SEARCH, SUMMARIZE_PROMPT,
                       SYSTEM_PROMPT, VALUE_HINT_FIND, VALUE_HINT_LOOP_FIND,
                       VALUE_HINT_LOOP_PLAIN, VALUE_HINT_PLAIN,
@@ -167,6 +168,8 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
     # parity with origin/main is preserved.
     if cfg.distinct_key_guard and dialect_key in ("bigquery", "snowflake"):
         dialect_rules += GRAIN_DISTINCT_RULE
+    if cfg.gen_rules_guard and dialect_key in ("bigquery", "snowflake"):
+        dialect_rules += BIGQUERY_GEN_RULES
     system = session.system_prompt(question, cfg, extra_context) if hasattr(
         session, "system_prompt") else SYSTEM_PROMPT.format(
         dialect_header=dialect.header,
@@ -195,7 +198,8 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
     for step in range(cfg.max_steps):
         result.steps = step + 1
         if (cfg.step_budget_guard and not nudged and result.status == "no_sql"
-                and step >= cfg.max_steps - cfg.finalize_lead_steps):
+                and (step >= cfg.max_steps - cfg.finalize_lead_steps
+                     or repeat_fails >= cfg.repeat_fail_limit)):
             # Budget almost gone and nothing submitted. If the agent already has a
             # non-empty result, let IT choose which to submit (beats the passive
             # cluster-picker below) rather than burning the last turns on new probes.
@@ -400,11 +404,32 @@ def run_episode(question: str, session: ToolSession, llm: LLMConfig,
             if df_q is None or len(df_q) == 0:
                 continue
             clusters.setdefault(sig(df_q), []).append((int(qid[1:]), qid))
-        if clusters:
-            best = max(clusters.values(), key=lambda v: (len(v), max(x[0] for x in v)))
-            qid = max(best)[1]
-        else:
-            qid = max(session.query_results, key=lambda q: int(q[1:]))
+        ranked = sorted(clusters.values(),
+                        key=lambda v: (len(v), max(x[0] for x in v)), reverse=True)
+        qid = None
+        if ranked and cfg.step_budget_guard and critic_client \
+                and result.critic_rounds < critic_cfg.max_rounds:
+            # A degenerate last probe (e.g. bq096's unrelated query) can form the
+            # largest cluster and win by repetition. Let the critic veto a candidate
+            # that does not answer the question and move to the next cluster. Inert
+            # when no critic is configured -- identical to the pre-guard behavior.
+            for cluster in ranked:
+                if result.critic_rounds >= critic_cfg.max_rounds:
+                    break
+                cand_qid = max(cluster)[1]
+                csql, cdf = session.query_results[cand_qid]
+                verdict = critic_mod.review(critic_client, critic_cfg, question, csql,
+                                            cdf.head(12).to_csv(index=False),
+                                            session.doc_text)
+                result.critic_rounds += 1
+                result.trace.append({"step": result.steps, "fallback_critic": {
+                    "query_id": cand_qid, "approve": verdict.approve}})
+                if verdict.approve:
+                    qid = cand_qid
+                    break
+        if qid is None:
+            qid = (max(ranked[0])[1] if ranked
+                   else max(session.query_results, key=lambda q: int(q[1:])))
         result.sql, result.pred_df = session.query_results[qid][0], session.query_results[qid][1]
         result.status = "fallback"
 
